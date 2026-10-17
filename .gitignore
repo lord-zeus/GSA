@@ -1,0 +1,24 @@
+# — Rust —
+target/
+*.rlib
+*.dll
+*.exe
+
+# — Node / web build output —
+web/node_modules/
+web/dist/
+node_modules/
+
+# — VCS / env / secrets —
+.env
+.env.*
+*.env
+
+# — scratch / debug dumps (not source) —
+err.log
+out.log
+req_body.json
+_prefix.txt
+*.swp
+*~
+.DS_Store

@@ -1,0 +1,31 @@
+[package]
+name = "ser-runner"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Job queue + worker pool for the GSA Search Engine Ranker replica. Wires the executor (F#5), HTTP (F#6), and Browser (F#7) drivers into a concurrent pool with crash isolation."
+
+[lib]
+name = "runner"
+path = "src/lib.rs"
+
+[features]
+default = ["http"]
+http = ["engine/http"]
+browser = ["engine/browser"]
+
+[dependencies]
+engine = { package = "ser-engine", path = "../engine", default-features = false }
+ser-db = { path = "../db" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "chrono", "uuid"] }
+
+[dev-dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "chrono", "uuid"] }
+engine = { package = "ser-engine", path = "../engine", default-features = false }

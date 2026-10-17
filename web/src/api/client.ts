@@ -1,0 +1,231 @@
+// Minimal typed fetch wrapper for the Rust REST API.
+// Dev: Vite proxies /api and /healthz to :8080. Prod: same-origin (served by ser-api).
+
+export interface Health { status: string; db: string }
+export interface CatalogEngine {
+  id: number
+  kind: string
+  name: string
+  url: string
+  step_count: number
+  category: 'web' | 'email'
+  file_path: string
+}
+export interface CatalogList {
+  data: CatalogEngine[]
+  total: number
+}
+export interface TypeCount { engine_type: string; n: number }
+export interface Project {
+  id: string
+  name: string
+  description: string | null
+  use_proxies?: boolean
+  created_at: string
+}
+export interface EngineRow {
+  id: string
+  project_id: string
+  engine_name: string
+  engine_type: string
+  url: string
+  file_path: string
+  step_count: number
+  enabled: boolean
+  created_at: string
+}
+export interface JobRow {
+  id: string
+  project_id: string
+  engine_id: string | null
+  keyword_id: string | null
+  status: 'pending' | 'running' | 'done' | 'failed' | 'rejected' | 'cancelled'
+  attempts: number
+  last_error: string | null
+  started_at: string | null
+  finished_at: string | null
+  created_at: string
+}
+export interface ProjectResult {
+  id: string
+  job_id: string
+  kind: 'success' | 'info' | 'error' | 'rejected'
+  url: string | null
+  anchor: string | null
+  message: string | null
+  engine_name: string | null
+  keyword: string | null
+  created_at: string
+}
+export interface ResultStats {
+  success: number
+  info: number
+  error: number
+  rejected: number
+  total: number
+  total_jobs: number
+  unique_success_urls: number
+}
+export interface Keyword {
+  id: string
+  project_id: string
+  text: string
+  added_at: string
+}
+export interface KeywordBulkResult {
+  stored: number
+  keywords: Keyword[]
+}
+export interface ImportSummary {
+  category: string
+  directory?: string
+  scanned: number
+  imported: number
+  failed: number
+  duration_ms?: number
+}
+export interface ImportResult {
+  status: string
+  imported: number
+  failed: number
+  categories: ImportSummary[]
+  source: string
+}
+export interface CatalogStats {
+  total: number
+  web: number
+  email: number
+  types: TypeCount[]
+}
+export interface EmailSetting {
+  address: string
+  password: string
+}
+export interface ProxyRow {
+  id: string
+  host: string
+  port: number
+  proxy_kind: 'http' | 'socks5'
+  login: string
+  password: string
+  enabled: boolean
+  created_at: string
+}
+export interface ProxyTestResult {
+  proxy_id: string
+  ok: boolean
+  detail: string
+  latency_ms: number
+}
+export interface RunSummary {
+  claimed: number
+  done: number
+  failed: number
+  panics: number
+}
+
+async function req<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(path, {
+    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
+    ...init,
+  })
+  const text = await res.text()
+  let body: any = null
+  try { body = text ? JSON.parse(text) : null } catch { body = text }
+  if (!res.ok) {
+    throw new Error(
+      (body && body.error && (body.error as string)) || `HTTP ${res.status}`,
+    )
+  }
+  return body as T
+}
+
+export const api = {
+  health: () => req<Health>('/healthz'),
+
+  catalogList: async (q?: { kind?: string; search?: string; offset?: number; limit?: number }): Promise<CatalogList> => {
+    const p = new URLSearchParams()
+    if (q?.kind) p.set('kind', q.kind)
+    if (q?.search) p.set('q', q.search)
+    p.set('limit', String(q?.limit ?? 50))
+    p.set('offset', String(q?.offset ?? 0))
+    // The Rust API returns a bare array; we add total from /stats for the UI.
+    const [rows, stats] = await Promise.all([
+      req<CatalogEngine[]>(`/api/catengine?${p}`),
+      req<CatalogStats>('/api/catengine/stats').catch(() => null),
+    ])
+    return { data: rows, total: stats?.total ?? rows.length }
+  },
+  catalogImport: (directory?: string) =>
+    req<ImportResult>('/api/catengine/import', {
+      method: 'POST',
+      body: JSON.stringify({ directory: directory ?? null }),
+    }),
+  catalogStats: () => req<CatalogStats>('/api/catengine/stats'),
+
+  projectList: () => req<Project[]>('/api/projects'),
+  projectGet: (id: string) => req<any>(`/api/projects/${id}`),
+  projectCreate: (p: { name: string; description?: string }) =>
+    req<Project>('/api/projects', { method: 'POST', body: JSON.stringify(p) }),
+
+  keywordList: (projectId: string) => req<Keyword[]>(`/api/projects/${projectId}/keywords`),
+  keywordAdd: (projectId: string, text: string) =>
+    req<Keyword>(`/api/projects/${projectId}/keywords`, { method: 'POST', body: JSON.stringify({ text }) }),
+  keywordAddBulk: (projectId: string, keywords: string[]) =>
+    req<KeywordBulkResult>(`/api/projects/${projectId}/keywords/bulk`, { method: 'POST', body: JSON.stringify({ keywords }) }),
+  keywordDelete: (projectId: string, keywordId: string) =>
+    req<void>(`/api/projects/${projectId}/keywords/${keywordId}`, { method: 'DELETE' }),
+
+  // — F#11 Projects UI polish: full CRUD —
+  projectUpdate: (id: string, p: { name: string; description?: string }) =>
+    req<Project>(`/api/projects/${id}`, { method: 'PUT', body: JSON.stringify(p) }),
+  projectDelete: (id: string) =>
+    req<void>(`/api/projects/${id}`, { method: 'DELETE' }),
+  engineList: (projectId: string) => req<EngineRow[]>(`/api/projects/${projectId}/engines`),
+  engineAdd: (projectId: string, e: { engine_name: string; engine_type?: string; url?: string; file_path?: string; step_count?: number }) =>
+    req<EngineRow>(`/api/projects/${projectId}/engines`, { method: 'POST', body: JSON.stringify(e) }),
+  engineUpdate: (projectId: string, engineId: string, e: { engine_name: string; engine_type?: string; url?: string; step_count?: number }) =>
+    req<EngineRow>(`/api/projects/${projectId}/engines/${engineId}`, { method: 'PUT', body: JSON.stringify(e) }),
+  engineDelete: (projectId: string, engineId: string) =>
+    req<void>(`/api/projects/${projectId}/engines/${engineId}`, { method: 'DELETE' }),
+  engineToggle: (projectId: string, engineId: string, enabled: boolean) =>
+    req<EngineRow>(`/api/projects/${projectId}/engines/${engineId}/enabled`, { method: 'PUT', body: JSON.stringify({ enabled }) }),
+  jobList: (projectId: string, status?: string) =>
+    req<JobRow[]>(`/api/projects/${projectId}/jobs` + (status ? `?status=${status}` : '')),
+  jobCreate: (projectId: string, engineId?: string, keywordId?: string) =>
+    req<JobRow>(`/api/projects/${projectId}/jobs`, { method: 'POST', body: JSON.stringify({ engine_id: engineId ?? null, keyword_id: keywordId ?? null }) }),
+  jobCancel: (jobId: string) =>
+    req<JobRow>(`/api/jobs/${jobId}/cancel`, { method: 'POST' }),
+  jobResults: (jobId: string) =>
+    req<unknown[]>(`/api/jobs/${jobId}/results`),
+  projectResults: (projectId: string, kind?: string, limit?: number) => {
+    const p = new URLSearchParams()
+    if (kind) p.set('kind', kind)
+    if (limit) p.set('limit', String(limit))
+    const q = p.toString()
+    return req<ProjectResult[]>(`/api/projects/${projectId}/results` + (q ? `?${q}` : ''))
+  },
+  projectStats: (projectId: string) => req<ResultStats>(`/api/projects/${projectId}/results/stats`),
+
+  // — F#13 proxy support (GSA "proxy list") —
+  proxyList: () => req<ProxyRow[]>('/api/proxies'),
+  proxyAdd: (p: { host: string; port: number; kind?: string; login?: string; password?: string }) =>
+    req<ProxyRow>('/api/proxies', { method: 'POST', body: JSON.stringify(p) }),
+  proxyDelete: (id: string) => req<void>(`/api/proxies/${id}`, { method: 'DELETE' }),
+  proxySetEnabled: (id: string, enabled: boolean) =>
+    req<ProxyRow>(`/api/proxies/${id}/enabled`, { method: 'PUT', body: JSON.stringify({ enabled }) }),
+  proxyTest: (id: string) =>
+    req<ProxyTestResult>(`/api/proxies/${id}/test`, { method: 'POST' }),
+  projectSetUseProxies: (projectId: string, useProxies: boolean) =>
+    req<Project>(`/api/projects/${projectId}/proxies`, { method: 'PUT', body: JSON.stringify({ use_proxies: useProxies }) }),
+
+  // — F#12 email-runner glue: run now + operator mailbox + email engine field —
+  runProject: (projectId: string) =>
+    req<RunSummary>(`/api/projects/${projectId}/run`, { method: 'POST' }),
+  emailGet: () => req<EmailSetting>('/api/settings/email'),
+  emailSet: (s: { address: string; password: string }) =>
+    req<{ status: string }>('/api/settings/email', {
+      method: 'PUT',
+      body: JSON.stringify(s),
+    }),
+}

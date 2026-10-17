@@ -1,0 +1,820 @@
+//! # Step executor — the shared contract between engine, driver, and worker.
+//!
+//! Turn a [engine::Engine] plus a project context (keyword, target URL,
+//! optional anchor, seed, files, extra vars) into a [SubmissionPlan]:
+//! one ordered list of [StepPlan]s, each carrying its **navigation**
+//! (find_link / find_url / form_url / alternative_url), its **outcome
+//! matchers** (submit success / failed / captcha failed / failed-retry),
+//! its **verify config** (verify_url / verify_by / front-back delims),
+//! and its **form fields** (fully-resolved, concrete, ready to be POSTed
+//! or typed into a webview).
+//!
+//! [`execute_plan`] drives that plan through a [`driver::Driver`] (HTTP
+//! in #6, browser in #7), applies [`classify_step`], extracts the created
+//! link via [`extract_result_url`], and returns an [`ExecutionReport`].
+//!
+//! ## Determinism
+//!
+//! Every random draw flows through [engine::spin] (SplitMix64 + seed).
+//! Same input + same seed ⇒ byte-for-byte the same plan.
+//!
+//! ## What we deliberately don't do (yet)
+//!
+//! * Network I/O — the `Driver` trait abstracts that; this module is pure.
+//! * CAPTCHA solving — classified as [StepOutcome::CaptchaFailed], the
+//!   caller decides whether to retry, fetch a solver, or mark failed.
+//! * Multi-domain / multi-language — one engine, one target per run.
+
+use std::collections::HashMap;
+
+use serde::Serialize;
+
+use super::enginespec::{Engine, Step};
+use super::spin::{Context, SpintaxResolver};
+
+// ---------------------------------------------------------------------------
+//  Public data types
+// ---------------------------------------------------------------------------
+
+/// A project-level context the executor needs.  The minimum the GSA app
+/// always knows: the target URL and a keyword.  Everything else flows in
+/// as [SubmissionInput::extra] or [SubmissionInput::files].
+#[derive(Debug, Clone, Default)]
+pub struct SubmissionInput {
+    /// The site the backlink should point to (typically the project's URL).
+    pub url: String,
+    /// The keyword the project is optimising for.  GSA uses this as the
+    /// fallback for `%anchor_text%` when no article-specific anchor is set.
+    pub keyword: String,
+    /// Optional explicit anchor (overrides the keyword fallback).
+    pub anchor: Option<String>,
+    /// Optional spintax seed.  `None` ⇒ [SpintaxResolver::default()] (i.e.
+    /// `0xA11CE_5EED | 1` per submission; deterministic).
+    pub seed: Option<u64>,
+    /// Additional concrete values, looked up case-insensitively.
+    pub extra: HashMap<String, String>,
+    /// Spin data files, name → body (used by `%spinfile-NAME%`).
+    pub files: HashMap<String, String>,
+    /// Candidates for `%random_option%`.
+    pub random_options: Vec<String>,
+}
+
+impl SubmissionInput {
+    /// Resolve this input into a [Context] for the spintax resolver.
+    ///
+    /// GSA exposes **data sections** (like `[description_250]`, `[article]`,
+    /// `[kw]`) as direct `%name%` variables — `description_250`, `article`,
+    /// `kw` are all looked up in the *values* map.  Spintax **spinfiles** are
+    /// addressed separately as `%spinfile-NAME%`.  We therefore promote the
+    /// file contents into both `values` and `files` so both addressing
+    /// styles resolve correctly.
+    pub fn into_context(&self) -> Context {
+        let mut ctx = Context {
+            values: HashMap::new(),
+            files: self.files.clone(),
+            random_options: self.random_options.clone(),
+        };
+        // GSA's always-defined variables (name / keyword / url / e-mail).
+        ctx.set("url", &self.url);
+        if !self.keyword.is_empty() {
+            ctx.set("keyword", &self.keyword);
+            ctx.set("anchor_text", &self.anchor.clone().unwrap_or_else(|| self.keyword.clone()));
+        }
+        if let Some(a) = &self.anchor {
+            ctx.set("anchor_text", a);
+        }
+        // Data sections → values (direct %name% addresses).
+        for (k, v) in &self.files {
+            ctx.set(k, v);
+        }
+        for (k, v) in &self.extra {
+            ctx.set(k, v);
+        }
+        ctx
+    }
+}
+
+/// A single step's **navigation contract**.  What the driver must do to
+/// reach the form this step POSTs into.  Every field holds the raw raw
+/// engine value; `.split_alts()` returns the already-split candidates as
+/// a [`Vec<String>`].
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StepNav {
+    /// How to find the form link — split by `|`.  Globs (`*...`) and
+    /// substrings are both supported for matching.
+    pub find_link: Vec<String>,
+    /// URL the link points to — split by `|`.
+    pub find_url: Vec<String>,
+    /// Alternative target URL(s) — split by `|`.
+    pub alternative_url: Vec<String>,
+    /// The form's `action` / `form url` — split by `|`.
+    pub form_url: Vec<String>,
+    /// The form's `name=` — split by `|`.
+    pub form_name: Vec<String>,
+    /// `link type=Profile-URL` / `link type=URL` / etc. (raw).
+    pub link_type: Option<String>,
+    /// `modify url=...` — raw, usually the URL that must end with the
+    /// submitted URL.
+    pub modify_url: Option<String>,
+}
+
+impl StepNav {
+    fn split(v: Option<&str>) -> Vec<String> {
+        v.map(|s| s.split('|').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Best-fit target URL for the driver to navigate to: first candidate
+    /// of `form_url`, else `alternative_url`, else `find_url`, else `find_link`.
+    pub fn navigation_target(&self) -> Option<String> {
+        self.form_url.first()
+            .cloned()
+            .or_else(|| self.alternative_url.first().cloned())
+            .or_else(|| self.find_url.first().cloned())
+            .or_else(|| self.find_link.first().cloned())
+    }
+}
+
+/// How the response HTML should be classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepOutcome {
+    /// The response matched this step's `submit success` (or no matcher).
+    Success,
+    /// The response matched this step's `submit failed` (or any known
+    /// failure phrase — captcha / duplicate / invalid) and should be
+    /// retried per `submit failed retry`.
+    FailedRetry,
+    /// The response matched `submit failed` (or any known failure phrase)
+    /// and there is no retry strategy — caller should mark job failed.
+    Failed,
+    /// The response matched `captcha failed` — solver or human input needed.
+    CaptchaFailed,
+    /// The response matched none of the known matchers.
+    Unknown,
+}
+
+/// Classification of one step's response.
+#[derive(Debug, Clone, Serialize)]
+pub struct StepOutcomeRef {
+    pub outcome: StepOutcome,
+    /// The specific matcher phrase that matched, for UI surfacing.
+    pub matched_phrase: Option<String>,
+}
+
+/// A single resolved step (what the driver will actually do).
+#[derive(Debug, Clone, Serialize)]
+pub struct StepPlan {
+    /// Human-facing name, e.g. `register_step1`, `step2`, `delete_step1`.
+    pub name: String,
+    /// The step's phase, for UI ordering.
+    pub phase: StepPhase,
+    /// Phase-specific step number within the engine (1 for step1).
+    pub order: u32,
+    /// Navigation contract.
+    pub nav: StepNav,
+    /// Form field values, fully resolved (concrete, no spintax).
+    pub fields: HashMap<String, String>,
+    /// Expected outcome matchers (raw strings; [classify_step] matches them).
+    pub success: Vec<String>,
+    pub failed: Vec<String>,
+    pub failed_retry: Vec<String>,
+    pub captcha_failed: Vec<String>,
+}
+
+/// The phase a [StepPlan] belongs to — drives ordering + UI labels.
+/// Order = GSA's execution order: register → login → submit → extra → delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepPhase {
+    Register,
+    Login,
+    Submit,
+    Extra,
+    Delete,
+}
+
+/// The full resolved plan for one engine run.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubmissionPlan {
+    pub engine_name: String,
+    pub engine_type: String,
+    pub target_url: String,
+    pub anchor: Option<String>,
+    pub seed: u64,
+    /// Ordered steps, driver ready.  Register → Login → Submit → Extra → Delete.
+    pub steps: Vec<StepPlan>,
+    /// Which [`Driver`] implementation should execute this plan — decided by
+    /// [`crate::routing::required_driver_kind`] from the engine's markers.
+    /// The executor dispatches to `HttpDriver` or `BrowserDriver` based on
+    /// this field (see F#8 queue + F#10 project runner).
+    pub required_driver: crate::routing::DriverKind,
+    /// Fields the plan had no value for (typically because the project did
+    /// not set one) — useful for the UI to surface "fill me" prompts.
+    pub unresolved_fields: Vec<String>,
+}
+
+/// The result of driving a [SubmissionPlan] with a [driver::Driver].
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutionReport {
+    /// Number of steps that matched `submit success`.
+    pub successful: usize,
+    /// Number of steps that matched `submit failed` and had no retry.
+    pub failed: usize,
+    /// Number of steps that returned `submit failed retry`.
+    pub retried: usize,
+    /// Number of steps that hit a captcha.
+    pub captcha_failed: usize,
+    /// The created link (URL) — populated on success when the verify URL
+    /// or the response itself exposes the anchor.
+    pub submitted_url: Option<String>,
+    /// The HTML fragment the created-link was read from (for UI debugging).
+    pub submitted_url_source: Option<String>,
+    /// Errors the driver reported (network, timeouts, …) — one per step.
+    pub errors: Vec<String>,
+    /// Per-step outcomes, in plan order.
+    pub steps: Vec<StepOutcomeRef>,
+}
+
+// ---------------------------------------------------------------------------
+//  Resolution: Engine + SubmissionInput -> SubmissionPlan
+// ---------------------------------------------------------------------------
+
+/// Resolve an engine + context into a [SubmissionPlan].
+///
+/// * Steps are ordered Register → Login → Submit → Extra → Delete.
+/// * Each step's spintax is rendered **once** against the seeded context.
+/// * Unresolved `%name%` tokens are preserved verbatim *and* recorded in
+///   [SubmissionPlan::unresolved_fields] so the UI can flag them.
+pub fn resolve_plan(engine: &Engine, input: &SubmissionInput) -> SubmissionPlan {
+    let seed = input.seed.unwrap_or(SpintaxResolver::default().seed());
+    let resolver = SpintaxResolver::new(seed);
+    let ctx = input.into_context();
+
+    let mut ordered: Vec<StepPlan> = engine
+        .steps
+        .iter()
+        .filter(|s| is_submission_step(&s.name))
+        .map(|s| resolve_step(s, &resolver, &ctx))
+        .collect();
+    // Stable sort: Register < Login < Submit < Extra < Delete, then numeric.
+    ordered.sort_by_key(|sp| (sp.phase, sp.order));
+
+    let mut unresolved = Vec::new();
+    for sp in ordered.iter() {
+        for (k, v) in sp.fields.iter() {
+            if value_is_unresolved(v) {
+                unresolved.push(format!("{}: {}", k, v));
+            }
+        }
+    }
+
+    SubmissionPlan {
+        engine_name: engine.name.clone(),
+        engine_type: engine.engine_type.to_string(),
+        target_url: engine.url.clone(),
+        anchor: input.anchor.clone(),
+        seed,
+        steps: ordered,
+        required_driver: crate::routing::required_driver_kind(engine),
+        unresolved_fields: unresolved,
+    }
+}
+
+fn resolve_step(
+    step: &Step,
+    resolver: &SpintaxResolver,
+    ctx: &Context,
+) -> StepPlan {
+    let (phase, order) = phase_and_order(&step.name);
+    // `field()` returns `Option<&String>`; hand `split()` an `Option<&str>`.
+    let f = |k: &str| step.field(k).map(|s| s.as_str());
+    let nav = StepNav {
+        find_link: StepNav::split(f("find link")),
+        find_url: StepNav::split(f("find url")),
+        alternative_url: StepNav::split(f("alternative url")),
+        form_url: StepNav::split(f("form url")),
+        form_name: StepNav::split(f("form name")),
+        link_type: f("link type").map(str::to_string),
+        modify_url: f("modify url").map(str::to_string),
+    };
+
+    let mut fields = HashMap::new();
+    for (_k, f) in step.fields.iter() {
+        let resolved = resolver.resolve(&f.value, ctx);
+        let key_norm = f.key.to_string();
+        fields.insert(key_norm, resolved);
+    }
+
+    StepPlan {
+        name: step.name.clone(),
+        phase,
+        order,
+        nav,
+        fields,
+        success: StepNav::split(f("submit success")),
+        failed: StepNav::split(f("submit failed")),
+        failed_retry: StepNav::split(f("submit failed retry")),
+        captcha_failed: StepNav::split(f("captcha failed")),
+    }
+}
+
+/// Determine the (phase, order) tuple for a step by its name.
+fn phase_and_order(name: &str) -> (StepPhase, u32) {
+    let n = name.to_ascii_lowercase();
+    let order = n.rsplit(|c: char| !c.is_ascii_digit()).next().and_then(|d| d.parse().ok()).unwrap_or(1);
+    if n.starts_with("register") {
+        (StepPhase::Register, order)
+    } else if n.starts_with("login") {
+        (StepPhase::Login, order)
+    } else if n.starts_with("delete") {
+        (StepPhase::Delete, order)
+    } else if n.starts_with("extra") {
+        (StepPhase::Extra, order)
+    } else {
+        (StepPhase::Submit, order)
+    }
+}
+
+/// A section is a *submission step* only if it is a real GSA step
+/// (`step1`, `register_step1`, `login_step1`, `delete_step1`,
+/// `extra_step1`, …).  Metadata sections (`engine`, `setup`, `account`,
+/// `verify`, data sections like `url`/`login`/`article`) are NOT steps and
+/// must not be turned into driver actions.  Rule: after stripping
+/// non-alphanumerics the name must contain `step`.
+fn is_submission_step(name: &str) -> bool {
+    let compact: String = name
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    compact.contains("step")
+}
+
+/// Cheap heuristic for "this resolved value still has %name% in it".
+fn value_is_unresolved(v: &str) -> bool {
+    v.contains('%') && v.split('%').count() >= 3
+}
+
+// ---------------------------------------------------------------------------
+//  Classification: response HTML -> StepOutcome
+// ---------------------------------------------------------------------------
+
+/// Classify a step's response HTML against its outcome matchers.
+///
+/// Matcher priority: **captcha failed** > **submit failed retry** >
+/// **submit failed** > **submit success** > unknown.
+///
+/// Matching is case-insensitive substring; phrases are `|`-alternatives,
+/// so the caller passes the already-split list of candidate phrases.
+pub fn classify_step(step: &StepPlan, html: &str) -> StepOutcomeRef {
+    let hay = html.to_ascii_lowercase();
+    for (phrase, out) in step.captcha_failed.iter().flat_map(|p| p.split('|').map(|p| (p, StepOutcome::CaptchaFailed)))
+        .chain(step.failed_retry.iter().flat_map(|p| p.split('|').map(|p| (p, StepOutcome::FailedRetry))))
+        .chain(step.failed.iter().flat_map(|p| p.split('|').map(|p| (p, StepOutcome::Failed))))
+        .chain(step.success.iter().flat_map(|p| p.split('|').map(|p| (p, StepOutcome::Success))))
+    {
+        let needle = phrase.trim().to_ascii_lowercase();
+        if !needle.is_empty() && hay.contains(&needle) {
+            return StepOutcomeRef {
+                outcome: out,
+                matched_phrase: Some(needle),
+            };
+        }
+    }
+    StepOutcomeRef { outcome: StepOutcome::Unknown, matched_phrase: None }
+}
+
+// ---------------------------------------------------------------------------
+//  Result URL extraction (GSA `verify by=url` + `verify url=...`)
+// ---------------------------------------------------------------------------
+
+/// Extract the created link from the response HTML, per GSA's verify
+/// contract:
+///
+/// 1. If the step specifies `modify url` (or a known "result URL" shape),
+///    try `front`/`back` extraction between them.
+/// 2. Else call [engine::extraction::find_url] to pull the first absolute
+///    href that contains any of the step's `find url` candidates.
+/// 3. Else, if a [SubmissionInput::url] is in the response, extract it.
+pub fn extract_result_url(step: &StepPlan, html: &str, target: Option<&str>) -> Option<String> {
+    use super::extraction::{find_bare_url, find_url};
+
+    // 1. Every navigation hint (`find url`, `alternative url`, `modify url`)
+    //    is a matcher: pull the first absolute href on the page that contains
+    //    it (after stripping glob/star/dot prefixes GSA uses for matches).
+    let mut candidates: Vec<&String> =
+        step.nav.find_url.iter().chain(step.nav.alternative_url.iter()).collect();
+    if let Some(m) = &step.nav.modify_url {
+        candidates.push(m);
+    }
+    for candidate in candidates.iter() {
+        let c = candidate.trim().trim_start_matches('*').trim_start_matches('.');
+        if c.is_empty() {
+            continue;
+        }
+        if let Some(u) = find_url(html, c) {
+            return Some(u);
+        }
+    }
+    // 2. Fallback: the project URL itself (GSA: the submitted `%url%`).
+    if let Some(t) = target {
+        let bare = t
+            .trim()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("www.");
+        if !bare.is_empty() {
+            if let Some(u) = find_url(html, bare) {
+                return Some(u);
+            }
+        }
+    }
+    // 3. Bare-text fallback: GSA also records created links that sit in
+    //    confirmation text rather than an `<a href>`. Try each navigation
+    //    hint, then the project URL, as a substring scan over the whole body.
+    for hint in candidates.iter() {
+        let h = hint.trim().trim_start_matches('*').trim_start_matches('.');
+        if !h.is_empty() {
+            if let Some(u) = find_bare_url(html, h) {
+                return Some(u);
+            }
+        }
+    }
+    if let Some(t) = target {
+        let b = t
+            .trim()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("www.");
+        if !b.is_empty() {
+            if let Some(u) = find_bare_url(html, b) {
+                return Some(u);
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+//  Execution loop — drive a [SubmissionPlan] through a [driver::Driver]
+// ---------------------------------------------------------------------------
+
+use super::driver::{Driver, DriverResponse};
+
+/// Drive `plan.steps` through `driver`, applying [classify_step] and
+/// [extract_result_url] at each step.
+///
+/// This is the *shared contract* between the executor and the (as-yet
+/// unimplemented) HTTP (#6) / browser (#7) drivers — they implement
+/// [Driver], the executor just consumes the response.
+pub async fn execute_plan(
+    plan: &SubmissionPlan,
+    driver: &dyn Driver,
+) -> ExecutionReport {
+    let mut report = ExecutionReport {
+        successful: 0,
+        failed: 0,
+        retried: 0,
+        captcha_failed: 0,
+        submitted_url: None,
+        submitted_url_source: None,
+        errors: Vec::new(),
+        steps: Vec::new(),
+    };
+    for step in plan.steps.iter() {
+        let target = step.nav.navigation_target().unwrap_or_else(|| plan.target_url.clone());
+        // A step that carries form fields is a *submit* step (register /
+        // login / step-N); a step without fields is a read-only navigate
+        // (e.g. `delete_step1` typically has `just download=1` and no form).
+        let res: DriverResponse = if !step.fields.is_empty() {
+            driver.submit(target.clone(), step.fields.clone(), std::time::Duration::from_secs(30)).await
+        } else {
+            driver.navigate(target.clone()).await
+        };
+        if !res.ok {
+            report.errors.push(format!("{}: {}", step.name, res.error.unwrap_or_default()));
+            report.failed += 1;
+            report.steps.push(StepOutcomeRef {
+                outcome: StepOutcome::Failed,
+                matched_phrase: None,
+            });
+            continue;
+        }
+        let outcome = classify_step(step, &res.html);
+        if let Some(u) = extract_result_url(step, &res.html, Some(&plan.target_url)) {
+            report.submitted_url = report.submitted_url.clone().or(Some(u.clone()));
+            report.submitted_url_source = Some(format!("{}: {}", step.name, u));
+        }
+        match outcome.outcome {
+            StepOutcome::Success => report.successful += 1,
+            StepOutcome::Failed => report.failed += 1,
+            StepOutcome::FailedRetry => report.retried += 1,
+            StepOutcome::CaptchaFailed => report.captcha_failed += 1,
+            StepOutcome::Unknown => {
+                report.errors.push(format!("{}: unknown outcome", step.name));
+                report.failed += 1;
+            }
+        }
+        report.steps.push(outcome);
+    }
+    report
+}
+
+// ===========================================================================
+//  Tests: real engine files, classification, extraction, ordering,
+//  determinism, and the execute_plan loop with a stub driver.
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::MockDriver;
+    use crate::enginespec::parse_engine_str;
+    use std::collections::HashMap;
+
+    // -- helpers -------------------------------------------------------------
+
+    fn test_input() -> SubmissionInput {
+        SubmissionInput {
+            url: "https://mysite.example/".to_string(),
+            keyword: "buy shoes online".to_string(),
+            anchor: None,
+            seed: Some(0xC0FFEE),
+            extra: HashMap::from([
+                ("login".to_string(), "serlogin1".to_string()),
+                ("password".to_string(), "serpass123".to_string()),
+                ("captcha".to_string(), "abc123".to_string()),
+            ]),
+            files: HashMap::from([
+                ("description_250".to_string(), "A really {long|short} description about shoes.".to_string()),
+            ]),
+            random_options: Vec::new(),
+        }
+    }
+
+    fn aardvark_engine() -> Engine {
+        let raw = std::fs::read(
+            r"C:\Users\kingsly\Downloads\GSA_SER_v18.20_FINAL\GSA_SER_v18.20_FINAL\Engines\Aardvark Topsites.ini",
+        )
+        .expect("Aardvark Topsites.ini must be on this machine");
+        // File is Windows-1252; lossy-decode like the real import pipeline does.
+        let raw = String::from_utf8_lossy(&raw).into_owned();
+        parse_engine_str(&raw, "Aardvark Topsites").unwrap()
+    }
+
+    // -- resolve_plan --------------------------------------------------------
+
+    #[test]
+    fn resolve_plan_orders_register_before_login_before_submit() {
+        let eng = aardvark_engine();
+        let plan = resolve_plan(&eng, &test_input());
+        let names: Vec<_> = plan.steps.iter().map(|s| s.name.to_ascii_lowercase()).collect();
+        let idx_register = names.iter().position(|n| n.starts_with("register")).expect("has register");
+        let idx_login = names.iter().position(|n| n.starts_with("login")).expect("has login");
+        let idx_submit = names.iter().position(|n| n == "step1").expect("has step1");
+        let idx_delete = names.iter().position(|n| n.starts_with("delete")).expect("has delete");
+        assert!(idx_register < idx_login, "register {} must come before login {}", idx_register, idx_login);
+        assert!(idx_login < idx_submit, "login {} must come before submit {}", idx_login, idx_submit);
+        assert!(idx_submit < idx_delete, "submit {} must come before delete {}", idx_submit, idx_delete);
+    }
+
+    #[test]
+    fn resolve_plan_resolves_spintax_in_fields() {
+        let eng = aardvark_engine();
+        let plan = resolve_plan(&eng, &test_input());
+        // The Aardvark register step fills `url=%url%` → must become the
+        // concrete target URL after resolve.
+        let register = plan
+            .steps
+            .iter()
+            .find(|s| s.name.to_ascii_lowercase().starts_with("register"))
+            .expect("register step");
+        let url_field = register
+            .fields
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == "url")
+            .map(|(_, v)| v.clone());
+        // GSA's Aardvark register uses `url=%url%` which resolves to the
+        // project URL.
+        assert_eq!(url_field.as_deref(), Some("https://mysite.example/"));
+        // description=%description_250% → the file's random item (spintax
+        // resolved; one of "A really long description about shoes." or
+        // "A really short description about shoes.").
+        let desc = register
+            .fields
+            .iter()
+            .find(|(k, _)| k.to_ascii_lowercase() == "description")
+            .map(|(_, v)| v.clone())
+            .expect("description field");
+        assert!(
+            desc == "A really long description about shoes."
+                || desc == "A really short description about shoes.",
+            "got: {desc}"
+        );
+    }
+
+    #[test]
+    fn resolve_plan_records_unresolved_fields() {
+        let raw = r#"
+[engine]
+name=Test
+engine type=Directory
+url=http://example.com
+
+[step 1]
+url=%url%
+title=%anchor_text%
+custom=%totally_undefined_variable%
+"#;
+        let eng = parse_engine_str(raw, "Test").unwrap();
+        let input = SubmissionInput {
+            url: "https://target.example/".into(),
+            keyword: "k".into(),
+            anchor: Some("anchor".into()),
+            seed: Some(1),
+            ..Default::default()
+        };
+        let plan = resolve_plan(&eng, &input);
+        assert_eq!(plan.steps.len(), 1);
+        let step = &plan.steps[0];
+        assert_eq!(step.fields.get("url").map(|s| s.as_str()), Some("https://target.example/"));
+        assert!(plan.unresolved_fields.iter().any(|f| f.contains("totally_undefined_variable")));
+    }
+
+    #[test]
+    fn resolve_plan_is_deterministic_with_same_seed() {
+        let eng = aardvark_engine();
+        let a = resolve_plan(&eng, &test_input());
+        let b = resolve_plan(&eng, &test_input());
+        // Every field, every step, in order.
+        assert_eq!(a.steps.len(), b.steps.len());
+        for (sa, sb) in a.steps.iter().zip(b.steps.iter()) {
+            assert_eq!(sa.name, sb.name);
+            assert_eq!(sa.fields, sb.fields);
+            assert_eq!(sa.nav.find_link, sb.nav.find_link);
+        }
+    }
+
+    #[test]
+    fn resolve_plan_preserves_unknown_variables_verbatim() {
+        let raw = "[step 1]\r\nfoo=%leave%\r\nbar=%never_defined%";
+        let eng = parse_engine_str(raw, "X").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        let s = &plan.steps[0];
+        assert_eq!(s.fields.get("foo").map(|v| v.as_str()), Some(""));
+        assert_eq!(s.fields.get("bar").map(|v| v.as_str()), Some("%never_defined%"));
+    }
+
+    // -- classify_step -------------------------------------------------------
+
+    fn step_with(success: &str, failed: &str, captcha: &str) -> StepPlan {
+        StepPlan {
+            name: "x".into(),
+            phase: StepPhase::Submit,
+            order: 1,
+            nav: StepNav::default(),
+            fields: HashMap::new(),
+            success: StepNav::split(Some(success)),
+            failed: StepNav::split(Some(failed)),
+            failed_retry: Vec::new(),
+            captcha_failed: StepNav::split(Some(captcha)),
+        }
+    }
+
+    #[test]
+    fn classify_precedence_captcha_beats_failed_beats_success() {
+        let step = step_with("thank you for submitting", "username taken", "captcha does not match");
+        let html = "<h1>thank you for submitting</h1>";
+        assert_eq!(classify_step(&step, html).outcome, StepOutcome::Success);
+        let html = "username taken on this domain";
+        assert_eq!(classify_step(&step, html).outcome, StepOutcome::Failed);
+        let html = "the captcha does not match the image";
+        assert_eq!(classify_step(&step, html).outcome, StepOutcome::CaptchaFailed);
+        // Captcha takes precedence over success even when both are present.
+        let html = "thank you for submitting — but the captcha does not match";
+        assert_eq!(classify_step(&step, html).outcome, StepOutcome::CaptchaFailed);
+        // Unknown when none match.
+        let html = "completely different page";
+        assert_eq!(classify_step(&step, html).outcome, StepOutcome::Unknown);
+    }
+
+    #[test]
+    fn classify_is_case_insensitive() {
+        let step = step_with("Thank You", "", "");
+        assert_eq!(classify_step(&step, "thAnK yOu").outcome, StepOutcome::Success);
+        assert_eq!(classify_step(&step, "THANK YOU FOR JOINING").outcome, StepOutcome::Success);
+    }
+
+    // -- extract_result_url --------------------------------------------------
+
+    #[test]
+    fn extract_prefers_modify_url_when_set() {
+        let mut step = step_with("", "", "");
+        step.nav.modify_url = Some("https://site.example/result/".into());
+        let html = r#"<a href="https://site.example/result/?id=abc123">ok</a>"#;
+        // modify url is just a prefix hint; find_url will find an absolute
+        // href containing that substring.
+        assert_eq!(
+            extract_result_url(&step, html, None),
+            Some("https://site.example/result/?id=abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_falls_back_to_target_url_when_no_matcher_set() {
+        let step = step_with("", "", "");
+        let html = r#"<a href="https://target.example/p?id=xyz">Link</a>"#;
+        assert_eq!(
+            extract_result_url(&step, html, Some("https://target.example/")),
+            Some("https://target.example/p?id=xyz".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_returns_none_when_nothing_matches() {
+        let step = step_with("ok", "", "");
+        let html = "<p>a page with no links</p>";
+        assert_eq!(extract_result_url(&step, html, Some("https://elsewhere.example/")), None);
+    }
+
+    // -- execute_plan --------------------------------------------------------
+
+    #[tokio::test]
+    async fn execute_plan_reports_success_and_extracts_url() {
+        let raw = r#"
+[engine]
+name=Fake Directory
+engine type=Directory
+url=http://dir.example/
+
+[step 1]
+url=%url%
+title=%anchor_text%
+submit success=thank you for joining
+captcha failed=
+find url=dir.example/profile
+"#;
+        let eng = parse_engine_str(raw, "Fake Directory").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        let driver = MockDriver::with_html(
+            "<html><body>thank you for joining! <a href=\"https://dir.example/profile/abc123\">your profile</a></body></html>",
+        );
+        let report = execute_plan(&plan, &driver).await;
+        assert_eq!(report.successful, 1, "expected 1 success; report = {report:?}");
+        assert_eq!(report.failed, 0);
+        assert_eq!(
+            report.submitted_url.as_deref(),
+            Some("https://dir.example/profile/abc123")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_plan_reports_captcha_and_unknown() {
+        let raw = r#"
+[engine]
+name=F
+engine type=Directory
+url=http://d.example/
+
+[step 1]
+url=%url%
+submit success=ok
+submit failed=error
+captcha failed=captcha
+"#;
+        let eng = parse_engine_str(raw, "F").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        let driver = MockDriver::with_html("the captcha does not match");
+        let report = execute_plan(&plan, &driver).await;
+        assert_eq!(report.captcha_failed, 1);
+        assert_eq!(report.steps[0].outcome, StepOutcome::CaptchaFailed);
+        assert!(report
+            .steps[0]
+            .matched_phrase
+            .as_deref()
+            .unwrap_or("")
+            .contains("captcha"));
+    }
+
+    #[tokio::test]
+    async fn execute_plan_reports_driver_error() {
+        let raw = r#"
+[engine]
+name=E
+engine type=url-shortener
+url=http://s.example/
+
+[step 1]
+url=%url%
+submit success=ok
+"#;
+        let eng = parse_engine_str(raw, "E").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        let driver = MockDriver::fail_with("connection reset");
+        let report = execute_plan(&plan, &driver).await;
+        assert_eq!(report.failed, 1);
+        assert!(!report.errors.is_empty());
+        assert!(report.errors[0].contains("connection reset"));
+    }
+}

@@ -1,0 +1,23 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ser-replica-db
+    environment:
+      POSTGRES_USER: ser
+      POSTGRES_PASSWORD: ser
+      POSTGRES_DB: ser
+    ports:
+      # Host 5432 is taken by the SMS stack's native Postgres, so publish to 5433.
+      # Inside the container Postgres still listens on 5432 (the 5432 side of the map).
+      - "5433:5432"
+    volumes:
+      - ser_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ser -d ser"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  ser_pgdata:

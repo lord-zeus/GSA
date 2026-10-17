@@ -1,0 +1,10 @@
+# Windows build env: GNU toolchain + WinLibs mingw linker (no VS Build Tools here).
+# With this file, plain `cargo test` / `cargo run` work with NO env vars.
+[target.x86_64-pc-windows-gnu]
+linker = "C:/Users/kingsly/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/x86_64-w64-mingw32-g++.exe"
+
+# MinGW's C runtime encodes stdout through the Windows ANSI code page
+# (Windows-1252) — non-Latin-1 characters like em-dashes come out as
+# "â".  Force UTF-8 so console output is correct.
+[env]
+LC_ALL = { value = "C.UTF-8", force = true }

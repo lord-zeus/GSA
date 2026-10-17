@@ -1,0 +1,38 @@
+[package]
+name = "ser-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Core functionality engine of the GSA Search Engine Ranker replica: spintax/spin resolution, engine-spec parsing, URL/field helpers and extraction."
+license = "MIT"
+
+[lib]
+name = "engine"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["cookies", "charset", "http2", "socks"] }
+# --- browser bridge (Feature #7) ---
+tokio = { version = "1", features = ["process", "time", "rt-multi-thread", "sync", "macros", "io-util", "net"] }
+# --- POP3 mail transport (Feature #12) — TLS upgrade for port 995 / STARTTLS.
+# Both crates already resolve in the workspace lockfile via reqwest's defaults,
+# so no new transitive trees are pulled in.
+native-tls = "0.2"
+tokio-native-tls = "0.3"
+tokio-tungstenite = { version = "0.24", optional = true }
+tungstenite = { version = "0.24", optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[features]
+default = []
+# Enable the real `HttpDriver` (reqwest-backed).  Off by default so the pure
+# engine core can be built/embedded without pulling in network deps.
+http = []
+# Enable the real `WebDriver` (Chrome DevTools Protocol).  Off by default.
+browser = ["dep:tokio-tungstenite", "dep:futures-util", "dep:tungstenite"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

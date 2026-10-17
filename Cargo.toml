@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/engine",
+  "crates/db",
+  "crates/runner",
+  "crates/api",
+  "crates/desktop",
+]
+
+[workspace.package]
+edition = "2021"
+
+[profile.dev]
+opt-level = 1
+debug = "line-tables-only"
