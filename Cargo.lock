@@ -3458,6 +3458,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-stream",
  "tower",
  "tower-http",
  "uuid",
@@ -3501,6 +3502,7 @@ dependencies = [
 name = "ser-engine"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
  "futures-util",
@@ -4661,6 +4663,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

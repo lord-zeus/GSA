@@ -2,8 +2,8 @@ use sqlx::{FromRow, PgPool, Row};
 use uuid::Uuid;
 
 use crate::model::{
-    Engine, Job, JobStatus, Keyword, Project, ProjectResult, Proxy, ResultKind, ResultStats,
-    Schedule, SubmissionResult,
+    Engine, Job, JobStatus, Keyword, NotificationRow, Project, ProjectResult, Proxy, ResultKind,
+    ResultStats, Schedule, SubmissionResult,
 };
 
 /// CRUD + pipeline helpers over the core tables.
@@ -1426,4 +1426,145 @@ impl Repo {
             None => Ok(None),
         }
     }
+
+
+    // ─────────────────────────────────────────────────────────────
+    // F#18 — Notification Center CRUD.
+    // ─────────────────────────────────────────────────────────────
+
+    /// Insert one alert log row. The API's `Notifier` calls this after
+    /// classifying an event; the returned `NotificationRow` is the exact
+    /// shape the SSE stream serializes.
+    pub async fn insert_notification(
+        &self,
+        ntype: &str,
+        severity: &str,
+        project_id: Option<Uuid>,
+        job_id: Option<&str>,
+        title: &str,
+        message: &str,
+        payload: &serde_json::Value,
+    ) -> anyhow::Result<NotificationRow> {
+        let row = sqlx::query(
+            "INSERT INTO notifications (type, severity, project_id, job_id, title, message, payload)\n\
+             VALUES ($1, $2, $3, $4, $5, $6, $7)\n\
+             RETURNING id, type, severity, project_id, job_id, title, message, payload, is_read, created_at",
+        )
+            .bind(ntype)
+            .bind(severity)
+            .bind(project_id)
+            .bind(job_id)
+            .bind(title)
+            .bind(message)
+            .bind(payload)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(NotificationRow {
+            id: row.try_get("id").map_err(|e| anyhow::anyhow!("id: {e}"))?,
+            r#type: row.try_get("type").map_err(|e| anyhow::anyhow!("type: {e}"))?,
+            severity: row.try_get("severity").map_err(|e| anyhow::anyhow!("severity: {e}"))?,
+            project_id: row.try_get::<Option<Uuid>, _>("project_id").unwrap_or(None),
+            job_id: row.try_get::<Option<String>, _>("job_id").unwrap_or(None),
+            title: row.try_get("title").map_err(|e| anyhow::anyhow!("title: {e}"))?,
+            message: row.try_get("message").map_err(|e| anyhow::anyhow!("message: {e}"))?,
+            payload: row.try_get("payload").map_err(|e| anyhow::anyhow!("payload: {e}"))?,
+            is_read: false,
+            created_at: row.try_get("created_at").map_err(|e| anyhow::anyhow!("created_at: {e}"))?,
+        })
+    }
+
+    /// Mark one notification read; `false` if the id doesn't exist.
+    pub async fn mark_notification_read(&self, id: Uuid) -> anyhow::Result<bool> {
+        let n = sqlx::query("UPDATE notifications SET is_read = TRUE WHERE id = $1 AND is_read = FALSE")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(n.rows_affected() > 0)
+    }
+
+    /// Mark every notification read. Returns count affected.
+    pub async fn mark_all_notifications_read(&self) -> anyhow::Result<u64> {
+        let n = sqlx::query("UPDATE notifications SET is_read = TRUE WHERE is_read = FALSE")
+            .execute(&self.pool)
+            .await?;
+        Ok(n.rows_affected())
+    }
+
+    /// Unread count for the bell badge.
+    pub async fn count_unread_notifications(&self) -> anyhow::Result<i64> {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM notifications WHERE is_read = FALSE")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n)
+    }
+
+    /// Notification Center list — newest first, capped.
+    /// `project_id`/`unread_only` are optional filters.
+    pub async fn list_notifications(
+        &self,
+        limit: i64,
+        offset: i64,
+        project_id: Option<Uuid>,
+        unread_only: bool,
+    ) -> anyhow::Result<Vec<NotificationRow>> {
+        let rows: Vec<sqlx::postgres::PgRow> = if unread_only {
+            if let Some(p) = project_id {
+                sqlx::query(
+                    "SELECT id, type, severity, project_id, job_id, title, message, payload, is_read, created_at\n\
+                     FROM notifications WHERE project_id = $1 AND is_read = FALSE\n\
+                     ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+                )
+                .bind(p)
+                .bind(limit)
+                .bind(offset)
+            } else {
+                sqlx::query(
+                    "SELECT id, type, severity, project_id, job_id, title, message, payload, is_read, created_at\n\
+                     FROM notifications WHERE is_read = FALSE\n\
+                     ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+                )
+                .bind(limit)
+                .bind(offset)
+            }
+        } else if let Some(p) = project_id {
+            sqlx::query(
+                "SELECT id, type, severity, project_id, job_id, title, message, payload, is_read, created_at\n\
+                 FROM notifications WHERE project_id = $1\n\
+                 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
+            )
+            .bind(p)
+            .bind(limit)
+            .bind(offset)
+        } else {
+            sqlx::query(
+                "SELECT id, type, severity, project_id, job_id, title, message, payload, is_read, created_at\n\
+                 FROM notifications ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            )
+            .bind(limit)
+            .bind(offset)
+        }
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(Self::row_to_notif(&r)?);
+        }
+        Ok(out)
+    }
+
+    fn row_to_notif(row: &sqlx::postgres::PgRow) -> anyhow::Result<NotificationRow> {
+        Ok(NotificationRow {
+            id: row.try_get("id").map_err(|e| anyhow::anyhow!("id: {e}"))?,
+            r#type: row.try_get("type").map_err(|e| anyhow::anyhow!("type: {e}"))?,
+            severity: row.try_get("severity").map_err(|e| anyhow::anyhow!("severity: {e}"))?,
+            project_id: row.try_get::<Option<Uuid>, _>("project_id").unwrap_or(None),
+            job_id: row.try_get::<Option<String>, _>("job_id").unwrap_or(None),
+            title: row.try_get("title").map_err(|e| anyhow::anyhow!("title: {e}"))?,
+            message: row.try_get("message").map_err(|e| anyhow::anyhow!("message: {e}"))?,
+            payload: row.try_get("payload").map_err(|e| anyhow::anyhow!("payload: {e}"))?,
+            is_read: row.try_get("is_read").map_err(|e| anyhow::anyhow!("is_read: {e}"))?,
+            created_at: row.try_get("created_at").map_err(|e| anyhow::anyhow!("created_at: {e}"))?,
+        })
+    }
+
 }

@@ -36,6 +36,10 @@ use axum::response::{IntoResponse, Response};
 
 /// F#17 — background scheduler loop (ticks + fires due schedules).
 pub mod scheduler;
+/// F#18 — in-process real-time alert bus (SSE fan-out).
+pub mod livebus;
+/// F#18 — the single emission funnel (persist → broadcast → email).
+pub mod notifier;
 
 use axum::routing::{delete, get, post, put};
 
@@ -63,6 +67,9 @@ pub struct AppState {
 
     pub pool: PgPool,
 
+    /// F#18 — real-time alert bus (shared by every SSE client).
+    pub bus: crate::livebus::LiveBus,
+
 }
 
 
@@ -71,7 +78,7 @@ pub async fn app_state(dsn: Option<&str>) -> anyhow::Result<Arc<AppState>> {
 
     let pool = ser_db::connect(dsn).await?;
 
-    Ok(Arc::new(AppState { pool }))
+    Ok(Arc::new(AppState { pool, bus: crate::livebus::LiveBus::new() }))
 
 }
 
@@ -1388,9 +1395,34 @@ pub async fn run_project_pool(project_id: Uuid, state: &Arc<AppState>) -> anyhow
     let pool = runner::pool_for_disk(state.pool.clone(), cfg, roots, drivers).with_context(ctx);
 
 
-
+    // F#18 — time the run so the alert can carry a duration.
+    let started = std::time::Instant::now();
     let summary = pool.run(project_id).await;
+    let duration_secs = started.elapsed().as_secs();
 
+    // F#18 — one notification per run outcome (good, bad, or mixed).
+    let project_name = Repo::new(state.pool.clone())
+        .project_by_id(project_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.name)
+        .unwrap_or_else(|| project_id.to_string());
+    if let Err(e) = notifier::notify_run(
+        state,
+        project_id,
+        &project_name,
+        summary.claimed,
+        summary.done,
+        summary.failed,
+        summary.panics,
+        0, // captcha_blocked: not separately surfaced by the pool yet
+        duration_secs,
+    )
+    .await
+    {
+        eprintln!("[notify] run-outcome emit failed: {e}");
+    }
 
 
     Ok(serde_json::json!({
@@ -1759,6 +1791,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/settings/engine/overrides", get(list_engine_overrides).post(set_engine_override).delete(delete_engine_overrides))
 
         .route("/api/settings/engine/{name}/effective", get(effective_engine_settings))
+        // F#18 — alert channels.
+        .route("/api/settings/notify", get(get_notify_settings).put(put_notify_settings).post(test_notify_email))
+        .route("/api/notifications", get(list_notifications_api))
+        .route("/api/notifications/unread", get(count_unread_api))
+        .route("/api/notifications/{id}/read", put(mark_notification_read_api).post(mark_notification_read_api))
+        .route("/api/notifications/read-all", put(mark_all_read_api).post(mark_all_read_api))
+        .route("/api/notifications/live", get(notifications_sse))
 
         .route("/api/settings/export", get(export_settings_bundle))
 
@@ -2752,4 +2791,189 @@ async fn import_settings_bundle(state: State<Arc<AppState>>, body: Json<ImportBu
 }
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// F#18 — alert channels + real-time notifications.
+// ─────────────────────────────────────────────────────────────────────────────
 
+/// GET /api/settings/notify — the operator's alert-channel config
+/// (SMTP + per-type email toggles). Password comes back as-is (this is a
+/// local operator tool, not a public API).
+async fn get_notify_settings(state: State<Arc<AppState>>) -> Response {
+    let cfg = crate::notifier::NotifyConfig::load(&state.pool).await;
+    (StatusCode::OK, Json(serde_json::to_value(&cfg).unwrap())).into_response()
+}
+
+/// PUT /api/settings/notify — save the config, then emit a
+/// `settingsChanged` alert (the operator just changed how they're alerted,
+/// which is itself "something that happened").
+async fn put_notify_settings(state: State<Arc<AppState>>, body: Json<crate::notifier::NotifyConfig>) -> Response {
+    match body.0.save(&state.pool).await {
+        Ok(()) => {
+            let email_on = body.0.email_enabled && !body.0.recipient.trim().is_empty();
+            let _ = crate::notifier::notify_settings_saved(
+                &state,
+                if email_on {
+                    format!("email alerts ON to {}", body.0.recipient)
+                } else {
+                    "email alerts OFF".to_string()
+                },
+            )
+            .await;
+            (StatusCode::OK, Json(serde_json::json!({ "status": "ok", "email_enabled": email_on }))).into_response()
+        }
+        Err(e) => error_response(e.into()),
+    }
+}
+
+/// POST /api/settings/notify — "test my email config": send one
+/// `systemInfo` test alert through the saved SMTP settings (mode `log`
+/// renders without a socket, so this doubles as a dry-run). The outcome is
+/// returned as JSON AND a `systemError`/`settingsChanged` alert is emitted
+/// so the bell tells the story either way.
+async fn test_notify_email(state: State<Arc<AppState>>) -> Response {
+    let cfg = crate::notifier::NotifyConfig::load(&state.pool).await;
+    let smtp_cfg = cfg.to_smtp();
+    let probe = engine::notify::Notification {
+        id: "test".into(),
+        type_: engine::notify::NotificationType::SystemInfo,
+        severity: engine::notify::Severity::Info,
+        project_id: None,
+        job_id: None,
+        title: "SER test alert".into(),
+        message: "If you got this email (or saw it in the logs), your alert channel works.".into(),
+        payload: serde_json::json!({ "source": "test-notify" }),
+        is_read: false,
+        created_at: chrono::Utc::now(),
+    };
+    let out = match tokio::task::spawn_blocking(move || engine::smtp::send(&smtp_cfg, &probe)).await {
+        Ok(Ok(r)) => {
+            let _ = crate::notifier::notify_settings_saved(&state, "email test delivered".to_string()).await;
+            serde_json::json!({ "status": "ok", "delivered": r.delivered,
+                                 "message_bytes": r.message_size,
+                                 "mode": r.mode.as_kebab(),
+                                 "rendered": r.rendered })
+        }
+        Ok(Err(e)) => {
+            let _ = crate::notifier::emit_system_error(&state, "email test failed", Some(e.clone())).await;
+            serde_json::json!({ "status": "error", "error": e })
+        }
+        Err(je) => {
+            let _ = crate::notifier::emit_system_error(&state, "email test task panicked", Some(je.to_string())).await;
+            serde_json::json!({ "status": "error", "error": je.to_string() })
+        }
+    };
+    (StatusCode::OK, Json(out)).into_response()
+}
+
+#[derive(Deserialize)]
+struct ListQueries {
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
+    #[serde(default)]
+    project_id: Option<Uuid>,
+    #[serde(default)]
+    unread: Option<bool>,
+}
+
+/// GET /api/notifications — Notification Center list (newest first).
+async fn list_notifications_api(state: State<Arc<AppState>>, Query(q): Query<ListQueries>) -> Response {
+    let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    let offset = q.offset.unwrap_or(0).max(0);
+    match Repo::new(state.pool.clone())
+        .list_notifications(limit, offset, q.project_id, q.unread.unwrap_or(false))
+        .await
+    {
+        Ok(list) => (StatusCode::OK, Json(serde_json::to_value(&list).unwrap())).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// GET /api/notifications/unread — badge count for the bell.
+async fn count_unread_api(state: State<Arc<AppState>>) -> Response {
+    match Repo::new(state.pool.clone()).count_unread_notifications().await {
+        Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "unread": n }))).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// PUT|POST /api/notifications/{id}/read — mark one read.
+async fn mark_notification_read_api(state: State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
+    match Repo::new(state.pool.clone()).mark_notification_read(id).await {
+        Ok(true) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "not found" }))).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// PUT|POST /api/notifications/read-all — wipe the badge.
+async fn mark_all_read_api(state: State<Arc<AppState>>) -> Response {
+    match Repo::new(state.pool.clone()).mark_all_notifications_read().await {
+        Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok", "marked": n }))).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// GET /api/notifications/live — the real-time channel (SSE).
+///
+/// `Server-Sent Events` over the in-process `tokio::sync::broadcast` bus:
+/// each connected client gets its own receiver, and `emit` never blocks on
+/// a slow client (broadcast drops for lagging receivers; the Vue store
+/// re-fetches the DB list on the `EventSource` (re)connect, so no alert is
+/// ever lost). Every frame is one of:
+///   event: hello     {"serverTime": "..."}              (immediately)
+///   event: notify    <Notification>                      (each alert)
+///   event: error     {"error": "..."}                    (stream died mid-flight)
+/// The `text/event-stream` content type makes `EventSource` auto-reconnect
+/// with `Last-Event-Id` semantics; we don't read the header (the DB list is
+/// the source of truth — a reconnect is just a `GET /api/notifications`).
+async fn notifications_sse(state: State<Arc<AppState>>) -> Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures_util::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    let mut rx = state.bus.subscribe();
+    let hello_time = chrono::Utc::now().to_rfc3339();
+
+    // A stream of `Event`s: `hello` first, then one frame per bus event.
+    // `Lagged` frames (a slow client) are dropped — the UI refetches on
+    // reconnect, and the DB already has every alert.
+    type SseFrame = Result<Event, std::convert::Infallible>;
+    let stream: futures_util::stream::BoxStream<'static, SseFrame> = futures_util::stream::once(std::future::ready(Ok::<Event, std::convert::Infallible>(Event::default()
+            .event("hello")
+            .data(serde_json::to_string(&serde_json::json!({ "serverTime": hello_time })).unwrap()))))
+    .chain(
+        BroadcastStream::new(rx).filter_map(|r| {
+            let fut = async move { match r {
+                Ok(ev) => Some(Ok::<Event, std::convert::Infallible>(Event::default().event("notify").data(serde_json::to_string(&ev.notification).unwrap_or_default()))),
+                // `Lagged` (slow client) and `Empty` (channel closed): drop
+                // the frame. The UI refetches on EventSource reconnect and
+                // the DB already holds every alert, so no data is lost.
+                Err(_) => None,
+            }};
+            fut
+        }),
+    )
+    .boxed();
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::default().interval(std::time::Duration::from_secs(15)),
+        )
+        .into_response()
+}
+
+/// Helper: `SmtpMode` -> kebab-case string for the test button's JSON.
+trait Kebab {
+    fn as_kebab(&self) -> &'static str;
+}
+impl Kebab for engine::smtp::SmtpMode {
+    fn as_kebab(&self) -> &'static str {
+        match self {
+            engine::smtp::SmtpMode::Log => "log",
+            engine::smtp::SmtpMode::StartTls => "starttls",
+            engine::smtp::SmtpMode::DirectTls => "direct-tls",
+        }
+    }
+}

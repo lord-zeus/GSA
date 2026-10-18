@@ -239,6 +239,39 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T
 }
 
+// — F#18 notifications & alert channels —
+export type NotificationSeverity = 'info' | 'good' | 'warn' | 'bad'
+export interface NotificationItem {
+  id: string
+  type: string                     // camelCase engine type: runCompleted, captchaBlocked, …
+  severity: NotificationSeverity
+  project_id: string | null
+  job_id: string | null
+  title: string
+  message: string
+  payload: Record<string, unknown> | null
+  is_read: boolean
+  created_at: string               // ISO-8601 UTC
+}
+export interface NotifySettings {
+  email_enabled: boolean
+  recipient: string
+  smtp_host: string
+  smtp_port: number
+  smtp_mode: string                // 'starttls' | 'direct-tls' | 'log'
+  smtp_user: string
+  smtp_password: string
+  sender_name: string
+  perType: Record<string, boolean>
+}
+export interface NotifyTestResult {
+  status: 'ok' | 'error'
+  delivered?: boolean
+  message_bytes?: number
+  mode?: string
+  rendered?: Record<string, string>
+  error?: string
+}
 export const api = {
   health: () => req<Health>('/healthz'),
 
@@ -379,10 +412,35 @@ export const api = {
   settingsGetEffective: (engineName: string) =>
     req<Record<string, unknown>>(`/api/settings/engine/${encodeURIComponent(engineName)}/effective`),
   // Import / export bundle (GSA_SER_Settings format as JSON).
+
+
   settingsExport: () => req<Record<string, unknown>>('/api/settings/export'),
   settingsImport: (bundle: Record<string, unknown>) =>
     req<{ status: string; proxies_upserted: number }>('/api/settings/import', {
       method: 'POST',
       body: JSON.stringify({ bundle }),
     }),
+
+  // — F#18 notifications & alert channels —
+  notificationsList: (q?: { limit?: number; offset?: number; unread?: boolean }) => {
+    const p = new URLSearchParams()
+    if (q?.limit != null) p.set('limit', String(q.limit))
+    if (q?.offset != null) p.set('offset', String(q.offset))
+    if (q?.unread != null) p.set('unread', String(q.unread))
+    const s = p.toString()
+    return req<NotificationItem[]>(`/api/notifications${s ? '?' + s : ''}`)
+  },
+  notificationsUnread: () => req<{ unread: number }>('/api/notifications/unread'),
+  notificationMarkRead: (id: string) =>
+    req<{ status: string }>(`/api/notifications/${id}/read`, { method: 'PUT' }),
+  notificationsReadAll: () =>
+    req<{ status: string; marked: number }>('/api/notifications/read-all', { method: 'PUT' }),
+  notifySettingsGet: () => req<NotifySettings>('/api/settings/notify'),
+  notifySettingsSave: (s: NotifySettings) =>
+    req<{ status: string; email_enabled: boolean }>('/api/settings/notify', {
+      method: 'PUT',
+      body: JSON.stringify(s),
+    }),
+  notifySettingsTest: () =>
+    req<NotifyTestResult>('/api/settings/notify', { method: 'POST' }),
 }

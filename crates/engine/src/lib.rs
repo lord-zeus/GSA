@@ -65,6 +65,15 @@ pub mod stats;
 /// `ScheduleSpec` + `next_run` cadence/window/weekday/gate algorithm.
 /// Ungated so the cron semantics are testable without Postgres or `http`.
 pub mod schedule;
+/// F#18 — notification event model + classification (pure core; the API
+/// writes this shape to Postgres, the SSE stream serializes it, and the
+/// SMTP sender renders it — one event vocabulary across all channels).
+pub mod notify;
+/// F#18 — outbound SMTP delivery (the "email me an alert" channel).
+/// Non-optional deps (`tokio-native-tls` / `native-tls` / `tokio` net) are
+/// already in the tree via F#12/F#6, so this is ungated — the `log` mode
+/// (tests) needs no socket.
+pub mod smtp;
 
 pub use keyword::{expand as expand_keyword, normalize as normalize_keyword, resolve_one as resolve_keyword_one};
 

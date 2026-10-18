@@ -91,6 +91,22 @@ async fn fire(state: Arc<AppState>, id: Uuid) -> anyhow::Result<()> {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[scheduler] run project {} failed: {e}", row.project_id);
+            // F#18 — a schedule slot was claimed but the run blew up:
+            // alert the operator (the run-outcome notifier only covers
+            // the in-pool path, so this error case is the one to emit).
+            if let Err(ne) = crate::notifier::notify(
+                &state,
+                &engine::notify::classify_schedule_failed(
+                    Some(row.project_id.to_string()),
+                    None,
+                    Some(row.name.clone()),
+                    Some(e.to_string()),
+                ),
+            )
+            .await
+            {
+                eprintln!("[scheduler] schedule-failed notify failed: {ne}");
+            }
             return Ok(());
         }
     };

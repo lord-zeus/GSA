@@ -308,3 +308,71 @@ pub struct ScheduleInput {
     #[serde(default)]
     pub enabled: Option<bool>,
 }
+
+
+// ─────────────────────────────────────────────────────────────
+// F#18 — alert log (Notification Center).
+// ─────────────────────────────────────────────────────────────
+
+/// One alert log row. `type`/`severity` are the STRING spellings defined
+/// by `engine::notify::NotificationType::as_str()` / `Severity::as_str()`
+/// (camelCase / lowercase respectively), so the API can write the row
+/// from either shape directly. `created_at` is a `TIMESTAMPTZ`.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct NotificationRow {
+    pub id: Uuid,
+    pub r#type: String,
+    pub severity: String,
+    pub project_id: Option<Uuid>,
+    pub job_id: Option<String>,
+    pub title: String,
+    pub message: String,
+    pub payload: serde_json::Value,
+    pub is_read: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Inbound shape for `POST /api/notifications/emit` (the API's
+/// `Notifier` also emits directly via `repo.insert_notification`, so
+/// this struct exists for external / test emitters — the UI's
+/// "test my email config" button uses it too).
+#[derive(Debug, Clone, Deserialize)]
+pub struct NotifyEmit {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub severity: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub job_id: Option<String>,
+    pub title: String,
+    pub message: String,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+/// Settings-page shape for the "alert channels" block (GSA "email me on
+/// X" toggles + SMTP config). Lives as `settings.notify_config` (JSON)
+/// via `repo::get_setting`/`set_setting`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NotifySettings {
+    #[serde(rename = "emailEnabled")]
+    pub email_enabled: bool,
+    pub smtpHost: String,
+    pub smtpPort: u16,
+    /// `starttls` (587) or `direct-tls` (465). `log` = render-only, no
+    /// socket — used by the test button.
+    pub smtpMode: String,
+    pub authUser: String,
+    pub authPassword: String,
+    pub senderName: String,
+    pub recipient: String,
+    #[serde(default = "default_connect_timeout")]
+    pub connectTimeoutSecs: u64,
+    /// Per-type `emailEnabled` toggle map (camelCase type → bool). Missing
+    /// keys fall back to `NotificationType::default_email()`.
+    #[serde(rename = "perTypeEmail")]
+    pub per_type_email: std::collections::BTreeMap<String, bool>,
+}
+fn default_connect_timeout() -> u64 { 15 }

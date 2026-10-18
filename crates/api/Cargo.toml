@@ -22,6 +22,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # F#14 — bounded-concurrency proxy geo verification (already in the workspace
 # via ser-engine's `browser` feature; enabling here, not a new external crate).
 futures-util = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
 # In-process job execution (F#12): run a project's queued jobs via the
 # worker pool + HTTP driver. `http` feature pulls the real reqwest HttpDriver
 # (used for both the plain-form web engines and the WEB-inbox email engines).
