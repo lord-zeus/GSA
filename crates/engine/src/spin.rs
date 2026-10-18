@@ -423,6 +423,40 @@ fn lookup_builtin(
         return Some(String::new());
     }
 
+    // 8. F#22 humanize tokens — data-driven text generators cloned from GSA's
+    //    shipped `.dat` pools (titlegen / comments / user_agents / charspin).
+    //    Missing data ⇒ empty string (graceful), never a panic.
+    if n == "generate_title" || n == "blog_title" || n == "article_title" || n == "title" {
+        let kw = ctx.get("keyword").unwrap_or("").to_string();
+        let generated = crate::humanize::generate_title(&kw, rng).unwrap_or_default();
+        if !generated.is_empty() {
+            return Some(render_with_rng(&generated, ctx, rng, visited));
+        }
+        return Some(String::new());
+    }
+    if n == "blog_comment" || n == "guestbook_comment" || n == "image_comment" || n == "random_comment" || n == "comment" {
+        let n = n.as_str();
+        let category = match n {
+            "guestbook_comment" => "guestbook",
+            "image_comment" => "image",
+            "blog_comment" => "blog",
+            _ => "blog",
+        };
+        let c = crate::humanize::random_comment(category, rng).unwrap_or_default();
+        return Some(render_with_rng(&c, ctx, rng, visited));
+    }
+    if n == "charspin" || n == "humanize" {
+        let kw: &str = ctx.get("keyword").unwrap_or("");
+        let seed = ctx.get("anchor_text").unwrap_or(kw).to_string();
+        if seed.is_empty() {
+            return Some(String::new());
+        }
+        return Some(crate::humanize::charspin(&seed, 10, rng));
+    }
+    if n == "user_agent" || n == "ua" {
+        return Some(crate::humanize::pick_user_agent(rng).unwrap_or_default());
+    }
+
     None
 }
 
