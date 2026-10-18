@@ -23,7 +23,9 @@ tokio = { version = "1", features = ["process", "time", "rt-multi-thread", "sync
 native-tls = "0.2"
 tokio-native-tls = "0.3"
 # --- F#16 stats timeline (calendar-day bucketing; already in lockfile via sqlx) ---
-chrono = "0.4"
+# `serde` feature enables NaiveDateTime / NaiveTime (de)serialization needed
+# by ScheduleSpec's #[serde(...)] annotations.
+chrono = { version = "0.4", features = ["serde"] }
 tokio-tungstenite = { version = "0.24", optional = true }
 tungstenite = { version = "0.24", optional = true }
 futures-util = { version = "0.3", optional = true }

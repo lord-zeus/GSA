@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::model::{
     Engine, Job, JobStatus, Keyword, Project, ProjectResult, Proxy, ResultKind, ResultStats,
-    SubmissionResult,
+    Schedule, SubmissionResult,
 };
 
 /// CRUD + pipeline helpers over the core tables.
@@ -1225,5 +1225,205 @@ impl Repo {
         }
         tx.commit().await?;
         Ok(upserted)
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // F#17 — per-project scheduled runs (schedule CRUD + atomic claim).
+    // Mirrors the `jobs` pattern: per-row advisory lock (UUID hash),
+    // UPDATE with a `next_run_at < $now AND enabled` guard, and a
+    // `run_count = run_count + 1` increment in the same transaction so
+    // two schedulers can't double-fire one slot.
+    // ─────────────────────────────────────────────────────────────
+
+    const SCHEDULE_COLUMNS: &'static str =
+        "id, project_id, name, mode, start_at, stop_at,\n\
+         repeat_every_minutes, repeat_weekdays, window_start, window_end,\n\
+         max_runs, run_count, enabled, next_run_at, created_at, updated_at";
+
+    pub async fn create_schedule(
+        &self,
+        project_id: Uuid,
+        name: &str,
+        mode: &str,
+        start_at: chrono::DateTime<chrono::Utc>,
+        stop_at: Option<chrono::DateTime<chrono::Utc>>,
+        repeat_every_minutes: Option<i32>,
+        repeat_weekdays: Option<Vec<i32>>,
+        window_start: Option<chrono::NaiveTime>,
+        window_end: Option<chrono::NaiveTime>,
+        max_runs: Option<i64>,
+        enabled: bool,
+    ) -> anyhow::Result<Schedule> {
+        let row = sqlx::query(
+            &format!(
+                "INSERT INTO schedules (project_id, name, mode, start_at, stop_at,\n\
+                 repeat_every_minutes, repeat_weekdays, window_start, window_end,\n\
+                 max_runs, run_count, enabled, next_run_at)\n\
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11, now())\n\
+                 RETURNING {}",
+                Self::SCHEDULE_COLUMNS
+            )
+            .as_str(),
+        )
+        .bind(project_id)
+        .bind(name)
+        .bind(mode)
+        .bind(start_at)
+        .bind(stop_at)
+        .bind(repeat_every_minutes)
+        .bind(repeat_weekdays)
+        .bind(window_start)
+        .bind(window_end)
+        .bind(max_runs)
+        .bind(enabled)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(FromRow::from_row(&row)?)
+    }
+
+    pub async fn list_schedules(&self, project_id: Option<Uuid>) -> anyhow::Result<Vec<Schedule>> {
+        let q = match project_id {
+            Some(p) => format!(
+                "SELECT {} FROM schedules WHERE project_id = $1 ORDER BY name",
+                Self::SCHEDULE_COLUMNS
+            ),
+            None => format!(
+                "SELECT {} FROM schedules ORDER BY project_id, name",
+                Self::SCHEDULE_COLUMNS
+            ),
+        };
+        let rows = match project_id {
+            Some(p) => sqlx::query(&q).bind(p).fetch_all(&self.pool).await?,
+            None => sqlx::query(&q).fetch_all(&self.pool).await?,
+        };
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(FromRow::from_row(&r)?);
+        }
+        Ok(out)
+    }
+
+    pub async fn schedule_by_id(&self, id: Uuid) -> anyhow::Result<Option<Schedule>> {
+        let row = sqlx::query(&format!("SELECT {} FROM schedules WHERE id = $1", Self::SCHEDULE_COLUMNS).as_str())
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(r) => Ok(Some(FromRow::from_row(&r)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn set_schedule_enabled(&self, id: Uuid, enabled: bool) -> anyhow::Result<Schedule> {
+        let row = sqlx::query(
+            &format!(
+                "UPDATE schedules SET enabled = $2, updated_at = now()\n\
+                 WHERE id = $1 RETURNING {}",
+                Self::SCHEDULE_COLUMNS
+            )
+            .as_str(),
+        )
+        .bind(id)
+        .bind(enabled)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("schedule not found: {}", id))?;
+        Ok(FromRow::from_row(&row)?)
+    }
+
+    pub async fn delete_schedule(&self, id: Uuid) -> anyhow::Result<bool> {
+        Ok(sqlx::query("DELETE FROM schedules WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            > 0)
+    }
+
+    /// Store the "next eligible fire time" the engine computed at create /
+    /// after re-enable. NULL = schedule is already consumed (nothing
+    /// further to fire) — the API's claim_schedule also writes NULL when
+    /// a schedule retires.
+    pub async fn set_next_run_at(
+        &self,
+        id: Uuid,
+        next_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> anyhow::Result<()> {
+        sqlx::query("UPDATE schedules SET next_run_at = $2, updated_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(next_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Atomically claim a due schedule for the API scheduler to fire.
+    ///
+    /// Invariants (enforced in SQL, not in the Rust caller):
+    ///   * `next_run_at IS NOT NULL` — the row has a "last-fired slot".
+    ///   * `next_run_at <= $deadline` — that slot is in the past now.
+    ///   * `enabled = TRUE` — the operator hasn't toggled the row off.
+    ///   * `run_count < COALESCE(max_runs, BIGINT_MAX)` — the cap has not
+    ///     been consumed (no-op for `recurring` schedules with `max_runs = NULL`).
+    ///
+    /// The claim:
+    ///   1. `run_count = run_count + 1` (consumes one slot).
+    ///   2. `next_run_at` is advanced to the **next** slot per
+    ///      `ScheduleSpec::next_run(spec, now)` for `recurring`, or set
+    ///      to NULL (consumed) for `once`. The caller passes the pre-computed
+    ///      `next_after` — this keeps the claim pure and avoids a second
+    ///      read/round-trip (and a second race window).
+    ///   3. `updated_at = now()`.
+    ///
+    /// Concurrent claims: two schedulers calling `claim_schedule` in the
+    /// same tick with the same `deadline` are serialized by an advisory
+    /// transaction lock (like `claim_next_pending`), so exactly one wins.
+    /// A losing scheduler's `UPDATE ... WHERE id = (subselect ...)`
+    /// re-checks the row, sees `run_count` already incremented, and
+    /// re-evaluates the `run_count < COALESCE(max_runs, BIGINT_MAX)` guard;
+    /// if the cap is now hit, the subselect returns no row and the
+    /// top-level UPDATE matches 0 rows → returns `None`.
+    pub async fn claim_schedule(
+        &self,
+        id: Uuid,
+        deadline: chrono::DateTime<chrono::Utc>,
+        next_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> anyhow::Result<Option<Schedule>> {
+        // Atomically fire one due slot of this schedule:
+        //   - only if enabled AND next_run_at is set AND next_run_at <= deadline
+        //   - the cap is enforced by `(max_runs IS NULL OR run_count < max_runs)`
+        // The row is updated to `next_run_at = $3` (the next eligible slot
+        // the pure engine computed, or NULL when the schedule is retired)
+        // and `run_count` bumped in the same UPDATE. Postgres row locking
+        // + the `next_run_at <= deadline` re-check after the first commit
+        // makes double-claims impossible: a losing scheduler's UPDATE
+        // re-evaluates the WHERE clause against the committed row and
+        // finds `next_run_at` no longer <= its own deadline, so it matches
+        // 0 rows -> None.
+        let row = sqlx::query(
+            &format!(
+                "UPDATE schedules SET
+                     run_count   = run_count + 1,
+                     next_run_at = $3,
+                     updated_at  = now()
+                 WHERE id = $1
+                   AND enabled = TRUE
+                   AND next_run_at IS NOT NULL
+                   AND next_run_at <= $2
+                   AND (max_runs IS NULL OR run_count < max_runs)
+                 RETURNING {}",
+                Self::SCHEDULE_COLUMNS
+            )
+            .as_str(),
+        )
+        .bind(id)
+        .bind(deadline)
+        .bind(next_after)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(r) => Ok(Some(FromRow::from_row(&r)?)),
+            None => Ok(None),
+        }
     }
 }

@@ -135,6 +135,44 @@ export interface RunSummary {
   panics: number
 }
 
+// ── F#17 · scheduled runs (cron) ──
+// Mirrors `Schedule` in crates/db/src/model.rs. Datetimes serialize as
+// ISO-8601 (chrono's serde default); times as "HH:MM:SS".
+export interface ScheduleRow {
+  id: string
+  project_id: string
+  name: string
+  mode: 'once' | 'recurring'
+  start_at: string
+  stop_at: string | null
+  repeat_every_minutes: number | null
+  repeat_weekdays: number[] | null   // ISO 1=Mon…7=Sun
+  window_start: string | null        // "HH:MM:SS"
+  window_end: string | null
+  max_runs: number | null
+  run_count: number
+  enabled: boolean
+  next_run_at: string | null         // ISO datetime, null = never fired / consumed
+  created_at: string
+  updated_at: string
+}
+export interface ScheduleCreateInput {
+  name: string
+  mode: 'once' | 'recurring'
+  start_at: string                   // "YYYY-MM-DD HH:MM:SS" or ISO-8601 (naive UTC)
+  stop_at?: string | null
+  repeat_every_minutes?: number | null
+  repeat_weekdays?: number[] | null
+  window_start?: string | null       // "HH:MM" or "HH:MM:SS" (UTC)
+  window_end?: string | null
+  max_runs?: number | null
+  enabled?: boolean
+}
+export interface ScheduleCreated {
+  schedule: ScheduleRow
+  next_run_at: string | null
+}
+
 // ── F#16 · stats & analytics (GSA dashboard metrics) ──
 export interface StatsSummary {
   jobs_total: number
@@ -297,6 +335,21 @@ export const api = {
     ),
   projectSetUseProxies: (projectId: string, useProxies: boolean) =>
     req<Project>(`/api/projects/${projectId}/proxies`, { method: 'PUT', body: JSON.stringify({ use_proxies: useProxies }) }),
+
+  // — F#17 · scheduled runs (cron) —
+  // Row shape (mirrors `Schedule` in crates/db/src/model.rs).
+  scheduleList: (projectId?: string) =>
+    req<ScheduleRow[]>(projectId ? `/api/projects/${projectId}/schedules` : '/api/schedules'),
+  scheduleGet: (id: string) => req<ScheduleRow>(`/api/schedules/${id}`),
+  scheduleCreate: (projectId: string, s: ScheduleCreateInput) =>
+    req<ScheduleCreated>(`/api/projects/${projectId}/schedules`, {
+      method: 'POST',
+      body: JSON.stringify(s),
+    }),
+  scheduleDelete: (id: string) => req<void>(`/api/schedules/${id}`, { method: 'DELETE' }),
+  scheduleSetEnabled: (id: string, enabled: boolean) =>
+    req<ScheduleRow>(`/api/schedules/${id}/enabled`, { method: 'PUT', body: JSON.stringify({ enabled }) }),
+  scheduleRunNow: (id: string) => req<RunSummary & { status?: string; reason?: string }>(`/api/schedules/${id}/run-now`, { method: 'POST' }),
 
   // — F#12 email-runner glue: run now + operator mailbox + email engine field —
   runProject: (projectId: string) =>

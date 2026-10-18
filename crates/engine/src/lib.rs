@@ -61,6 +61,10 @@ pub mod geo_probe;
 /// bundle format (pure core; DB/API/layers build on this).
 pub mod settings;
 pub mod stats;
+/// F#17 — pure schedule core (GSA per-project scheduler): typed
+/// `ScheduleSpec` + `next_run` cadence/window/weekday/gate algorithm.
+/// Ungated so the cron semantics are testable without Postgres or `http`.
+pub mod schedule;
 
 pub use keyword::{expand as expand_keyword, normalize as normalize_keyword, resolve_one as resolve_keyword_one};
 

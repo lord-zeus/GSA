@@ -246,3 +246,65 @@ pub struct ProxyTest {
     pub latency_ms: i64,
     pub detail: String,
 }
+
+// ─────────────────────────────────────────────────────────────
+// F#17 — per-project scheduled runs (GSA "scheduler" / scheduled posting).
+// ─────────────────────────────────────────────────────────────
+
+/// A project schedule row. The `start_at`/`repeat_*/window_*/stop_at/
+/// max_runs` fields are the declarative calendar; `run_count`/`enabled`/
+/// `next_run_at` are the runtime state the API scheduler mutates.
+///
+/// `repeat_weekdays` is ISO 1 (Mon) … 7 (Sun); `None` = any weekday. The
+/// `NaiveTime` window columns are a UTC wall-clock window.
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct Schedule {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub name: String,
+    /// `"once"` or `"recurring"`.
+    pub mode: String,
+    pub start_at: DateTime<Utc>,
+    pub stop_at: Option<DateTime<Utc>>,
+    /// Cadence in minutes (1..=525600). `None` for `once`, required for
+    /// `recurring`.
+    pub repeat_every_minutes: Option<i32>,
+    /// ISO weekday set (1=Mon..7=Sun) or `None` = any day.
+    pub repeat_weekdays: Option<Vec<i32>>,
+    pub window_start: Option<chrono::NaiveTime>,
+    pub window_end: Option<chrono::NaiveTime>,
+    pub max_runs: Option<i64>,
+    pub run_count: i32,
+    pub enabled: bool,
+    /// The last-fired slot (`timestamptz`); `NULL` = never fired. The
+    /// scheduler compares against `now` via `Repo::claim_schedule`.
+    pub next_run_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Inbound shape for `POST /api/projects/{id}/schedules` — mirrors the
+/// `ScheduleSpec` fields the operator picks in the UI. `start_at` is naive
+/// UTC (`%Y-%m-%d %H:%M:%S`); the API validates it against
+/// `ScheduleSpec::validate()` before insert.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ScheduleInput {
+    pub name: String,
+    #[serde(default)]
+    pub mode: String, // "once" | "recurring"
+    pub start_at: String,
+    #[serde(default)]
+    pub stop_at: Option<String>,
+    #[serde(default)]
+    pub repeat_every_minutes: Option<i32>,
+    #[serde(default)]
+    pub repeat_weekdays: Option<Vec<i32>>,
+    #[serde(default)]
+    pub window_start: Option<String>, // "HH:MM:SS"
+    #[serde(default)]
+    pub window_end: Option<String>,
+    #[serde(default)]
+    pub max_runs: Option<i64>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}

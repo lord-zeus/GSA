@@ -8,6 +8,7 @@ const router = createRouter({
     { path: '/projects', name: 'projects', component: () => import('@/views/ProjectsView.vue') },
     { path: '/proxies', name: 'proxies', component: () => import('@/views/ProxiesView.vue') },
     { path: '/stats', name: 'stats', component: () => import('@/views/StatsView.vue') },
+    { path: '/schedules', name: 'schedules', component: () => import('@/views/SchedulesView.vue') },
     { path: '/settings', name: 'settings', component: () => import('@/views/SettingsView.vue') },
   ],
 })

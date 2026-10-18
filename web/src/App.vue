@@ -34,6 +34,9 @@ const ok = computed(() => health.status === 'ok' && health.db === 'up')
         <router-link to="/stats" active-class="active">
           <span>📊</span> Stats
         </router-link>
+        <router-link to="/schedules" active-class="active">
+          <span>⏰</span> Schedules
+        </router-link>
         <router-link to="/settings" active-class="active">
           <span>⚙︎</span> Settings
         </router-link>

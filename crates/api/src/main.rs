@@ -15,6 +15,18 @@ async fn main() -> anyhow::Result<()> {
     let dsn = std::env::var("SEER_DATABASE_URL").ok();
     let state = ser_api::app_state(dsn.as_deref()).await?;
 
+    // F#17 — background scheduler loop. Ticks every SEER_SCHEDULER_TICK_MS
+    // (default 30 s); fires enabled schedules whose `next_run_at` is <= now,
+    // claiming the slot atomically (restart-safe, no double-fire). The task
+    // outlives this scope — the runtime keeps it alive for the process
+    // lifetime. Disable with SEER_SCHEDULER_DISABLE=1 (debugging).
+    if std::env::var("SEER_SCHEDULER_DISABLE").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false) {
+        eprintln!("ser-api: scheduler DISABLED (SEER_SCHEDULER_DISABLE set)");
+    } else {
+        let h = ser_api::scheduler::spawn(state.clone());
+        eprintln!("ser-api: scheduler spawned (handle {}); tick_ms from SEER_SCHEDULER_TICK_MS (default 30000)", h.id());
+    }
+
     let mut app = ser_api::router(state).layer(cors());
 
     // Optional same-origin Vue build (production path, crash isolation intact:
