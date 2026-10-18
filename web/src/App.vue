@@ -31,6 +31,9 @@ const ok = computed(() => health.status === 'ok' && health.db === 'up')
         <router-link to="/proxies" active-class="active">
           <span>⇌</span> Proxies
         </router-link>
+        <router-link to="/settings" active-class="active">
+          <span>⚙︎</span> Settings
+        </router-link>
       </nav>
       <div class="side-foot">
         <span class="dot" :class="ok ? 'ok' : 'bad'"></span>&nbsp;

@@ -41,6 +41,17 @@ fn error_response(e: anyhow::Error) -> Response {
      Json(serde_json::json!({ "error": e.to_string() }))).into_response()
 }
 
+/// True if `e` is the Postgres unique-constraint violation that
+/// `POST /api/proxies` raises on a re-entered `host:port`.  Lets the handler
+/// map a collision to 409 "already exists" instead of leaking a 500 with the
+/// raw constraint string.  Matches on both the human-readable message and the
+/// specific constraint name — neither changes with sqlx version.
+fn is_unique_violation(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("duplicate key value violates unique constraint")
+        || msg.contains("uq_proxies_host_port")
+}
+
 pub async fn healthz(state: State<Arc<AppState>>) -> Response {
     let up = ser_db::ping(&state.pool).await;
     if up {
@@ -634,9 +645,21 @@ async fn run_project(
         .await
         .unwrap_or_default();
 
+    // F#15 — the "Global Settings" drive the pool: `threads` sets the
+    // worker fanout (GSA 1..=64) and `max_submit_seconds` bounds every
+    // job. Falls back to the pre-F#15 locals when the row is empty.
+    let global_settings = Repo::new(state.pool.clone())
+        .global_settings()
+        .await
+        .unwrap_or_default();
     let mut cfg = runner::RunnerConfig::default();
-    cfg.concurrent_workers = 4; // GSA runs 25-50; 4 is a sane local default.
-    cfg.per_job_timeout = std::time::Duration::from_secs(90);
+    cfg.concurrent_workers = global_settings
+        .threads
+        .unwrap_or(4)
+        .clamp(1, 64) as usize;
+    cfg.per_job_timeout = std::time::Duration::from_secs(
+        global_settings.max_submit_seconds.unwrap_or(90).clamp(1, 3600) as u64,
+    );
     cfg.leader_idle_timeout = std::time::Duration::from_millis(800);
     cfg.max_retries = 0;
 
@@ -673,6 +696,7 @@ async fn run_project(
         email_address,
         email_password,
         proxies,
+        settings: std::sync::Arc::new(global_settings.clamped_ref()),
         ..Default::default()
     };
 
@@ -729,6 +753,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/proxies/{id}/verify-geo", post(verify_proxy_geo))
         .route("/api/proxies/verify-all", post(verify_all_proxies_geo))
         .route("/api/settings/email", get(get_email_setting).put(put_email_setting))
+        .route("/api/settings/global", get(get_global_settings).put(put_global_settings))
+        .route("/api/settings/engine/overrides", get(list_engine_overrides).post(set_engine_override).delete(delete_engine_overrides))
+        .route("/api/settings/engine/{name}/effective", get(effective_engine_settings))
+        .route("/api/settings/export", get(export_settings_bundle))
+        .route("/api/settings/import", post(import_settings_bundle))
         .route("/api/catengine/stats", get(catalog_stats))
         .route("/api/catengine", get(catalog_list))
         .route("/api/catengine/import", post(catalog_import))
@@ -784,7 +813,14 @@ async fn create_proxy(state: State<Arc<AppState>>, body: Json<AddProxyReq>) -> R
         .await
     {
         Ok(p) => (StatusCode::CREATED, Json(serde_json::to_value(&p).unwrap())).into_response(),
-        Err(e) => error_response(e),
+        Err(e) => {
+            if is_unique_violation(&e) {
+                (StatusCode::CONFLICT,
+                 Json(serde_json::json!({ "error": "a proxy with this host:port already exists" }))).into_response()
+            } else {
+                error_response(e)
+            }
+        }
     }
 }
 
@@ -1010,3 +1046,105 @@ async fn verify_all_proxies_geo(
 }
 
 // ─── F#13: project proxy gate ────────────────────────────────────────────────
+
+// ─── F#15: settings & profiles (global + engine-override + import/export) ──
+
+/// GET /api/settings/global — read the stored global settings.
+async fn get_global_settings(state: State<Arc<AppState>>) -> Response {
+    match Repo::new(state.pool.clone()).global_settings().await {
+        Ok(s) => (StatusCode::OK, Json(serde_json::to_value(&s).unwrap())).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// PUT /api/settings/global — replace the whole stored global settings.
+async fn put_global_settings(state: State<Arc<AppState>>, body: Json<engine::settings::Settings>) -> Response {
+    match Repo::new(state.pool.clone()).set_global_settings(&body.0).await {
+        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// GET /api/settings/engine/overrides — every per-engine override row.
+async fn list_engine_overrides(state: State<Arc<AppState>>) -> Response {
+    match Repo::new(state.pool.clone()).list_engine_overrides().await {
+        Ok(list) => (StatusCode::OK, Json(serde_json::to_value(&list).unwrap())).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct SetEngineOverrideReq {
+    engine_name: String,
+    field: String,
+    /// Omitted / null / empty-string = "clear this field back to global".
+    value: Option<String>,
+}
+
+/// POST /api/settings/engine/overrides — set (or clear, with `value: null`)
+/// one field of one engine's override.
+async fn set_engine_override(state: State<Arc<AppState>>, body: Json<SetEngineOverrideReq>) -> Response {
+    let value = body.0.value.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    match Repo::new(state.pool.clone())
+        .set_engine_override(&body.0.engine_name, &body.0.field, value)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct DeleteEngineOverridesReq {
+    engine_name: String,
+}
+
+/// DELETE /api/settings/engine/overrides?engine_name=<name> — remove every
+/// stored override for one engine. (query-param form, so the URL stays a
+/// single route for every engine.)
+async fn delete_engine_overrides(
+    state: State<Arc<AppState>>,
+    q: axum::extract::Query<DeleteEngineOverridesReq>,
+) -> Response {
+    match Repo::new(state.pool.clone()).delete_engine_overrides(&q.0.engine_name).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// GET /api/settings/engine/{name}/effective — the *effective* settings for
+/// one engine (global + that engine's overrides, clamped, ready to feed a
+/// runner).
+async fn effective_engine_settings(
+    state: State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    match Repo::new(state.pool.clone()).effective_settings_for_engine(&name).await {
+        Ok(s) => (StatusCode::OK, Json(serde_json::to_value(&s).unwrap())).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// GET /api/settings/export — the GSA_SER_Settings bundle as JSON (global +
+/// engine overrides + proxy snapshot). The UI wraps this with a download.
+async fn export_settings_bundle(state: State<Arc<AppState>>) -> Response {
+    match Repo::new(state.pool.clone()).export_settings_bundle().await {
+        Ok(b) => (StatusCode::OK, Json(serde_json::to_value(&b).unwrap())).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct ImportBundleReq {
+    bundle: engine::settings::SettingsBundle,
+}
+
+/// POST /api/settings/import — apply a bundle (global + engine overrides +
+/// proxies, in one transaction). Returns the number of proxy rows upserted.
+async fn import_settings_bundle(state: State<Arc<AppState>>, body: Json<ImportBundleReq>) -> Response {
+    match Repo::new(state.pool.clone()).import_settings_bundle(&body.0.bundle).await {
+        Ok(n) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok", "proxies_upserted": n }))).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+

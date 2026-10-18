@@ -41,6 +41,12 @@ pub struct SubmissionContext {
     /// behavior). Driver kinds without a `proxy_driver` impl fall back
     /// to a direct connection transparently.
     pub proxies: Vec<ProxySpec>,
+    /// F#15 — the effective (clamped) settings for this project's engines.
+    /// The pool reads `threads` and `max_submit_seconds` from here; the
+    /// API layer fills it from `Repo::global_settings()` + engine override
+    /// (global settings only — per-keyword / per-engine overrides are
+    /// handled by the *engine* executor, not the pool).
+    pub settings: std::sync::Arc<engine::settings::Settings>,
 }
 
 /// The terminal state of one job's execution.
@@ -141,6 +147,17 @@ impl JobRunner {
     /// panic here is the pool's problem.
     ///
     /// `Send` — safe to move across the task boundary.
+    /// F#15 — per-job timeout from the effective settings
+    /// (`max_submit_seconds`, clamped to 1..=3600 s). Falls back to
+    /// `RunnerConfig::per_job_timeout` for tests that construct a context
+    /// with `settings` left at its struct Default (an empty `Settings`).
+    fn job_timeout(&self) -> std::time::Duration {
+        match self.ctx.settings.max_submit_seconds {
+            Some(secs) if secs > 0 => std::time::Duration::from_secs((secs.min(3600).max(1)) as u64),
+            _ => self.cfg.per_job_timeout,
+        }
+    }
+
     pub async fn run_one(&self, repo: &ser_db::Repo, job: &ser_db::Job) -> JobOutcome {
         let (engine_id, file_path) = match self
             .resolve_engine(repo, job)
@@ -210,7 +227,7 @@ impl JobRunner {
                 email_address: addr,
                 password: pw,
             };
-            let timeout = self.cfg.per_job_timeout;
+            let timeout = self.job_timeout();
             // run_email_engine is sync — it spawns a one-shot runtime per
             // Driver call. Drive it from `spawn_blocking`, wrapped in the
             // per-job timeout, exactly the way the pool drives other sync
@@ -314,7 +331,7 @@ impl JobRunner {
         // ONCE on the next proxy in the list before failing the job.
         // Driver kinds without proxy support (browser bridge) transparently
         // keep using the direct driver.
-        let timeout = self.cfg.per_job_timeout;
+        let timeout = self.job_timeout();
         let seed = self.seed_for_job(job).unwrap_or(0xA11CE_5EED | 1);
         let n = self.ctx.proxies.len();
         let mut attempt_idx: Option<usize> = if n > 0 { Some((seed as usize) % n) } else { None };

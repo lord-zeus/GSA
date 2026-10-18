@@ -845,4 +845,217 @@ impl Repo {
             .fetch_optional(&self.pool)
             .await?)
     }
+
+    // ── F#15: global settings + engine-override settings ─────────────────
+    /// Read the stored global settings blob. A missing row or empty `{}`
+    /// yields the out-of-the-box GSA defaults; a stored blob is clamped on
+    /// the way out.
+    pub async fn global_settings(&self) -> anyhow::Result<engine::settings::Settings> {
+        let raw = self.get_setting("global.settings").await?;
+        match raw {
+            Some(s) if !s.trim().is_empty() => Ok(
+                serde_json::from_str::<engine::settings::Settings>(&s)
+                    .map_err(|e| anyhow::anyhow!("stored settings blob is corrupt: {e}"))?
+                    .clamped(),
+            ),
+            _ => Ok(engine::settings::Settings::gsa_default()),
+        }
+    }
+
+    /// Persist the global settings blob (the JSON document GSA keeps in its
+    /// `GSA_SER_Settings.zip` profile).
+    pub async fn set_global_settings(&self, global: &engine::settings::Settings) -> anyhow::Result<()> {
+        let json = serde_json::to_string(&global.clamped_ref())
+            .map_err(|e| anyhow::anyhow!("global settings not serializable: {e}"))?;
+        self.set_setting("global.settings", &json).await
+    }
+
+    /// All per-engine override rows, grouped into one `SettingsOverride` per
+    /// engine (sparse `field → value` map, exactly as the GSA engine-settings
+    /// panel edits them).
+    pub async fn list_engine_overrides(&self) -> anyhow::Result<Vec<engine::settings::SettingsOverride>> {
+        let rows = sqlx::query("SELECT engine_name, field, value FROM engine_settings")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut by_engine: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let name: String = row.try_get("engine_name")?;
+            let field: String = row.try_get("field")?;
+            let value: String = row.try_get("value")?;
+            by_engine.entry(name).or_default().insert(field, value);
+        }
+        Ok(by_engine
+            .into_iter()
+            .map(|(name, fields)| engine::settings::SettingsOverride {
+                engine_name: name,
+                fields,
+            })
+            .collect())
+    }
+
+    /// Upsert one field of one engine's override. An empty/blank value
+    /// DELETES that override (the UI "clear back to global" button).
+    pub async fn set_engine_override(
+        &self,
+        engine_name: &str,
+        field: &str,
+        value: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let field = field.trim();
+        if field.is_empty() {
+            anyhow::bail!("override field name is empty");
+        }
+        if let Some(v) = value.map(str::trim).filter(|v| !v.is_empty()) {
+            sqlx::query(
+                "INSERT INTO engine_settings (engine_name, field, value) VALUES ($1, $2, $3)
+                 ON CONFLICT (engine_name, field) DO UPDATE SET value = $3, updated_at = now()",
+            )
+            .bind(engine_name)
+            .bind(field)
+            .bind(v)
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query("DELETE FROM engine_settings WHERE engine_name = $1 AND field = $2")
+                .bind(engine_name)
+                .bind(field)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Remove every stored override for one engine.
+    pub async fn delete_engine_overrides(&self, engine_name: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM engine_settings WHERE engine_name = $1")
+            .bind(engine_name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Resolve the effective settings for a single engine: the stored global
+    /// values with that engine's sparse overrides applied on top (pure logic
+    /// lives in `ser_engine::settings::effective`).
+    pub async fn effective_settings_for_engine(&self, engine_name: &str) -> anyhow::Result<engine::settings::Settings> {
+        let global = self.global_settings().await?;
+        let overrides = self.list_engine_overrides().await?;
+        Ok(engine::settings::effective(&global, Some(engine_name), &overrides))
+    }
+
+    /// Bundle export (the GSA_SER_Settings payload): global settings + every
+    /// engine override + the proxy list snapshot.
+    pub async fn export_settings_bundle(&self) -> anyhow::Result<engine::settings::SettingsBundle> {
+        let global = self.global_settings().await?;
+        let engine_overrides = self
+            .list_engine_overrides()
+            .await?
+            .into_iter()
+            .map(|o| (o.engine_name.clone(), o))
+            .collect();
+        let proxies_sql = sqlx::query(
+            "SELECT host, port, proxy_kind, login, password, enabled, country
+             FROM proxies ORDER BY host, port",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let proxies = proxies_sql
+            .iter()
+            .map(|row| {
+                let host: String = row.try_get("host")?;
+                let port: i32 = row.try_get("port")?;
+                let proxy_kind: String = row.try_get("proxy_kind")?;
+                let login: String = row.try_get("login")?;
+                let password: String = row.try_get("password")?;
+                let enabled: bool = row.try_get("enabled")?;
+                let country: Option<String> = row.try_get("country")?;
+                Ok::<_, sqlx::Error>(engine::settings::ProxySnapshot {
+                    host,
+                    port: port as u16,
+                    proxy_kind,
+                    login,
+                    password,
+                    enabled,
+                    country,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(engine::settings::SettingsBundle {
+            global,
+            engine_overrides,
+            proxies,
+            ..Default::default()
+        })
+    }
+
+    /// Bundle import (reverse of `export_settings_bundle`): replaces the
+    /// stored global settings, replaces engine overrides for the engines the
+    /// bundle touched (wholesale), and upserts the bundle's proxies by
+    /// (host, port). Returns the number of proxy rows upserted.
+    /// Everything runs in one transaction so a mid-import crash leaves the
+    /// previous state intact.
+    pub async fn import_settings_bundle(&self, bundle: &engine::settings::SettingsBundle) -> anyhow::Result<usize> {
+        let mut tx = self.pool.begin().await?;
+        let global_json = serde_json::to_string(&bundle.global.clamped_ref())
+            .map_err(|e| anyhow::anyhow!("global settings not serializable: {e}"))?;
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES ('global.settings', $1)
+             ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = now()",
+        )
+        .bind(global_json)
+        .execute(&mut *tx)
+        .await?;
+
+        let bundle_engines: std::collections::BTreeSet<String> =
+            bundle.engine_overrides.keys().cloned().collect();
+        for name in &bundle_engines {
+            sqlx::query("DELETE FROM engine_settings WHERE engine_name = $1")
+                .bind(name)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for (name, o) in &bundle.engine_overrides {
+            for (field, value) in &o.fields {
+                let v = value.trim();
+                if v.is_empty() {
+                    continue;
+                }
+                sqlx::query(
+                    "INSERT INTO engine_settings (engine_name, field, value) VALUES ($1, $2, $3)
+                     ON CONFLICT (engine_name, field) DO UPDATE SET value = $3, updated_at = now()",
+                )
+                .bind(name)
+                .bind(field)
+                .bind(v)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        let mut upserted = 0usize;
+        for p in &bundle.proxies {
+            sqlx::query(
+                "INSERT INTO proxies (host, port, proxy_kind, login, password, enabled, country)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT (host, port) DO UPDATE SET
+                     proxy_kind = EXCLUDED.proxy_kind,
+                     login = EXCLUDED.login,
+                     password = EXCLUDED.password,
+                     enabled = EXCLUDED.enabled,
+                     country = EXCLUDED.country",
+            )
+            .bind(&p.host)
+            .bind(p.port as i32)
+            .bind(&p.proxy_kind)
+            .bind(&p.login)
+            .bind(&p.password)
+            .bind(p.enabled)
+            .bind(&p.country)
+            .execute(&mut *tx)
+            .await?;
+            upserted += 1;
+        }
+        tx.commit().await?;
+        Ok(upserted)
+    }
 }

@@ -73,11 +73,10 @@ fn ctx(url: &str, kw: &str) -> SubmissionContext {
         email_address: String::new(),
         email_password: String::new(),
         proxies: Default::default(),
+        // F#15 — empty settings → `job_timeout` falls back to `RunnerConfig::per_job_timeout`.
+        settings: std::sync::Arc::new(engine::settings::Settings::default()),
     }
 }
-
-// --------------------------------------------------------------------------
-// 1) One job, one worker, mock driver returns success phrase.
 #[tokio::test]
 async fn single_job_success() {
     let Some(pool) = pool_or_skip().await else { return };
@@ -509,6 +508,8 @@ enabled=1"##;
         email_address: "tester@gmail.com".into(),
         email_password: "pw".into(),
         proxies: Default::default(),
+        // F#15 — empty settings → `job_timeout` falls back to `RunnerConfig::per_job_timeout`.
+        settings: std::sync::Arc::new(engine::settings::Settings::default()),
     };
 
     let cfg = RunnerConfig {

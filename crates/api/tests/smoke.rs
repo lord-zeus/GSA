@@ -847,3 +847,64 @@ async fn f11_projects_ui_full_crud_api() {
     assert!(matches!(status, StatusCode::NOT_FOUND) || status.is_client_error());
     let _ = claim_uri; // (referenced above)
 }
+
+/// Fix #1 (UA-journey finding): re-adding the same proxy host:port must return
+/// 409 "already exists", not a bare 500 leaking the raw `uq_proxies_host_port`
+/// constraint string.  Idempotent — every run uses a fresh host:port derived
+/// from the wall clock.
+#[tokio::test]
+async fn f15_proxy_duplicate_returns_409_not_500() {
+    let Ok(state) = app_state(None).await else {
+        eprintln!("SKIP f15 proxy-409: no Postgres (docker compose up -d)");
+        return;
+    };
+    let app = router(state);
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let host = format!("10.{}.0.1", (stamp % 250) + 1);
+    let port: u16 = 20000 + (stamp as u64 % 5000) as u16;
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "host": host, "port": port, "country": "US"
+    })).unwrap();
+
+    // 1) first add -> 201
+    let (status1, first) = body_to_json(
+        app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/proxies")
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone())).unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status1, StatusCode::CREATED, "first proxy add should be 201");
+
+    // 2) duplicate add (same host:port) -> 409, with a friendly message, NOT a 500
+    let (status2, second) = body_to_json(
+        app.clone().oneshot(
+            Request::builder().method("POST").uri("/api/proxies")
+                .header("content-type", "application/json")
+                .body(Body::from(body)).unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::CONFLICT, "duplicate proxy must be 409 (was 500)");
+    let err = second["error"].as_str().unwrap_or("");
+    assert!(err.contains("already exists"), "409 error should say 'already exists', got: {err}");
+    assert!(!err.contains("uq_proxies_host_port"), "raw constraint string should not leak, got: {err}");
+
+    // cleanup (best-effort) so repeated runs don't pile proxies up
+    if let Some(id) = first["id"].as_str() {
+        let _ = body_to_json(
+            app.oneshot(Request::builder().method("DELETE").uri(format!("/api/proxies/{id}")).body(Body::empty()).unwrap())
+            .await.unwrap(),
+        ).await;
+    }
+}

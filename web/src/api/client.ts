@@ -253,4 +253,29 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(s),
     }),
+
+  // — F#15 settings & profiles —
+  // Global settings (app-wide, the "Global Settings" panel of GSA).
+  settingsGetGlobal: () => req<Record<string, unknown>>('/api/settings/global'),
+  settingsSetGlobal: (s: Record<string, unknown>) =>
+    req<{ status: string }>('/api/settings/global', { method: 'PUT', body: JSON.stringify(s) }),
+  // Per-engine overrides (the three-level cascade: global → engine-override → effective).
+  settingsListOverrides: () => req<Array<{ engine_name: string; fields: Record<string, string> }>>('/api/settings/engine/overrides'),
+  settingsSetOverride: (engineName: string, field: string, value: string | null) =>
+    req<{ status: string }>('/api/settings/engine/overrides', {
+      method: 'POST',
+      body: JSON.stringify({ engine_name: engineName, field, value }),
+    }),
+  settingsDeleteOverrides: (engineName: string) =>
+    req<void>(`/api/settings/engine/overrides?engine_name=${encodeURIComponent(engineName)}`, { method: 'DELETE' }),
+  // Effective (merged + clamped) settings for one engine.
+  settingsGetEffective: (engineName: string) =>
+    req<Record<string, unknown>>(`/api/settings/engine/${encodeURIComponent(engineName)}/effective`),
+  // Import / export bundle (GSA_SER_Settings format as JSON).
+  settingsExport: () => req<Record<string, unknown>>('/api/settings/export'),
+  settingsImport: (bundle: Record<string, unknown>) =>
+    req<{ status: string; proxies_upserted: number }>('/api/settings/import', {
+      method: 'POST',
+      body: JSON.stringify({ bundle }),
+    }),
 }
