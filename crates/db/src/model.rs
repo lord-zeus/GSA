@@ -14,6 +14,37 @@ pub struct Project {
     /// list (round-robin, down proxies skipped). Default false (direct).
     #[serde(default)]
     pub use_proxies: bool,
+    /// F#19: GSA "Anchor Text" mix — JSON blob. `None` = the main keyword is
+    /// used as the anchor for every submission (previous behavior); `Some`
+    /// = a weighted pool the runner draws from per job.
+    #[serde(default)]
+    pub anchor_mix: Option<String>,
+    /// F#19: GSA "Use a random URL from above on every submission (else in
+    /// sequence)". Drives multi-URL (linkwheel) target selection at F#22.
+    #[serde(default)]
+    pub use_random_url: bool,
+    /// F#19: GSA "Use URL variations with N%" — emit scheme/www/case variants
+    /// of the target URL with this probability (0..=100).
+    #[serde(default)]
+    pub url_variations: i32,
+    /// F#19: GSA "Use the root/main URL with N%" — submit the bare
+    /// `scheme://host/` (no path) with this probability (0..=100).
+    #[serde(default)]
+    pub root_url: i32,
+    /// F#24-lite: GSA "Use verified URLs of another project (Multi-Tier)" —
+    /// the upstream project ids whose verified URLs this project submits.
+    #[serde(default)]
+    pub linkwheel: Vec<Uuid>,
+    /// F#24-lite: GSA "Automatically export verified URLs" — append each
+    /// success to `<data>/verified/<project-name>.csv` as it happens.
+    #[serde(default)]
+    pub auto_export: bool,
+    /// GSA Data tab "URL (spintax)": the base URL this project's backlinks
+    /// point at. Empty = engine-spec default (`%url%` left to the INI).
+    /// The runner applies F#19 URL options (root_url / url_variations)
+    /// and F#24-lite linkwheel (upstream verified URLs) to it per job.
+    #[serde(default)]
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

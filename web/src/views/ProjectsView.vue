@@ -22,7 +22,7 @@ const created = ref<Project | null>(null)
 const selected = ref<string>('')
 
 // — detail tabs —
-const tab = ref<'engines' | 'keywords' | 'jobs' | 'results'>('engines')
+const tab = ref<'engines' | 'keywords' | 'jobs' | 'results' | 'options'>('engines')
 
 // — engines tab —
 const engines = ref<EngineRow[]>([])
@@ -508,7 +508,120 @@ function onProjectChange() {
   loadKeywords()
   loadJobs()
   loadResults()
+  if (tab.value === 'options') loadProjectOptions()
 }
+
+// — options tab (F#19: GSA "Data" tab + "Anchor Text" tab) —
+const optsBusy = ref(false)
+const optsLoaded = ref(false)
+const optsSaved = ref(false)
+const optsErr = ref<string | null>(null)
+// GSA "Data" tab — the backlink target URL (spintax allowed).
+const optsUrl = ref('')
+const optsUseRandomUrl = ref(false)
+const optsUrlVariations = ref(0)
+const optsRootUrl = ref(0)
+// Multi-Tier linkwheel (upstream project ids whose verified URLs are used).
+const optsLinkwheel = ref<string[]>([])
+const optsAutoExport = ref(false)
+// Anchor pool (GSA "Anchor Text (below the keyword)" tab) — PoolConfig JSON.
+const optsSecondary = ref('')
+const optsBranding = ref('')
+const optsLsi = ref('')
+const optsGeneric = ref('')
+const optsDomain = ref(false)
+const optsPctSecondary = ref(0)
+const optsPctBranding = ref(0)
+const optsPctLsi = ref(0)
+const optsPctGeneric = ref(0)
+const optsPctDomain = ref(0)
+const optsVariationsPct = ref(20)
+const optsDomainWithKeyword = ref(false)
+// verified URL list (display + linkwheel source).
+const optsVerified = ref<string[]>([])
+
+function splitPool(s: string): string[] {
+  return s.split(/\n|,|\|/).map((x) => x.trim()).filter(Boolean)
+}
+
+async function loadProjectOptions() {
+  if (!selected.value) return
+  optsSaved.value = false
+  try {
+    const p: any = await api.projectGet(selected.value)
+    optsUrl.value = p.url || ''
+    optsUseRandomUrl.value = !!p.use_random_url
+    optsUrlVariations.value = p.url_variations ?? 0
+    optsRootUrl.value = p.root_url ?? 0
+    optsLinkwheel.value = p.linkwheel ?? []
+    optsAutoExport.value = !!p.auto_export
+    const cfg = p.anchor_mix ? JSON.parse(p.anchor_mix) : {}
+    optsSecondary.value = (cfg.secondary || []).join('\n')
+    optsBranding.value = (cfg.branding || []).join('\n')
+    optsLsi.value = (cfg.lsi || []).join('\n')
+    optsGeneric.value = (cfg.generic || []).join('\n')
+    optsDomain.value = !!cfg.domain
+    optsPctSecondary.value = cfg.percentages?.secondary ?? 0
+    optsPctBranding.value = cfg.percentages?.branding ?? 0
+    optsPctLsi.value = cfg.percentages?.lsi ?? 0
+    optsPctGeneric.value = cfg.percentages?.generic ?? 0
+    optsPctDomain.value = cfg.percentages?.domain ?? 0
+    optsVariationsPct.value = cfg.variations_pct ?? 20
+    optsDomainWithKeyword.value = !!cfg.domain_with_keyword
+    optsVerified.value = await api.projectVerifiedUrls(selected.value, 500)
+    optsLoaded.value = true
+    optsErr.value = null
+  } catch (e: any) {
+    optsErr.value = e?.message ?? String(e)
+  }
+}
+
+function buildPoolConfig(): string {
+  return JSON.stringify({
+    secondary: splitPool(optsSecondary.value),
+    branding: splitPool(optsBranding.value),
+    lsi: splitPool(optsLsi.value),
+    generic: splitPool(optsGeneric.value),
+    domain: optsDomain.value,
+    percentages: {
+      secondary: optsPctSecondary.value,
+      branding: optsPctBranding.value,
+      lsi: optsPctLsi.value,
+      generic: optsPctGeneric.value,
+      domain: optsPctDomain.value,
+    },
+    variations_pct: optsVariationsPct.value,
+    domain_with_keyword: optsDomainWithKeyword.value,
+  })
+}
+
+async function saveProjectOptions() {
+  if (!selected.value) return
+  optsBusy.value = true
+  optsSaved.value = false
+  try {
+    if (optsUrl.value.trim()) await api.projectSetUrl(selected.value, optsUrl.value.trim())
+    await api.projectSetAnchorOptions(selected.value, {
+      anchor_mix: buildPoolConfig(),
+      use_random_url: optsUseRandomUrl.value,
+      url_variations: optsUrlVariations.value,
+      root_url: optsRootUrl.value,
+      linkwheel: optsLinkwheel.value,
+      auto_export: optsAutoExport.value,
+    })
+    optsSaved.value = true
+    optsErr.value = null
+  } catch (e: any) {
+    optsErr.value = e?.message ?? String(e)
+  } finally {
+    optsBusy.value = false
+  }
+}
+
+watch(
+  tab,
+  (t) => { if (t === 'options' && selected.value) loadProjectOptions() },
+)
 
 onMounted(load)
 onBeforeUnmount(() => {
@@ -592,7 +705,7 @@ function cls(status: string) {
     <div v-if="selected" style="margin-top:18px">
       <div class="tabs" style="display:flex;gap:4px;align-items:center;border-bottom:1px solid #2a2f3a;padding-bottom:8px">
         <button
-          v-for="t in (['engines', 'keywords', 'jobs', 'results'] as const)"
+          v-for="t in (['engines', 'keywords', 'jobs', 'results', 'options'] as const)"
           :key="t"
           :style="tab === t ? 'padding:6px 14px;border-radius:8px;font-weight:600;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.4);cursor:pointer' : 'padding:6px 14px;border-radius:8px;background:transparent;border:1px solid #2a2f3a;color:#9aa4b2;cursor:pointer;text-transform:capitalize'"
           @click="tab = t"
@@ -956,6 +1069,117 @@ function cls(status: string) {
               </tr>
             </tbody>
           </table>
+        </div>
+      </div>
+
+      <!-- Options (F#19) — GSA "Data" tab + "Anchor Text" tab -->
+      <div v-if="tab === 'options'" style="margin-top:12px">
+        <div class="card" style="margin-bottom:12px">
+          <div style="font-weight:700;font-size:15px">🎯 Backlink target</div>
+          <div class="muted" style="font-size:12px;margin-top:2px">GSA "Data" tab → URL. Where every backlink in this project points. Spintax <code>[a|b]</code> allowed.</div>
+          <input
+            v-model="optsUrl"
+            placeholder="https://example.com/[coffee|tea]-guide-[dubai|london]"
+            style="flex:1;min-width:320px;margin-top:10px"
+          />
+          <div style="display:flex;gap:24px;margin-top:12px;flex-wrap:wrap">
+            <label style="display:flex;gap:6px;align-items:center;font-size:13px">
+              <input type="checkbox" v-model="optsUseRandomUrl" />
+              Randomize the URL (use a variant)
+            </label>
+            <label style="display:flex;gap:6px;align-items:center;font-size:13px">
+              Variations %
+              <input type="number" min="0" max="100" v-model.number="optsUrlVariations" style="width:70px" />
+            </label>
+            <label style="display:flex;gap:6px;align-items:center;font-size:13px">
+              Root URL % <span class="muted">(bare scheme://host/)</span>
+              <input type="number" min="0" max="100" v-model.number="optsRootUrl" style="width:70px" />
+            </label>
+          </div>
+          <div style="margin-top:14px">
+            <div style="font-weight:600;font-size:13px">Multi-Tier / Linkwheel (upstream project URLs)</div>
+            <div class="muted" style="font-size:12px">Projects whose <em>verified URLs</em> this one targets. Leave empty for direct submissions to the URL above.</div>
+            <select v-model="optsLinkwheel" multiple size="3" style="margin-top:8px;min-width:320px">
+              <option v-for="p in projects" :key="p.id" :value="p.id" :disabled="p.id === selected">
+                {{ p.name }}
+              </option>
+            </select>
+          </div>
+          <label style="display:flex;gap:6px;align-items:center;font-size:13px;margin-top:14px">
+            <input type="checkbox" v-model="optsAutoExport" />
+            Auto-export verified URLs (GSA "Automatically export verified URLs")
+          </label>
+        </div>
+
+        <div class="card" style="margin-bottom:12px">
+          <div style="font-weight:700;font-size:15px">🔤 Anchor text mixing <span class="muted" style="font-weight:400;font-size:12px">(GSA "Anchor Text (below the keyword)" tab)</span></div>
+          <div class="muted" style="font-size:12px;margin-top:2px">
+            Main keyword = 100 % − sum of the other pools. One value per line. Weights are percentages of total draws.
+          </div>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-top:12px">
+            <div>
+              <label class="muted" style="font-size:12px">Secondary pool — <span class="mono">{{ optsPctSecondary }}%</span></label>
+              <textarea v-model="optsSecondary" rows="3" placeholder="dubai coffee shop&#10;coffee roaster dubai" style="width:100%"></textarea>
+              <input type="number" min="0" max="100" v-model.number="optsPctSecondary" style="width:100%;margin-top:6px" placeholder="weight %" />
+            </div>
+            <div>
+              <label class="muted" style="font-size:12px">Branding pool — <span class="mono">{{ optsPctBranding }}%</span></label>
+              <textarea v-model="optsBranding" rows="3" placeholder="DubaiCoffee&#10;Dubai Coffee Co." style="width:100%"></textarea>
+              <input type="number" min="0" max="100" v-model.number="optsPctBranding" style="width:100%;margin-top:6px" placeholder="weight %" />
+            </div>
+            <div>
+              <label class="muted" style="font-size:12px">LSI pool — <span class="mono">{{ optsPctLsi }}%</span></label>
+              <textarea v-model="optsLsi" rows="3" placeholder="arabica beans&#10;single origin roastery" style="width:100%"></textarea>
+              <input type="number" min="0" max="100" v-model.number="optsPctLsi" style="width:100%;margin-top:6px" placeholder="weight %" />
+            </div>
+            <div>
+              <label class="muted" style="font-size:12px">Generic pool — <span class="mono">{{ optsPctGeneric }}%</span></label>
+              <textarea v-model="optsGeneric" rows="3" placeholder="click here&#10;read more" style="width:100%"></textarea>
+              <input type="number" min="0" max="100" v-model.number="optsPctGeneric" style="width:100%;margin-top:6px" placeholder="weight %" />
+            </div>
+            <div>
+              <label style="font-size:12px;display:flex;align-items:center;gap:8px">
+                <input type="checkbox" v-model="optsDomain" />
+                Domain as anchor — <span class="mono">{{ optsPctDomain }}%</span>
+              </label>
+              <input type="number" min="0" max="100" v-model.number="optsPctDomain" :disabled="!optsDomain" style="width:100%;margin-top:6px" placeholder="weight %" />
+            </div>
+            <div>
+              <label class="muted" style="font-size:12px">Anchor text variations % <span style="opacity:.7">(case mutation, e.g. gsa → Gsa)</span></label>
+              <input type="number" min="0" max="100" v-model.number="optsVariationsPct" style="width:100%;margin-top:6px" placeholder="default 20" />
+            </div>
+            <div>
+              <label style="display:flex;gap:6px;align-items:center;font-size:12px">
+                <input type="checkbox" v-model="optsDomainWithKeyword" />
+                Combine domain / generic with keyword
+              </label>
+              <span class="muted" style="font-size:11px">(piggy-back a pool anchor with the main keyword)</span>
+            </div>
+          </div>
+
+          <div style="margin-top:14px;display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+            <button style="padding:9px 18px;font-weight:600" :disabled="optsBusy" @click="saveProjectOptions">
+              {{ optsBusy ? 'Saving…' : (optsSaved ? '✓ Saved — click to re-save' : 'Save options') }}
+            </button>
+            <button class="muted" @click="loadProjectOptions()" :disabled="optsBusy">↻ reload</button>
+            <span v-if="optsSaved" style="color:#16a34a;font-weight:600">Saved ✓</span>
+            <span v-if="optsErr" style="color:#ef4444">{{ optsErr }}</span>
+            <span v-else-if="optsLoaded" class="muted">Loaded ✓</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div style="font-weight:700;font-size:15px">✅ Verified URLs ({{ optsVerified.length }})</div>
+          <div class="muted" style="font-size:12px;margin-top:2px">
+            Successful backlinks built by this project so far — the pool the linkwheel consumes.
+          </div>
+          <div v-if="optsVerified.length" style="margin-top:10px;max-height:260px;overflow:auto;padding:8px;border:1px solid #2a2f3a;border-radius:8px">
+            <div v-for="u in optsVerified" :key="u" style="font-size:12px;padding:3px 0;word-break:break-all;border-bottom:1px dashed #2a2f3a">
+              <a :href="u" target="_blank" rel="noreferrer" style="color:#60a5fa">{{ u }}</a>
+            </div>
+          </div>
+          <div v-else class="muted" style="margin-top:10px;font-size:13px">No successes yet — run a job to populate this list.</div>
         </div>
       </div>
     </div>

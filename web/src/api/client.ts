@@ -21,6 +21,19 @@ export interface Project {
   name: string
   description: string | null
   use_proxies?: boolean
+  // F#19 — the GSA "Data" tab + "Anchor Text" tab (backlink target + rotation).
+  /** The backlink target URL (GSA Data-tab "URL"; spintax allowed). */
+  url?: string
+  /** Weighted anchor text pool (JSON string of PoolConfig). */
+  anchor_mix?: string | null
+  /** URL randomization / variation options (GSA "Data" tab "URL options"). */
+  use_random_url?: boolean
+  url_variations?: number
+  root_url?: number
+  /** Multi-Tier linkwheel: upstream project ids whose verified URLs are used. */
+  linkwheel?: string[]
+  /** GSA "Automatically export verified URLs" (F#24-lite). */
+  auto_export?: boolean
   created_at: string
 }
 export interface EngineRow {
@@ -317,6 +330,26 @@ export const api = {
     req<Project>(`/api/projects/${id}`, { method: 'PUT', body: JSON.stringify(p) }),
   projectDelete: (id: string) =>
     req<void>(`/api/projects/${id}`, { method: 'DELETE' }),
+  // — F#19: per-project URL + anchor-rotation + linkwheel + verified export —
+  /** Set the backlink target URL (GSA Data-tab "URL"). */
+  projectSetUrl: (id: string, url: string) =>
+    req<Project>(`/api/projects/${id}/url`, { method: 'PUT', body: JSON.stringify({ url }) }),
+  /** Save the "Anchor Text (below the keyword)" tab. Omitted fields unchanged. */
+  projectSetAnchorOptions: (
+    id: string,
+    o: {
+      anchor_mix?: string
+      use_random_url?: boolean
+      url_variations?: number
+      root_url?: number
+      linkwheel?: string[]
+      auto_export?: boolean
+    },
+  ) =>
+    req<Project>(`/api/projects/${id}/anchor-options`, { method: 'PUT', body: JSON.stringify(o) }),
+  /** List the project's verified (successful) submission URLs. */
+  projectVerifiedUrls: (id: string, limit = 500) =>
+    req<string[]>(`/api/projects/${id}/verified?limit=${limit}`),
   engineList: (projectId: string) => req<EngineRow[]>(`/api/projects/${projectId}/engines`),
   engineAdd: (projectId: string, e: { engine_name: string; engine_type?: string; url?: string; file_path?: string; step_count?: number }) =>
     req<EngineRow>(`/api/projects/${projectId}/engines`, { method: 'POST', body: JSON.stringify(e) }),

@@ -584,6 +584,177 @@ async fn update_project(
 
 
 
+/// PUT /api/projects/{id}/url — set the project's base target URL
+/// (GSA Data-tab "URL (spintax)"). `None`/empty body 400s; a project
+/// with an empty URL is left at the engine-spec default.
+#[derive(Deserialize)]
+
+pub struct SetProjectUrlBody {
+
+    url: String,
+
+}
+
+async fn set_project_url_api(
+
+    Path(id): Path<Uuid>,
+
+    state: State<Arc<AppState>>,
+
+    body: Json<SetProjectUrlBody>,
+
+) -> Response {
+
+    let url = body.url.trim().to_string();
+
+    if url.is_empty() {
+
+        return StatusCode::BAD_REQUEST
+
+            .into_response();
+
+    }
+
+    match Repo::new(state.pool.clone())
+
+        .set_project_url(id, &url)
+
+        .await
+
+    {
+
+        Ok(p) => Json(p).into_response(),
+
+        Err(e) => error_response(e),
+
+    }
+
+}
+
+
+
+/// PUT /api/projects/{id}/anchor-options — the GSA "Anchor Text (below the
+/// keyword)" tab: anchor mix JSON, URL randomization/variation, root-URL
+/// percentage, linkwheel (upstream project ids), and auto-export.  Every
+/// field is optional; the repo `COALESCE`s so omitted fields are left
+/// untouched.
+#[derive(Deserialize)]
+
+pub struct AnchorOptionsBody {
+
+    #[serde(default)]
+
+    anchor_mix: Option<String>,
+
+    #[serde(default)]
+
+    use_random_url: Option<bool>,
+
+    #[serde(default)]
+
+    url_variations: Option<i32>,
+
+    #[serde(default)]
+
+    root_url: Option<i32>,
+
+    #[serde(default)]
+
+    linkwheel: Option<Vec<Uuid>>,
+
+    #[serde(default)]
+
+    auto_export: Option<bool>,
+
+}
+
+async fn set_project_anchor_options_api(
+
+    Path(id): Path<Uuid>,
+
+    state: State<Arc<AppState>>,
+
+    body: Json<AnchorOptionsBody>,
+
+) -> Response {
+
+    let result = Repo::new(state.pool.clone())
+
+        .set_project_options(
+
+            id,
+
+            body.anchor_mix.as_deref(),
+
+            body.use_random_url,
+
+            body.url_variations,
+
+            body.root_url,
+
+            body.linkwheel.as_deref(),
+
+            body.auto_export,
+
+        )
+
+        .await;
+
+    match result {
+
+        Ok(p) => Json(p).into_response(),
+
+        Err(e) => error_response(e),
+
+    }
+
+}
+
+
+
+/// GET /api/projects/{id}/verified — GSA "link list" feed: the project's
+/// verified (successful) submission URLs, most recent first.  Accepts an
+/// optional `?limit=N` query param (default 500, max 5000).
+#[derive(Deserialize)]
+
+pub struct VerifiedQuery {
+
+    #[serde(default)]
+
+    limit: Option<i64>,
+
+}
+
+async fn list_verified_urls_api(
+
+    Path(id): Path<Uuid>,
+
+    Query(q): Query<VerifiedQuery>,
+
+    state: State<Arc<AppState>>,
+
+) -> Response {
+
+    let limit = q.limit.unwrap_or(500);
+
+    match Repo::new(state.pool.clone())
+
+        .list_verified_urls(id, limit)
+
+        .await
+
+    {
+
+        Ok(rows) => Json(rows).into_response(),
+
+        Err(e) => error_response(e),
+
+    }
+
+}
+
+
+
 /// GET /api/projects/{id} — read one project (404 if unknown).
 
 async fn get_project(
@@ -1368,18 +1539,39 @@ pub async fn run_project_pool(project_id: Uuid, state: &Arc<AppState>) -> anyhow
 
 
 
+    // F#19 / F#24-lite — fetch the project's own config row once and
+    // thread anchor mix, URL options, linkwheel, auto-export, and the
+    // GSA Data-tab URL (F#19 base target) into the submission context.
+    let project_row = Repo::new(state.pool.clone())
+        .project_by_id(project_id)
+        .await
+        .ok()
+        .flatten();
+
     let ctx = runner::SubmissionContext {
-
         email_address,
-
         email_password,
-
         proxies,
-
         settings: std::sync::Arc::new(global_settings.clamped_ref()),
 
-        ..Default::default()
+        project_id,
+        project_url: project_row.as_ref().map(|p| p.url.clone()).unwrap_or_default(),
+        anchor: project_row
+            .as_ref()
+            .and_then(|p| p.anchor_mix.as_deref())
+            .and_then(|s| serde_json::from_str::<engine::anchor::PoolConfig>(s).ok())
+            .filter(|c| !c.is_empty()),
+        url_options: engine::anchor::UrlOptions {
+            use_random_url: project_row.as_ref().map(|p| p.use_random_url).unwrap_or(false),
+            url_variations: u32::try_from(project_row.as_ref().map(|p| p.url_variations).unwrap_or(0))
+                .unwrap_or(0),
+            root_url: u32::try_from(project_row.as_ref().map(|p| p.root_url).unwrap_or(0))
+                .unwrap_or(0),
+        },
+        linkwheel_project_ids: project_row.as_ref().map(|p| p.linkwheel.clone()).unwrap_or_default(),
+        auto_export: project_row.as_ref().map(|p| p.auto_export).unwrap_or(false),
 
+        ..Default::default()
     };
 
 
@@ -1757,6 +1949,17 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/projects/{id}/results", get(project_results))
 
         .route("/api/projects/{id}/results/stats", get(project_stats))
+        // F#19 — GSA "Anchor Text (below the keyword)" tab + URL options +
+        // linkwheel + auto-export.  Separate PUTs so the UI can save them
+        // independently (each is `None`-tolerant in the repo).
+        .route("/api/projects/{id}/url", put(set_project_url_api))
+        .route(
+            "/api/projects/{id}/anchor-options",
+            put(set_project_anchor_options_api),
+        )
+        // F#24-lite — auto-export of the project's verified URLs (the
+        // GSA "link list" feed for downstream tiers).
+        .route("/api/projects/{id}/verified", get(list_verified_urls_api))
 
         .route("/api/jobs/claim", post(claim_job))
 

@@ -193,7 +193,8 @@ impl Repo {
     pub async fn create_project(&self, name: &str, description: Option<&str>) -> anyhow::Result<Project> {
         let row = sqlx::query(
             "INSERT INTO projects (name, description) VALUES ($1, $2)
-             RETURNING id, name, description, created_at, updated_at, use_proxies",
+             RETURNING id, name, description, created_at, updated_at, use_proxies,
+                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url",
         )
         .bind(name)
         .bind(description)
@@ -211,7 +212,8 @@ impl Repo {
     ) -> anyhow::Result<Project> {
         let row = sqlx::query(
             "UPDATE projects SET name = $1, description = $2 WHERE id = $3
-             RETURNING id, name, description, created_at, updated_at, use_proxies",
+             RETURNING id, name, description, created_at, updated_at, use_proxies,
+                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url",
         )
         .bind(name)
         .bind(description)
@@ -233,7 +235,8 @@ impl Repo {
 
     pub async fn list_projects(&self) -> anyhow::Result<Vec<Project>> {
         let rows = sqlx::query(
-            "SELECT id, name, description, created_at, updated_at, use_proxies
+            "SELECT id, name, description, created_at, updated_at, use_proxies,
+             anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url
              FROM projects ORDER BY created_at",
         )
         .fetch_all(&self.pool)
@@ -243,7 +246,8 @@ impl Repo {
 
     pub async fn project_by_name(&self, name: &str) -> anyhow::Result<Option<Project>> {
         let row = sqlx::query(
-            "SELECT id, name, description, created_at, updated_at, use_proxies
+            "SELECT id, name, description, created_at, updated_at, use_proxies,
+             anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url
              FROM projects WHERE name = $1",
         )
         .bind(name)
@@ -255,7 +259,8 @@ impl Repo {
     /// Fetch one project by id (404-friendly: None when absent).
     pub async fn project_by_id(&self, id: Uuid) -> anyhow::Result<Option<Project>> {
         let row = sqlx::query(
-            "SELECT id, name, description, created_at, updated_at, use_proxies
+            "SELECT id, name, description, created_at, updated_at, use_proxies,
+             anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url
              FROM projects WHERE id = $1",
         )
         .bind(id)
@@ -263,6 +268,25 @@ impl Repo {
         .await?;
         Ok(row.map(|r| Project::from_row(&r)).transpose()?)
     }
+
+    /// F#19 — update the project's base target URL (GSA Data-tab "URL").
+    /// A standalone route so we don't have to change every existing
+    /// `update_project` caller.
+    pub async fn set_project_url(&self, id: Uuid, url: &str) -> anyhow::Result<Project> {
+        let row = sqlx::query(
+            "UPDATE projects SET url = $2, updated_at = now() WHERE id = $1
+             RETURNING id, name, description, created_at, updated_at, use_proxies,
+                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url",
+        )
+        .bind(id)
+        .bind(url)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("project {id} not found"))?;
+        Ok(FromRow::from_row(&row)?)
+    }
+
+    // (set_project_options lives under F#19 below, after the engines section.)
 
     // ── engines ───────────────────────────────────────────────────────────
     pub async fn upsert_engine(
@@ -997,7 +1021,8 @@ impl Repo {
     pub async fn set_project_use_proxies(&self, id: Uuid, use_proxies: bool) -> anyhow::Result<Project> {
         let row = sqlx::query(
             "UPDATE projects SET use_proxies = $1, updated_at = now() WHERE id = $2
-             RETURNING id, name, description, created_at, updated_at, use_proxies",
+             RETURNING id, name, description, created_at, updated_at, use_proxies,
+                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export",
         )
         .bind(use_proxies)
         .bind(id)
@@ -1012,6 +1037,86 @@ impl Repo {
             .bind(id)
             .fetch_optional(&self.pool)
             .await?)
+    }
+
+    // ── F#19: project submission options (GSA "Data" tab) ────────────────
+    /// Set one or more of the project's anchor/URL/Linkwheel options. `None`
+    /// entries are left unchanged. All writes in one round trip.
+    pub async fn set_project_options(
+        &self,
+        id: Uuid,
+        anchor_mix: Option<&str>,
+        use_random_url: Option<bool>,
+        url_variations: Option<i32>,
+        root_url: Option<i32>,
+        linkwheel: Option<&[Uuid]>,
+        auto_export: Option<bool>,
+    ) -> anyhow::Result<Project> {
+        let row = sqlx::query(
+            "UPDATE projects p SET
+                 anchor_mix      = COALESCE($1, p.anchor_mix),
+                 use_random_url  = COALESCE($2, p.use_random_url),
+                 url_variations  = COALESCE($3, p.url_variations),
+                 root_url        = COALESCE($4, p.root_url),
+                 linkwheel       = COALESCE($5, p.linkwheel),
+                 auto_export     = COALESCE($6, p.auto_export),
+                 updated_at      = now()
+               WHERE p.id = $7
+               RETURNING p.id, p.name, p.description, p.created_at, p.updated_at, p.use_proxies,
+                         p.anchor_mix, p.use_random_url, p.url_variations, p.root_url,
+                         p.linkwheel, p.auto_export, p.url",
+        )
+        .bind(anchor_mix.map(|s| s.to_string()))
+        .bind(use_random_url)
+        .bind(url_variations.map(|v| v.clamp(0, 100)))
+        .bind(root_url.map(|v| v.clamp(0, 100)))
+        .bind(linkwheel.map(|v| v.to_vec()))
+        .bind(auto_export)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("project {id} not found"))?;
+        Ok(FromRow::from_row(&row)?)
+    }
+
+    /// Last N successful-submission URLs (GSA "verified URLs" pool), newest
+    /// first. Used for the Multi-Tier/Linkwheel target pool (F#24-lite) and
+    /// for `GET /api/projects/{id}/verified-urls`.
+    pub async fn list_verified_urls(&self, project_id: Uuid, limit: i64) -> anyhow::Result<Vec<String>> {
+        let limit = limit.clamp(1, 5000);
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT r.url AS url FROM results r
+             JOIN jobs j ON j.id = r.job_id
+             WHERE j.project_id = $1 AND r.kind = 'success'
+               AND r.url IS NOT NULL AND r.url != ''
+             GROUP BY r.url
+             ORDER BY MAX(r.created_at) DESC
+             LIMIT $2",
+        )
+        .bind(project_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Success-URL pool for `upstream_id` (Linkwheel source), newest first.
+    /// `exclude` (this project) is never returned.
+    pub async fn verified_urls_from(&self, upstream_id: Uuid, exclude: Uuid, limit: i64) -> anyhow::Result<Vec<String>> {
+        let limit = limit.clamp(1, 5000);
+        let rows = sqlx::query_scalar::<_, String>(
+            "SELECT r.url FROM results r
+             JOIN jobs j ON j.id = r.job_id
+             WHERE j.project_id = $1 AND j.project_id != $2
+               AND r.kind = 'success' AND r.url IS NOT NULL AND r.url != ''
+             ORDER BY r.created_at DESC LIMIT $3",
+        )
+        .bind(upstream_id)
+        .bind(exclude)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     // ── F#15: global settings + engine-override settings ─────────────────

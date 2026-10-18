@@ -3,6 +3,8 @@
 //! inside each `tokio::task`.
 
 use std::collections::HashMap;
+use std::io::Write;
+use std::path::Path;
 
 use engine::driver::Driver;
 use engine::email_exec::{EmailContext, run_email_engine};
@@ -20,6 +22,9 @@ use crate::specprovider::SpecSource;
 pub struct SubmissionContext {
     /// The project's target URL (where the backlink should point).
     pub project_url: String,
+    /// The project id — used only for GSA-style auto-export file naming
+    /// (`<data>/verified/<project_id>.csv`); does not affect submission.
+    pub project_id: Uuid,
     /// The keyword (empty string = none).
     pub keyword: String,
     /// Spintax data files, `name -> body`.
@@ -47,6 +52,25 @@ pub struct SubmissionContext {
     /// (global settings only — per-keyword / per-engine overrides are
     /// handled by the *engine* executor, not the pool).
     pub settings: std::sync::Arc<engine::settings::Settings>,
+    /// F#19 — anchor-text mix (GSA "Anchor Text" block). `None` = submit the
+    /// main keyword as anchor for every job (previous behavior). `Some` =
+    /// a weighted pool the runner draws from per job (deterministic in the
+    /// per-job seed) and feeds in via `%anchor_text%` / `%banchor_text%` /
+    /// `%panchor_text%` / `%lanchor_text%` / `%url%`.
+    pub anchor: Option<engine::anchor::PoolConfig>,
+    /// F#19 — URL options (GSA "URL options" block).
+    pub url_options: engine::anchor::UrlOptions,
+    /// F#19 — Multi-Tier / linkwheel: upstream project ids whose *verified
+    /// success URLs* this project may use as its submission target (one per
+    /// job, deterministic per job). Empty = no linkwheel (target is the
+    /// project's own URL).
+    pub linkwheel_project_ids: Vec<Uuid>,
+    /// F#24-lite — GSA "Automatically export verified URLs": when `true`,
+    /// every **successful** submission appends a GSA-schema CSV row to
+    /// `<data_dir>/verified/<project_id>.csv` (the "link list" feed that
+    /// downstream tier projects import). Default `false` to keep old-test
+    /// behavior; set per project from `projects.auto_export`.
+    pub auto_export: bool,
 }
 
 /// The terminal state of one job's execution.
@@ -182,11 +206,106 @@ impl JobRunner {
             }
         };
 
-        // 3) plan
+        // 3) plan.
+        //
+        // F#19 — Anchor-text rotation: when the project carries an anchor mix
+        // (i.e. at least one non-keyword anchor type with weight > 0), draw one
+        // concrete anchor per job (deterministic in the per-job seed) and
+        // substitute it into the engine spec via `%anchor_text%`.  When the
+        // mix is `None` (previous behavior) the anchor stays `None` and GSA's
+        // keyword-fallback path in the executor kicks in.
+        let anchor_draw = if let Some(cfg) = &self.ctx.anchor {
+            if cfg.is_empty() {
+                None
+            } else {
+                let domain = engine::anchor::domain_of(&self.ctx.project_url);
+                let spin_ctx = engine::spin::Context {
+                    values: std::collections::HashMap::new(),
+                    files: self.ctx.files.clone(),
+                    random_options: vec![],
+                };
+                let seed = self.seed_for_job(job).unwrap_or(0xA11CE_5EED | 1);
+                Some(engine::anchor::draw_anchor(cfg, &keyword, &domain, Some(seed), &spin_ctx))
+            }
+        } else {
+            None
+        };
+        let input_anchor = anchor_draw.as_ref().map(|d| d.text.clone());
+
+        // F#20 — URL options applied to the target URL before it reaches the
+        // engine spec (which resolves it into `%url%` form fields)
+        //
+        //   * `linkwheel_project_ids` non-empty → pick a verified URL from an
+        //     upstream project (GSA "Multi-Tier/Linkwheel" — the target URL is
+        //     the upstream's already-created backlink, not our own site).
+        //   * `root_url` > 0 → with that probability, use the bare host URL
+        //     (strip the path), e.g. `http://domain.de/link.html` →
+        //     `http://domain.de/`.
+        //   * `url_variations` > 0 → with that probability, emit a scheme/www/
+        //     case variant of the URL.
+        //
+        // The linkwheel pick is deterministic in the job id so a rerun of the
+        // same job always picks the same upstream URL (stable + testable).
+        let effective_url = {
+            let base = self.ctx.project_url.clone();
+            // 1) Linkwheel: replace the target with an upstream verified URL.
+            let base = if !self.ctx.linkwheel_project_ids.is_empty() {
+                // Deterministic pick: stable-hash of job id → upstream id.
+                let seed = job.id.as_u64_pair();
+                let hash = (seed.0 ^ seed.1.rotate_left(13)).wrapping_mul(0x9E37_79B9);
+                let idx = (hash as usize) % self.ctx.linkwheel_project_ids.len();
+                let upstream_id = self.ctx.linkwheel_project_ids[idx];
+                match repo.list_verified_urls(upstream_id, 500).await {
+                    Ok(urls) if !urls.is_empty() => {
+                        // Deterministic pick within the upstream pool.
+                        let pick = (hash >> 20) as usize % urls.len();
+                        urls[pick].clone()
+                    }
+                    _ => base,
+                }
+            } else {
+                base
+            };
+            // 2) root_url: with `root_url`%, use the bare scheme://host/.
+            let mut url = base;
+            let opts = &self.ctx.url_options;
+            if opts.root_url > 0 {
+                let seed = job.id.as_u64_pair();
+                let hash = (seed.0 ^ seed.1.rotate_left(27)).wrapping_mul(0xC2B2_AE35);
+                if (hash % 100) < u64::from(opts.root_url) {
+                    // Strip path — keep scheme + host.
+                    let trimmed = url.trim_start_matches("https://").trim_start_matches("http://");
+                    let host = trimmed.split('/').next().unwrap_or(trimmed);
+                    let scheme = if url.starts_with("https://") { "https://" } else { "http://" };
+                    url = format!("{scheme}{host}/");
+                }
+            }
+            // 3) url_variations: with `url_variations`%, emit a variant
+            //    (www/no-www, http/https, case).
+            if opts.url_variations > 0 {
+                let seed = job.id.as_u64_pair();
+                let hash = (seed.0 ^ seed.1.rotate_left(41)).wrapping_mul(0x85EBC_A6B);
+                let variant = (hash % 100) < u64::from(opts.url_variations);
+                if variant {
+                    // Toggle www: strip if present, else add.
+                    let stripped = url.trim_start_matches("https://").trim_start_matches("http://").trim_start_matches("www.");
+                    let scheme = if url.starts_with("https://") { "https://" } else { "http://" };
+                    url = if url.contains("://www.") {
+                        format!("{scheme}{stripped}")
+                    } else {
+                        format!("{scheme}www.{stripped}")
+                    };
+                    // Uppercase host (GSA example: `http://domain.de/` → `HTTP://www.Domain.de`)
+                    url = url.to_uppercase();
+                }
+            }
+            url
+        };
+
         let input = SubmissionInput {
-            url: self.ctx.project_url.clone(),
+            url: effective_url,
             keyword: keyword.clone(),
-            anchor: None,
+            anchor: input_anchor,
             seed: self.ctx.seed,
             extra: Default::default(),
             files: self.ctx.files.clone(),
@@ -489,6 +608,20 @@ impl JobRunner {
             )
             .await;
 
+        // F#24-lite — GSA "Automatically export verified URLs": when the
+        // project has `auto_export` on AND this job succeeded, append a CSV
+        // row (GSA's export schema) to `<data>/verified/<project_id>.csv`.
+        // Gated on `success` because that's the only outcome GSA exports
+        // (only verified URLs). Failures stay visible in the `results` table
+        // but are not part of the "link list" feed.
+        if success && self.ctx.auto_export {
+            if let Some(sub_url) = &report.submitted_url {
+                if !sub_url.trim().is_empty() {
+                    self.export_verified_url(job_id, sub_url, &keyword).await;
+                }
+            }
+        }
+
         JobOutcome {
             job_id,
             status: if done { "done" } else { "failed" },
@@ -510,6 +643,99 @@ impl JobRunner {
             None => anyhow::bail!("engine row {engine_id} not found"),
         };
         Ok((engine_id, row.file_path))
+    }
+
+    /// F#24-lite — GSA "Automatically export verified URLs".
+    ///
+    /// Append one GSA-schema CSV row to `<data_dir>/verified/<project_id>.csv`.
+    /// This is the "link list" feed that (a) downstream tier projects import
+    /// for Multi-Tier / linkwheel, and (b) the External-APIs tab of GSA
+    /// exposes as an "Import verified URLs from external file" source.
+    ///
+    /// Schema (matches GSA's export column order, from the binary strings we
+    /// pulled): `Date,URL,Anchor text,Engine,Type,DoFollow Link,Indexable,
+    /// Links (int),Links (ext),Project`. We fill the columns we can derive
+    /// at job-completion time (Date, URL, Anchor text, Project) and leave
+    /// the engine-specific ones blank — the engine row isn't loaded here, and
+    /// those fields are populated by GSA's post-run analysis pass.
+    ///
+    /// Deterministic + idempotent per (project, url): a re-run of the same
+    /// engine against the same target produces the same URL; the downstream
+    /// linkwheel consumer dedupes by URL anyway, so a duplicate row on retry
+    /// is harmless (the `list_verified_urls` SQL already `GROUP BY url`).
+    ///
+    /// `data_dir` resolution: `SEER_DATA_DIR` env var (operator-set), else
+    /// `~/.ser` — matching the `SEER_*` prefix convention the rest of the
+    /// app uses for its config surface. Best-effort: a failed write is
+    /// logged to stderr but never fails the job (export is a convenience,
+    /// not part of the submission contract).
+    async fn export_verified_url(&self, _job_id: Uuid, url: &str, anchor: &str) {
+        let anchor = anchor.trim();
+        let file = self.verified_export_path();
+        if file.parent().map(|p| !p.as_os_str().is_empty()).unwrap_or(true) {
+            if let Err(e) = std::fs::create_dir_all(file.parent().unwrap_or(Path::new("."))) {
+                eprintln!("[auto-export] could not create dir {e}");
+                return;
+            }
+        }
+        let header_written = std::fs::metadata(&file)
+            .map(|m| m.len() == 0)
+            .unwrap_or(true);
+        let date = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let esc = |s: &str| {
+            let t = s.trim();
+            if t.contains(',') || t.contains('"') || t.contains('\n') {
+                format!("\"{}\"", t.replace('"', "\"\""))
+            } else {
+                t.to_string()
+            }
+        };
+        // GSA's 10-column export schema, exactly (gap-analysis §2 from the
+        // binary strings): Date, URL, Anchor text, Engine, Type, DoFollow
+        // Link, Indexable, Links (int), Links (ext), Project.
+        let cells: Vec<String> = vec![
+            esc(&date),
+            esc(url),
+            esc(anchor),
+            String::new(), // Engine
+            String::new(), // Type (backlink family — engine-specific)
+            String::new(), // DoFollow Link
+            String::new(), // Indexable
+            String::new(), // Links (int)
+            String::new(), // Links (ext)
+            self.ctx.project_id.to_string(),
+        ];
+        let row = cells.join(",");
+        let header = "Date,URL,Anchor text,Engine,Type,DoFollow Link,Indexable,Links (int),Links (ext),Project";
+        let csv = if header_written {
+            format!("{header}\n{row}\n")
+        } else {
+            format!("{row}\n")
+        };
+        let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&file) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[auto-export] open {file:?}: {e}");
+                return;
+            }
+        };
+        if let Err(e) = f.write_all(csv.as_bytes()) {
+            eprintln!("[auto-export] write {file:?}: {e}");
+        }
+    }
+
+    /// Where the verified-URL feed lives. `SEER_DATA_DIR/verified/<project>.csv`,
+    /// falling back to `~/.ser/verified/<project>.csv`.
+    fn verified_export_path(&self) -> std::path::PathBuf {
+        let base = std::env::var("SEER_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("USERPROFILE")
+                    .or_else(|_| std::env::var("HOME"))
+                    .unwrap_or_else(|_| ".".to_string());
+                std::path::PathBuf::from(home).join(".ser")
+            });
+        base.join("verified").join(format!("{}.csv", self.ctx.project_id))
     }
 }
 
