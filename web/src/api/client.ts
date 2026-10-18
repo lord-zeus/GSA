@@ -110,12 +110,23 @@ export interface ProxyRow {
   password: string
   enabled: boolean
   created_at: string
+  // F#14 — geo/IP columns
+  country?: string | null
+  ip?: string | null
+  ip_public?: boolean | null
+  geo_verified_at?: string | null
 }
 export interface ProxyTestResult {
   proxy_id: string
   ok: boolean
   detail: string
   latency_ms: number
+}
+export interface ProxyGeoVerifyResult {
+  ip: string
+  ip_public: boolean
+  speed_ms: number | null
+  country: string | null
 }
 export interface RunSummary {
   claimed: number
@@ -208,14 +219,28 @@ export const api = {
   projectStats: (projectId: string) => req<ResultStats>(`/api/projects/${projectId}/results/stats`),
 
   // — F#13 proxy support (GSA "proxy list") —
-  proxyList: () => req<ProxyRow[]>('/api/proxies'),
-  proxyAdd: (p: { host: string; port: number; kind?: string; login?: string; password?: string }) =>
+  proxyList: (country?: string) =>
+    req<ProxyRow[]>(`/api/proxies${country ? `?country=${encodeURIComponent(country)}` : ''}`),
+  proxyAdd: (p: { host: string; port: number; kind?: string; login?: string; password?: string; country?: string }) =>
     req<ProxyRow>('/api/proxies', { method: 'POST', body: JSON.stringify(p) }),
   proxyDelete: (id: string) => req<void>(`/api/proxies/${id}`, { method: 'DELETE' }),
   proxySetEnabled: (id: string, enabled: boolean) =>
     req<ProxyRow>(`/api/proxies/${id}/enabled`, { method: 'PUT', body: JSON.stringify({ enabled }) }),
   proxyTest: (id: string) =>
     req<ProxyTestResult>(`/api/proxies/${id}/test`, { method: 'POST' }),
+  // — F#14 geo / IP handling —
+  proxySetCountry: (id: string, country: string) =>
+    req<ProxyRow>(`/api/proxies/${id}/country`, { method: 'PUT', body: JSON.stringify({ country }) }),
+  proxyVerifyGeo: (id: string, opts?: { egress_url?: string; timeout_secs?: number }) =>
+    req<ProxyGeoVerifyResult>(`/api/proxies/${id}/verify-geo`, {
+      method: 'POST',
+      body: JSON.stringify(opts ?? {}),
+    }),
+  proxyVerifyAll: (timeoutSecs?: number) =>
+    req<{ verified: number; failed: number; results: Array<Record<string, unknown>> }>(
+      '/api/proxies/verify-all',
+      { method: 'POST', body: JSON.stringify(timeoutSecs != null ? { timeout_secs: timeoutSecs } : {}) },
+    ),
   projectSetUseProxies: (projectId: string, useProxies: boolean) =>
     req<Project>(`/api/projects/${projectId}/proxies`, { method: 'PUT', body: JSON.stringify({ use_proxies: useProxies }) }),
 

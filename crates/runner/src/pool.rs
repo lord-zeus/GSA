@@ -104,7 +104,7 @@ impl WorkerPool {
         // queue drains.  After the loop, drop every sender so each
         // worker's `recv()` returns None and the worker exits.
         {
-            let repo = ser_db::Repo::new(&self.db);
+            let repo = ser_db::Repo::new(self.db.clone());
             let mut next = 0usize;
             loop {
                 let jobs = match repo
@@ -170,7 +170,7 @@ async fn worker_loop(pool: WorkerPool, summary: Arc<std::sync::Mutex<PoolSummary
     let db = pool.db.clone();
 
     while let Some(job_id) = rx.recv().await {
-        let repo = ser_db::Repo::new(&db);
+        let repo = ser_db::Repo::new(db.clone());
 
         // Claim atomically. If someone beat us to it, the guard clause
         // matches zero rows and we get `None` — skip silently.

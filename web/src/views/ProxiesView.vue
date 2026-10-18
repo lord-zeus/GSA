@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
-import { api, ProxyRow, ProxyTestResult } from '@/api/client'
+import { ref, onMounted, computed, watch } from 'vue'
+import { api, ProxyRow, ProxyTestResult, ProxyGeoVerifyResult } from '@/api/client'
 
 // — list state —
 const proxies = ref<ProxyRow[]>([])
@@ -8,17 +8,31 @@ const listError = ref('')
 const busy = ref(false)
 const tested = ref<Record<string, { t: ProxyTestResult; at: number }>>({})
 
+// — F#14: geo —
+const countryFilter = ref('')
+const geoVerified = ref<Record<string, { r: ProxyGeoVerifyResult; ok: boolean; at: number; err?: string }>>({})
+const busyGeo = ref<Record<string, boolean>>({})
+const busyVerifyAll = ref(false)
+
 // — add form —
-const f = ref({ host: '', port: 8080, kind: 'http', login: '', password: '', showAdd: false })
+const f = ref({ host: '', port: 8080, kind: 'http', login: '', password: '', country: '', showAdd: false })
 const addError = ref('')
 
 async function load() {
   listError.value = ''
   try {
-    proxies.value = await api.proxyList()
+    proxies.value = await api.proxyList(countryFilter.value || undefined)
   } catch (e: any) {
     listError.value = e.message || String(e)
   }
+}
+
+watch(countryFilter, () => { void load() })
+
+function resetGeo(id: string) {
+  const g = { ...geoVerified.value }
+  delete g[id]
+  geoVerified.value = g
 }
 
 async function add() {
@@ -32,8 +46,9 @@ async function add() {
       kind: f.value.kind,
       login: f.value.login,
       password: f.value.password,
+      country: f.value.country.trim() || undefined,
     })
-    f.value = { host: '', port: 8080, kind: 'http', login: '', password: '', showAdd: false }
+    f.value = { host: '', port: 8080, kind: 'http', login: '', password: '', country: '', showAdd: false }
     await load()
   } catch (e: any) {
     addError.value = e.message || String(e)
@@ -48,6 +63,7 @@ async function del(p: ProxyRow) {
   tested.value = { ...tested.value }
   const rest = { ...tested.value }
   delete rest[p.id]
+  resetGeo(p.id)
   await load()
 }
 
@@ -70,11 +86,41 @@ async function doTest(p: ProxyRow) {
   }
 }
 
+// — F#14: geo verify —
+async function doVerifyGeo(p: ProxyRow) {
+  busyGeo.value = { ...busyGeo.value, [p.id]: true }
+  resetGeo(p.id)
+  try {
+    const r = await api.proxyVerifyGeo(p.id)
+    geoVerified.value = { ...geoVerified.value, [p.id]: { r, ok: true, at: Date.now() } }
+    await load()
+  } catch (e: any) {
+    geoVerified.value = { ...geoVerified.value, [p.id]: { r: { ip: '', ip_public: false, speed_ms: null, country: p.country ?? null }, ok: false, at: Date.now(), err: e.message || String(e) } }
+  } finally {
+    const b = { ...busyGeo.value }
+    b[p.id] = false
+    busyGeo.value = b
+  }
+}
+
+async function doVerifyAll() {
+  busyVerifyAll.value = true
+  try {
+    // verify-all returns per-proxy rows; refresh the list to surface the
+    // newly-stored ip/public columns (GSA "verify all proxies").
+    await api.proxyVerifyAll().catch((e: any) => { listError.value = e.message || String(e) })
+    await load()
+  } finally {
+    busyVerifyAll.value = false
+  }
+}
+
 const stats = computed(() => {
   const n = proxies.value.length
   const on = proxies.value.filter((p) => p.enabled).length
   const ok = proxies.value.filter((p) => tested.value[p.id]?.t.ok).length
-  return { n, on, ok }
+  const geo = proxies.value.filter((p) => p.ip).length
+  return { n, on, ok, geo }
 })
 
 onMounted(load)
@@ -123,6 +169,7 @@ onMounted(load)
           </select>
           <input v-model="f.login" placeholder="login (opt)" style="flex:1;min-width:120px" />
           <input v-model="f.password" placeholder="pass (opt)" type="password" style="flex:1;min-width:120px" />
+          <input v-model="f.country" placeholder="country (opt, GSA targeting, e.g. US)" style="flex:1;min-width:120px" title="Target country (GSA 'Country' column) — projects can target jobs to this country" />
         </div>
         <div class="mt" style="margin-top:10px;display:flex;align-items:center;gap:10px">
           <button class="primary" :disabled="busy" @click="add">{{ busy ? 'Adding…' : 'Add' }}</button>
@@ -134,13 +181,21 @@ onMounted(load)
 
     <!-- list -->
     <div class="card" style="padding:0;overflow:hidden">
+      <div class="row" style="padding:12px 14px;gap:10px;border-bottom:1px solid var(--border);align-items:center">
+        <span style="font-weight:600;font-size:13px;white-space:nowrap">Filter by country (GSA country-targeting):</span>
+        <input v-model="countryFilter" placeholder="e.g. US, FR, or blank for all" style="flex:1;min-width:200px" />
+        <button class="primary" :disabled="busyVerifyAll || !proxies.length" @click="doVerifyAll" title="Egress-IP verify every enabled proxy (GSA 'verify all proxies')">
+          {{ busyVerifyAll ? 'Verifying…' : 'Verify all geo' }}
+        </button>
+      </div>
       <table class="table">
         <thead>
           <tr>
             <th>Host</th>
             <th>Port</th>
             <th>Type</th>
-            <th>Auth</th>
+            <th>Country</th>
+            <th>Egress IP</th>
             <th>Status</th>
             <th>Last test</th>
             <th class="spacer"></th>
@@ -149,7 +204,7 @@ onMounted(load)
         </thead>
         <tbody>
           <tr v-if="!proxies.length">
-            <td colspan="8" class="muted" style="text-align:center;padding:30px">
+            <td colspan="9" class="muted" style="text-align:center;padding:30px">
               no proxies yet — add one above to route jobs through a proxy pool
             </td>
           </tr>
@@ -157,8 +212,18 @@ onMounted(load)
             <td style="font-weight:600">{{ p.host }}</td>
             <td class="mono">{{ p.port }}</td>
             <td><span class="badge" :class="p.proxy_kind === 'socks5' ? 'accent' : ''">{{ p.proxy_kind }}</span></td>
-            <td class="mono muted" style="font-size:11px">
-              {{ (p.login ? p.login : '—') }}
+            <td class="mono" style="font-size:12px">
+              <span v-if="p.country">{{ p.country }}</span>
+              <span v-else class="muted">any</span>
+            </td>
+            <td class="mono" style="font-size:12px">
+              <template v-if="p.ip">
+                <span :style="{ color: p.ip_public ? 'var(--ok)' : 'var(--danger)' }">{{ p.ip }}</span>
+                <span class="muted" :title="p.ip_public ? 'Public egress IP' : 'Private IP — the proxy did not route our egress; not a real proxy'">
+                  ({{ p.ip_public ? 'public' : 'private' }})
+                </span>
+              </template>
+              <span v-else class="muted">—</span>
             </td>
             <td>
               <span class="dot" :class="p.enabled ? 'ok' : 'bad'" style="margin-right:6px"></span>
@@ -181,6 +246,13 @@ onMounted(load)
                   {{ p.enabled ? 'disable' : 'enable' }}
                 </button>
                 <button title="run a real socket probe (GSA proxy test)" @click="doTest(p)">test</button>
+                <button
+                  title="Egress-IP verify — fetches the IP this proxy routes us through (GSA 'verify egress IP')"
+                  :disabled="!!busyGeo[p.id]"
+                  @click="doVerifyGeo(p)"
+                >
+                  {{ busyGeo[p.id] ? 'verifying…' : 'verify geo' }}
+                </button>
                 <button title="remove" @click="del(p)">✕</button>
               </div>
             </td>

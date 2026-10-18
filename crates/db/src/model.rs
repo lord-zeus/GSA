@@ -198,6 +198,19 @@ pub struct Proxy {
     pub login: String,
     pub password: String,
     pub enabled: bool,
+    /// F#14 — target country the proxy serves (GSA "Country" column).  `NULL`
+    /// = untargeted (used for any-country jobs).
+    #[serde(default)]
+    pub country: Option<String>,
+    /// F#14 — verified egress IP of the proxy (auto-populated by `verify-geo`).
+    #[serde(default)]
+    pub ip: Option<String>,
+    /// F#14 — whether the verified IP is public (not RFC1918/loopback/link-local).
+    #[serde(default)]
+    pub ip_public: bool,
+    /// F#14 — when the IP was last verified.
+    #[serde(default)]
+    pub geo_verified_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -217,6 +230,9 @@ pub struct ProxyInput {
     pub password: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// F#14 — optional target country set at creation time.
+    #[serde(default)]
+    pub country: Option<String>,
 }
 
 /// Outcome of one proxy connectivity test (`POST /api/proxies/{id}/test`):

@@ -32,7 +32,7 @@ fn stamp() -> String {
 #[tokio::test]
 async fn full_pipeline_project_engines_keywords_jobs_results_history() {
     let Some(pool) = pool_or_skip().await else { return };
-    let repo = Repo::new(&pool);
+    let repo = Repo::new(pool.clone());
 
     // 1) project
     let name = format!("pipeline test {}", stamp());
@@ -155,7 +155,7 @@ async fn full_pipeline_project_engines_keywords_jobs_results_history() {
 #[tokio::test]
 async fn job_claim_is_atomic_under_concurrency() {
     let Some(pool) = pool_or_skip().await else { return };
-    let repo = Repo::new(&pool);
+    let repo = Repo::new(pool.clone());
     let project = repo
         .create_project(&format!("racing {}", stamp()), None)
         .await
@@ -171,7 +171,7 @@ async fn job_claim_is_atomic_under_concurrency() {
     for _ in 0..16 {
         let pool = pool.clone();
         handles.push(tokio::spawn(async move {
-            Repo::new(&pool).claim_next_pending(project.id).await
+            Repo::new(pool.clone()).claim_next_pending(project.id).await
         }));
     }
     let mut claimed_ids = Vec::new();
@@ -191,7 +191,7 @@ async fn job_claim_is_atomic_under_concurrency() {
 #[tokio::test]
 async fn f9_keyword_bulk_dedupe_delete() {
     let Some(pool) = pool_or_skip().await else { return };
-    let repo = Repo::new(&pool);
+    let repo = Repo::new(pool.clone());
     let project = repo
         .create_project(&format!("f9 kw {}:", stamp()), None)
         .await
@@ -267,7 +267,7 @@ async fn f9_keyword_bulk_dedupe_delete() {
 #[tokio::test]
 async fn f10_project_results_and_stats() {
     let Some(pool) = pool_or_skip().await else { return };
-    let repo = Repo::new(&pool);
+    let repo = Repo::new(pool.clone());
 
     let project = repo
         .create_project(&format!("f10 results {}", stamp()), None)
@@ -367,7 +367,7 @@ async fn f10_project_results_and_stats() {
 #[tokio::test]
 async fn f11_project_crud_and_lifecycle() {
     let Some(pool) = pool_or_skip().await else { return };
-    let repo = Repo::new(&pool);
+    let repo = Repo::new(pool.clone());
 
     // 1) create + rename + re-describe
     let p = repo

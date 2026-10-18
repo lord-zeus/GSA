@@ -81,7 +81,7 @@ fn ctx(url: &str, kw: &str) -> SubmissionContext {
 #[tokio::test]
 async fn single_job_success() {
     let Some(pool) = pool_or_skip().await else { return };
-    let repo = ser_db::Repo::new(&pool);
+    let repo = ser_db::Repo::new(pool.clone());
 
     let proj = repo
         .create_project(&format!("pool 1 {}", stamp()), None)
@@ -181,7 +181,7 @@ impl Driver for PanicOnceDriver {
 #[tokio::test]
 async fn crash_isolation_one_worker_panics_other_survives() {
     let Some(pool) = pool_or_skip().await else { return };
-    let repo = ser_db::Repo::new(&pool);
+    let repo = ser_db::Repo::new(pool.clone());
 
     let proj = repo
         .create_project(&format!("pool 2 {}", stamp()), None)
@@ -262,7 +262,7 @@ async fn crash_isolation_one_worker_panics_other_survives() {
 #[tokio::test]
 async fn missing_driver_marks_job_failed() {
     let Some(pool) = pool_or_skip().await else { return };
-    let repo = ser_db::Repo::new(&pool);
+    let repo = ser_db::Repo::new(pool.clone());
 
     let proj = repo
         .create_project(&format!("pool 3 {}", stamp()), None)
@@ -352,7 +352,7 @@ fn http_engine_with_result() -> engine::enginespec::Engine {
 #[tokio::test]
 async fn keyword_spintax_job_end_to_end() {
     let Some(pool) = pool_or_skip().await else { return };
-    let repo = ser_db::Repo::new(&pool);
+    let repo = ser_db::Repo::new(pool.clone());
 
     let proj = repo
         .create_project(&format!("kw f9 {}", stamp()), None)
@@ -422,7 +422,7 @@ async fn keyword_spintax_job_end_to_end() {
 #[tokio::test]
 async fn keyword_dedupe_and_deterministic_spin() {
     let Some(pool) = pool_or_skip().await else { return };
-    let repo = ser_db::Repo::new(&pool);
+    let repo = ser_db::Repo::new(pool.clone());
 
     let proj = repo
         .create_project(&format!("kw f9 b {}", stamp()), None)
@@ -458,7 +458,7 @@ async fn keyword_dedupe_and_deterministic_spin() {
 #[tokio::test]
 async fn email_web_family_success() {
     let Some(pool) = pool_or_skip().await else { return };
-    let repo = ser_db::Repo::new(&pool);
+    let repo = ser_db::Repo::new(pool.clone());
 
     // A WEB-family inbox spec (the shape of real 1secmail / discard INIs).
     // bare `"` which would close a regular `"..."` string.

@@ -141,7 +141,7 @@ impl JobRunner {
     /// panic here is the pool's problem.
     ///
     /// `Send` — safe to move across the task boundary.
-    pub async fn run_one(&self, repo: &ser_db::Repo<'_>, job: &ser_db::Job) -> JobOutcome {
+    pub async fn run_one(&self, repo: &ser_db::Repo, job: &ser_db::Job) -> JobOutcome {
         let (engine_id, file_path) = match self
             .resolve_engine(repo, job)
             .await
@@ -371,7 +371,7 @@ impl JobRunner {
     /// Priority: job-level `keyword_id` (spun if spintax) → pool context
     /// keyword → empty.  Spinning is deterministic in the job id so the
     /// same job always spins to the same variant.
-    async fn resolve_keyword(&self, repo: &ser_db::Repo<'_>, job: &ser_db::Job) -> String {
+    async fn resolve_keyword(&self, repo: &ser_db::Repo, job: &ser_db::Job) -> String {
         if let Some(kid) = job.keyword_id {
             match repo.keyword_by_id(kid).await {
                 Ok(Some(kw)) => {
@@ -407,7 +407,7 @@ impl JobRunner {
     /// `proxy stats` vocabulary).
     async fn finish(
         &self,
-        repo: &ser_db::Repo<'_>,
+        repo: &ser_db::Repo,
         job_id: Uuid,
         done: bool,
         err: Option<String>,
@@ -447,7 +447,7 @@ impl JobRunner {
 
     async fn resolve_engine<'a>(
         &self,
-        repo: &'a ser_db::Repo<'_>,
+        repo: &'a ser_db::Repo,
         job: &ser_db::Job,
     ) -> anyhow::Result<(Uuid, String)> {
         let engine_id = job

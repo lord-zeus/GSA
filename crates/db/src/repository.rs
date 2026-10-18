@@ -7,12 +7,20 @@ use crate::model::{
 };
 
 /// CRUD + pipeline helpers over the core tables.
-pub struct Repo<'a> {
-    pool: &'a PgPool,
+///
+/// `Repo` **owns** its `PgPool` (a cheap `Arc` clone of the shared pool), not
+/// a borrowed `&'a PgPool`.  Owning means a `Repo` can be captured into a
+/// `'static` future (e.g. `tokio::spawn` / a boxed async block) without the
+/// borrow-outlives-frame problem — the pattern the F#14 bulk geo verifier
+/// needs.  `PgPool` is connection-pooled behind an `Arc`, so the clone is
+/// cheap and shares the same pool; callers pass `state.pool.clone()`.
+#[derive(Clone)]
+pub struct Repo {
+    pool: PgPool,
 }
 
-impl<'a> Repo<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+impl Repo {
+    pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
@@ -24,7 +32,7 @@ impl<'a> Repo<'a> {
         )
         .bind(name)
         .bind(description)
-        .fetch_one(self.pool)
+        .fetch_one(&self.pool)
         .await?;
         Ok(FromRow::from_row(&row)?)
     }
@@ -43,7 +51,7 @@ impl<'a> Repo<'a> {
         .bind(name)
         .bind(description)
         .bind(id)
-        .fetch_optional(self.pool)
+        .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("project {id} not found"))?;
         Ok(FromRow::from_row(&row)?)
@@ -53,7 +61,7 @@ impl<'a> Repo<'a> {
     pub async fn delete_project(&self, id: Uuid) -> anyhow::Result<bool> {
         let n = sqlx::query("DELETE FROM projects WHERE id = $1")
             .bind(id)
-            .execute(self.pool)
+            .execute(&self.pool)
             .await?;
         Ok(n.rows_affected() > 0)
     }
@@ -63,7 +71,7 @@ impl<'a> Repo<'a> {
             "SELECT id, name, description, created_at, updated_at, use_proxies
              FROM projects ORDER BY created_at",
         )
-        .fetch_all(self.pool)
+        .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| Project::from_row(&r)).collect::<Result<_, _>>()?)
     }
@@ -74,7 +82,7 @@ impl<'a> Repo<'a> {
              FROM projects WHERE name = $1",
         )
         .bind(name)
-        .fetch_optional(self.pool)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| Project::from_row(&r)).transpose()?)
     }
@@ -86,7 +94,7 @@ impl<'a> Repo<'a> {
              FROM projects WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(self.pool)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| Project::from_row(&r)).transpose()?)
     }
@@ -117,7 +125,7 @@ impl<'a> Repo<'a> {
         .bind(url)
         .bind(file_path)
         .bind(step_count)
-        .fetch_one(self.pool)
+        .fetch_one(&self.pool)
         .await?;
         Ok(FromRow::from_row(&row)?)
     }
@@ -141,7 +149,7 @@ impl<'a> Repo<'a> {
         .bind(url)
         .bind(step_count)
         .bind(id)
-        .fetch_optional(self.pool)
+        .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("engine {id} not found"))?;
         Ok(FromRow::from_row(&row)?)
@@ -155,7 +163,7 @@ impl<'a> Repo<'a> {
         )
         .bind(enabled)
         .bind(id)
-        .fetch_optional(self.pool)
+        .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("engine {id} not found"))?;
         Ok(FromRow::from_row(&row)?)
@@ -166,7 +174,7 @@ impl<'a> Repo<'a> {
     pub async fn delete_engine(&self, id: Uuid) -> anyhow::Result<bool> {
         let n = sqlx::query("DELETE FROM engines WHERE id = $1")
             .bind(id)
-            .execute(self.pool)
+            .execute(&self.pool)
             .await?;
         Ok(n.rows_affected() > 0)
     }
@@ -179,7 +187,7 @@ impl<'a> Repo<'a> {
              FROM engines WHERE project_id = $1 ORDER BY engine_name",
         )
         .bind(project_id)
-        .fetch_all(self.pool)
+        .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| Engine::from_row(&r)).collect::<Result<_, _>>()?)
     }
@@ -190,7 +198,7 @@ impl<'a> Repo<'a> {
              FROM engines WHERE project_id = $1 AND enabled ORDER BY engine_name",
         )
         .bind(project_id)
-        .fetch_all(self.pool)
+        .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| Engine::from_row(&r)).collect::<Result<_, _>>()?)
     }
@@ -202,7 +210,7 @@ impl<'a> Repo<'a> {
         )
         .bind(project_id)
         .bind(file_path)
-        .fetch_optional(self.pool)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| Engine::from_row(&r)).transpose()?)
     }
@@ -215,7 +223,7 @@ impl<'a> Repo<'a> {
              FROM engines WHERE id = $1",
         )
         .bind(engine_id)
-        .fetch_optional(self.pool)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| Engine::from_row(&r)).transpose()?)
     }
@@ -238,7 +246,7 @@ impl<'a> Repo<'a> {
         )
         .bind(job_id)
         .bind(&token)
-        .fetch_optional(self.pool)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| Job::from_row(&r)).transpose()?)
     }
@@ -258,7 +266,7 @@ impl<'a> Repo<'a> {
         )
         .bind(project_id)
         .bind(&text)
-        .fetch_optional(self.pool)
+        .fetch_optional(&self.pool)
         .await?
         {
             return Ok(FromRow::from_row(&row)?);
@@ -270,7 +278,7 @@ impl<'a> Repo<'a> {
         )
         .bind(project_id)
         .bind(&text)
-        .fetch_one(self.pool)
+        .fetch_one(&self.pool)
         .await?;
         Ok(FromRow::from_row(&row)?)
     }
@@ -303,7 +311,7 @@ impl<'a> Repo<'a> {
             "SELECT id, project_id, text, added_at FROM keywords WHERE id = $1",
         )
         .bind(id)
-        .fetch_optional(self.pool)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| Keyword::from_row(&r)).transpose()?)
     }
@@ -313,7 +321,7 @@ impl<'a> Repo<'a> {
     pub async fn delete_keyword(&self, id: Uuid) -> anyhow::Result<bool> {
         let res = sqlx::query("DELETE FROM keywords WHERE id = $1")
             .bind(id)
-            .execute(self.pool)
+            .execute(&self.pool)
             .await?;
         Ok(res.rows_affected() > 0)
     }
@@ -323,7 +331,7 @@ impl<'a> Repo<'a> {
             "SELECT id, project_id, text, added_at FROM keywords WHERE project_id = $1 ORDER BY added_at",
         )
         .bind(project_id)
-        .fetch_all(self.pool)
+        .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| Keyword::from_row(&r)).collect::<Result<_, _>>()?)
     }
@@ -342,7 +350,7 @@ impl<'a> Repo<'a> {
         .bind(project_id)
         .bind(engine_id)
         .bind(keyword_id)
-        .fetch_one(self.pool)
+        .fetch_one(&self.pool)
         .await?;
         Ok(FromRow::from_row(&row)?)
     }
@@ -405,7 +413,7 @@ impl<'a> Repo<'a> {
         .bind(job_id)
         .bind(status.as_str())
         .bind(last_error)
-        .execute(self.pool)
+        .execute(&self.pool)
         .await?;
         Ok(())
     }
@@ -422,7 +430,7 @@ impl<'a> Repo<'a> {
                        started_at, finished_at, created_at",
         )
         .bind(id)
-        .fetch_optional(self.pool)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| Ok::<Job, anyhow::Error>(FromRow::from_row(&r)?)).transpose()?)
     }
@@ -433,7 +441,7 @@ impl<'a> Repo<'a> {
              FROM jobs WHERE id = $1",
         )
         .bind(job_id)
-        .fetch_optional(self.pool)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| Job::from_row(&r)).transpose()?)
     }
@@ -450,7 +458,7 @@ impl<'a> Repo<'a> {
             )
             .bind(project_id)
             .bind(st.as_str())
-            .fetch_all(self.pool)
+            .fetch_all(&self.pool)
             .await?
         } else {
             sqlx::query(
@@ -458,7 +466,7 @@ impl<'a> Repo<'a> {
                  FROM jobs WHERE project_id = $1 ORDER BY created_at DESC",
             )
             .bind(project_id)
-            .fetch_all(self.pool)
+            .fetch_all(&self.pool)
             .await?
         };
         Ok(rows.into_iter().map(|r| Job::from_row(&r)).collect::<Result<_, _>>()?)
@@ -484,7 +492,7 @@ impl<'a> Repo<'a> {
         .bind(anchor)
         .bind(message)
         .bind(payload)
-        .execute(self.pool)
+        .execute(&self.pool)
         .await?;
         Ok(())
     }
@@ -495,7 +503,7 @@ impl<'a> Repo<'a> {
              FROM results WHERE job_id = $1 ORDER BY created_at",
         )
         .bind(job_id)
-        .fetch_all(self.pool)
+        .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| SubmissionResult::from_row(&r)).collect::<Result<_, _>>()?)
     }
@@ -546,7 +554,7 @@ impl<'a> Repo<'a> {
             ),
         };
         let _ = params;
-        let rows = rows.fetch_all(self.pool).await?;
+        let rows = rows.fetch_all(&self.pool).await?;
         Ok(rows.into_iter().map(|r| ProjectResult::from_row(&r)).collect::<Result<_, _>>()?)
     }
 
@@ -564,7 +572,7 @@ impl<'a> Repo<'a> {
              WHERE j.project_id = $1",
         )
         .bind(project_id)
-        .fetch_one(self.pool)
+        .fetch_one(&self.pool)
         .await?;
         stats.success = counts.0;
         stats.info = counts.1;
@@ -573,7 +581,7 @@ impl<'a> Repo<'a> {
         stats.total = counts.4;
         stats.total_jobs = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE project_id = $1")
             .bind(project_id)
-            .fetch_one(self.pool)
+            .fetch_one(&self.pool)
             .await?;
         stats.unique_success_urls = sqlx::query_scalar(
             "SELECT count(DISTINCT r.url) FROM results r 
@@ -581,7 +589,7 @@ impl<'a> Repo<'a> {
              AND r.kind = 'success' AND r.url IS NOT NULL",
         )
         .bind(project_id)
-        .fetch_one(self.pool)
+        .fetch_one(&self.pool)
         .await?;
         Ok(stats)
     }
@@ -606,7 +614,7 @@ impl<'a> Repo<'a> {
         .bind(project_id)
         .bind(url)
         .bind(engine_name)
-        .fetch_one(self.pool)
+        .fetch_one(&self.pool)
         .await?;
         Ok(row.get::<bool, _>(0))
     }
@@ -616,7 +624,7 @@ impl<'a> Repo<'a> {
             "SELECT count(*) FROM history WHERE project_id = $1",
         )
         .bind(project_id)
-        .fetch_one(self.pool)
+        .fetch_one(&self.pool)
         .await?)
     }
 
@@ -624,7 +632,7 @@ impl<'a> Repo<'a> {
     pub async fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
         Ok(sqlx::query_scalar("SELECT value FROM settings WHERE key = $1")
             .bind(key)
-            .fetch_optional(self.pool)
+            .fetch_optional(&self.pool)
             .await?
             .map(|v: String| v))
     }
@@ -636,7 +644,7 @@ impl<'a> Repo<'a> {
         )
         .bind(key)
         .bind(value)
-        .execute(self.pool)
+        .execute(&self.pool)
         .await?;
         Ok(())
     }
@@ -651,10 +659,11 @@ impl<'a> Repo<'a> {
 
     // ── F#13: proxies ─────────────────────────────────────────────────────
     const PROXY_COLS: &'static str =
-        "id, host, port, proxy_kind, login, password, enabled, created_at";
+        "id, host, port, proxy_kind, login, password, enabled,\n        country, ip, ip_public, geo_verified_at, created_at";
 
     /// Add a proxy to the list. `kind` must be "http" or "socks5"
-    /// (normalized: case-insensitive, defaults to "http").
+    /// (normalized: case-insensitive, defaults to "http").  `country` is the
+    /// optional F#14 target-country (GSA "Country" column).
     pub async fn add_proxy(
         &self,
         host: &str,
@@ -663,6 +672,7 @@ impl<'a> Repo<'a> {
         login: &str,
         password: &str,
         enabled: bool,
+        country: Option<&str>,
     ) -> anyhow::Result<Proxy> {
         let kind = if kind.eq_ignore_ascii_case("socks5") || kind.eq_ignore_ascii_case("socks") {
             "socks5"
@@ -670,9 +680,10 @@ impl<'a> Repo<'a> {
             "http"
         };
         let row = sqlx::query(
-            "INSERT INTO proxies (host, port, proxy_kind, login, password, enabled)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             RETURNING id, host, port, proxy_kind, login, password, enabled, created_at",
+            "INSERT INTO proxies (host, port, proxy_kind, login, password, enabled, country)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING id, host, port, proxy_kind, login, password, enabled,
+                       country, ip, ip_public, geo_verified_at, created_at",
         )
         .bind(host)
         .bind(port)
@@ -680,14 +691,15 @@ impl<'a> Repo<'a> {
         .bind(login)
         .bind(password)
         .bind(enabled)
-        .fetch_one(self.pool)
+        .bind(country)
+        .fetch_one(&self.pool)
         .await?;
         Ok(FromRow::from_row(&row)?)
     }
 
     pub async fn list_proxies(&self) -> anyhow::Result<Vec<Proxy>> {
         let rows = sqlx::query(&format!("SELECT {} FROM proxies ORDER BY created_at, id", Self::PROXY_COLS))
-            .fetch_all(self.pool)
+            .fetch_all(&self.pool)
             .await?;
         Ok(rows.into_iter().map(|r| Proxy::from_row(&r)).collect::<Result<_, _>>()?)
     }
@@ -695,7 +707,7 @@ impl<'a> Repo<'a> {
     /// Only enabled proxies — the list the runner rotates over.
     pub async fn list_enabled_proxies(&self) -> anyhow::Result<Vec<Proxy>> {
         let rows = sqlx::query(&format!("SELECT {} FROM proxies WHERE enabled ORDER BY created_at, id", Self::PROXY_COLS))
-            .fetch_all(self.pool)
+            .fetch_all(&self.pool)
             .await?;
         Ok(rows.into_iter().map(|r| Proxy::from_row(&r)).collect::<Result<_, _>>()?)
     }
@@ -703,7 +715,7 @@ impl<'a> Repo<'a> {
     pub async fn proxy_by_id(&self, id: Uuid) -> anyhow::Result<Option<Proxy>> {
         let row = sqlx::query(&format!("SELECT {} FROM proxies WHERE id = $1", Self::PROXY_COLS))
             .bind(id)
-            .fetch_optional(self.pool)
+            .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|r| Proxy::from_row(&r)).transpose()?)
     }
@@ -712,7 +724,7 @@ impl<'a> Repo<'a> {
         let row = sqlx::query(&format!("UPDATE proxies SET enabled = $1 WHERE id = $2 RETURNING {}", Self::PROXY_COLS))
             .bind(enabled)
             .bind(id)
-            .fetch_optional(self.pool)
+            .fetch_optional(&self.pool)
             .await?
             .ok_or_else(|| anyhow::anyhow!("proxy {id} not found"))?;
         Ok(FromRow::from_row(&row)?)
@@ -721,9 +733,96 @@ impl<'a> Repo<'a> {
     pub async fn delete_proxy(&self, id: Uuid) -> anyhow::Result<bool> {
         let n = sqlx::query("DELETE FROM proxies WHERE id = $1")
             .bind(id)
-            .execute(self.pool)
+            .execute(&self.pool)
             .await?;
         Ok(n.rows_affected() > 0)
+    }
+
+    // ── F#14: geo / IP ─────────────────────────────────────────────────────
+    /// Set or clear a proxy's target country (the GSA "Country" column).
+    /// Passing `None` clears it to `NULL`.
+    pub async fn set_proxy_country(&self, id: Uuid, country: Option<&str>) -> anyhow::Result<Proxy> {
+        let row = sqlx::query(&format!(
+            "UPDATE proxies SET country = $1 WHERE id = $2 RETURNING {}",
+            Self::PROXY_COLS
+        ))
+        .bind(country)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("proxy {id} not found"))?;
+        Ok(FromRow::from_row(&row)?)
+    }
+
+    /// Persist a geo/IP verification result on a proxy (auto-populated by
+    /// `POST /api/proxies/{id}/verify-geo`).
+    pub async fn store_geo_verification(
+        &self,
+        id: Uuid,
+        ip: Option<&str>,
+        ip_public: bool,
+    ) -> anyhow::Result<Proxy> {
+        let row = sqlx::query(&format!(
+            "UPDATE proxies SET ip = $1, ip_public = $2, geo_verified_at = now()
+             WHERE id = $3 RETURNING {}",
+            Self::PROXY_COLS
+        ))
+        .bind(ip)
+        .bind(ip_public)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("proxy {id} not found"))?;
+        Ok(FromRow::from_row(&row)?)
+    }
+
+    /// Enabled proxies, optionally filtered to a **target country** (GSA
+    /// country-targeting).  `Some(country)` → only proxies whose stored
+    /// `country` equals `country` (case-insensitive); `None` → *all* enabled
+    /// proxies (no country filter — the "any country" job).
+    pub async fn list_enabled_proxies_by_country(
+        &self,
+        country: Option<&str>,
+    ) -> anyhow::Result<Vec<Proxy>> {
+        let rows = if let Some(c) = country {
+            sqlx::query(&format!(
+                "SELECT {} FROM proxies WHERE enabled AND lower(trim(country)) = lower(trim($1)) ORDER BY created_at, id",
+                Self::PROXY_COLS
+            ))
+            .bind(c)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(&format!("SELECT {} FROM proxies WHERE enabled ORDER BY created_at, id", Self::PROXY_COLS))
+                .fetch_all(&self.pool)
+                .await?
+        };
+        Ok(rows.into_iter().map(|r| Proxy::from_row(&r)).collect::<Result<_, _>>()?)
+    }
+
+    /// All proxies (regardless of enabled state) optionally filtered to a
+    /// target country — the **UI** country filter.  `None` → all proxies;
+    /// `Some(c)` → only proxies whose `country` equals `c` (case-insensitive).
+    /// Distinct from [`Self::list_enabled_proxies_by_country`], which is the
+    /// runner-facing *rotation* set (enabled only).
+    pub async fn list_all_proxies_by_country(
+        &self,
+        country: Option<&str>,
+    ) -> anyhow::Result<Vec<Proxy>> {
+        let rows = if let Some(c) = country {
+            sqlx::query(&format!(
+                "SELECT {} FROM proxies WHERE lower(trim(country)) = lower(trim($1)) ORDER BY created_at, id",
+                Self::PROXY_COLS
+            ))
+            .bind(c)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(&format!("SELECT {} FROM proxies ORDER BY created_at, id", Self::PROXY_COLS))
+                .fetch_all(&self.pool)
+                .await?
+        };
+        Ok(rows.into_iter().map(|r| Proxy::from_row(&r)).collect::<Result<_, _>>()?)
     }
 
     // ── F#13: project proxy gate ──────────────────────────────────────────
@@ -734,7 +833,7 @@ impl<'a> Repo<'a> {
         )
         .bind(use_proxies)
         .bind(id)
-        .fetch_optional(self.pool)
+        .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("project {id} not found"))?;
         Ok(FromRow::from_row(&row)?)
@@ -743,7 +842,7 @@ impl<'a> Repo<'a> {
     pub async fn project_use_proxies(&self, id: Uuid) -> anyhow::Result<Option<bool>> {
         Ok(sqlx::query_scalar("SELECT use_proxies FROM projects WHERE id = $1")
             .bind(id)
-            .fetch_optional(self.pool)
+            .fetch_optional(&self.pool)
             .await?)
     }
 }

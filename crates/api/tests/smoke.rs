@@ -498,7 +498,7 @@ async fn f10_project_results_and_stats_api() {
     };
     use ser_db::{JobStatus, ResultKind, Repo};
     let app = router(state.clone());
-    let repo = Repo::new(&state.pool);
+    let repo = Repo::new(state.pool.clone());
 
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();

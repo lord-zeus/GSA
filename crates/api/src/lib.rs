@@ -54,7 +54,7 @@ pub async fn healthz(state: State<Arc<AppState>>) -> Response {
 }
 
 async fn list_projects(state: State<Arc<AppState>>) -> Response {
-    let list = Repo::new(&state.pool).list_projects().await;
+    let list = Repo::new(state.pool.clone()).list_projects().await;
     match list {
         Ok(list) => Json(list).into_response(),
         Err(e) => error_response(e),
@@ -69,14 +69,14 @@ pub struct CreateProject {
 }
 
 async fn create_project(state: State<Arc<AppState>>, body: Json<CreateProject>) -> Response {
-    match Repo::new(&state.pool).create_project(&body.name, body.description.as_deref()).await {
+    match Repo::new(state.pool.clone()).create_project(&body.name, body.description.as_deref()).await {
         Ok(p) => (StatusCode::CREATED, Json(p)).into_response(),
         Err(e) => error_response(e),
     }
 }
 
 async fn list_engines(Path(project_id): Path<Uuid>, state: State<Arc<AppState>>) -> Response {
-    let result = Repo::new(&state.pool).list_engines_all(project_id).await;
+    let result = Repo::new(state.pool.clone()).list_engines_all(project_id).await;
     match result {
         Ok(list) => Json(list).into_response(),
         Err(e) => error_response(e),
@@ -93,7 +93,7 @@ async fn create_keyword(
     state: State<Arc<AppState>>,
     body: Json<AddKeyword>,
 ) -> Response {
-    let result = Repo::new(&state.pool).add_keyword(project_id, &body.text).await;
+    let result = Repo::new(state.pool.clone()).add_keyword(project_id, &body.text).await;
     match result {
         Ok(k) => (StatusCode::CREATED, Json(k)).into_response(),
         Err(e) => error_response(e),
@@ -111,10 +111,10 @@ async fn create_keywords_bulk(
     state: State<Arc<AppState>>,
     body: Json<AddKeywords>,
 ) -> Response {
-    let result = Repo::new(&state.pool).add_keywords(project_id, &body.keywords).await;
+    let result = Repo::new(state.pool.clone()).add_keywords(project_id, &body.keywords).await;
     match result {
         Ok((stored, _)) => {
-            let list = Repo::new(&state.pool).list_keywords(project_id).await;
+            let list = Repo::new(state.pool.clone()).list_keywords(project_id).await;
             match list {
                 Ok(list) => (
                     StatusCode::CREATED,
@@ -129,7 +129,7 @@ async fn create_keywords_bulk(
 }
 
 async fn list_keywords(Path(project_id): Path<Uuid>, state: State<Arc<AppState>>) -> Response {
-    let result = Repo::new(&state.pool).list_keywords(project_id).await;
+    let result = Repo::new(state.pool.clone()).list_keywords(project_id).await;
     match result {
         Ok(list) => Json(list).into_response(),
         Err(e) => error_response(e),
@@ -140,7 +140,7 @@ async fn get_keyword(
     Path((project_id, id)): Path<(Uuid, Uuid)>,
     state: State<Arc<AppState>>,
 ) -> Response {
-    let result = Repo::new(&state.pool).keyword_by_id(id).await;
+    let result = Repo::new(state.pool.clone()).keyword_by_id(id).await;
     match result {
         Ok(Some(k)) if k.project_id == project_id => Json(k).into_response(),
         Ok(_) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "not found" }))).into_response(),
@@ -152,7 +152,7 @@ async fn delete_keyword(
     Path((project_id, id)): Path<(Uuid, Uuid)>,
     state: State<Arc<AppState>>,
 ) -> Response {
-    let repo = Repo::new(&state.pool);
+    let repo = Repo::new(state.pool.clone());
     match repo.keyword_by_id(id).await {
         Ok(Some(k)) if k.project_id == project_id => {}
         Ok(_) => {
@@ -176,7 +176,7 @@ pub struct CreateJob {
 }
 
 async fn create_job(Path(project_id): Path<Uuid>, state: State<Arc<AppState>>, body: Json<CreateJob>) -> Response {
-    let result = Repo::new(&state.pool).create_job(project_id, body.engine_id, body.keyword_id).await;
+    let result = Repo::new(state.pool.clone()).create_job(project_id, body.engine_id, body.keyword_id).await;
     match result {
         Ok(j) => (StatusCode::CREATED, Json(j)).into_response(),
         Err(e) => error_response(e),
@@ -194,7 +194,7 @@ async fn list_jobs(
     state: State<Arc<AppState>>,
 ) -> Response {
     let status = q.status.and_then(|s| JobStatus::parse(&s));
-    let result = Repo::new(&state.pool).list_jobs(project_id, status).await;
+    let result = Repo::new(state.pool.clone()).list_jobs(project_id, status).await;
     match result {
         Ok(list) => Json(list).into_response(),
         Err(e) => error_response(e),
@@ -202,7 +202,7 @@ async fn list_jobs(
 }
 
 async fn get_job(Path(id): Path<Uuid>, state: State<Arc<AppState>>) -> Response {
-    let result = Repo::new(&state.pool).job_by_id(id).await;
+    let result = Repo::new(state.pool.clone()).job_by_id(id).await;
     match result {
         Ok(Some(j)) => Json(j).into_response(),
         Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error":"not found"}))).into_response(),
@@ -211,7 +211,7 @@ async fn get_job(Path(id): Path<Uuid>, state: State<Arc<AppState>>) -> Response 
 }
 
 async fn job_results(Path(id): Path<Uuid>, state: State<Arc<AppState>>) -> Response {
-    let result = Repo::new(&state.pool).results_for_job(id).await;
+    let result = Repo::new(state.pool.clone()).results_for_job(id).await;
     match result {
         Ok(list) => Json(list).into_response(),
         Err(e) => error_response(e),
@@ -233,7 +233,7 @@ async fn project_results(
     state: State<Arc<AppState>>,
 ) -> Response {
     let limit = q.limit.unwrap_or(200);
-    let result = Repo::new(&state.pool).project_results(project_id, q.kind.as_deref(), limit).await;
+    let result = Repo::new(state.pool.clone()).project_results(project_id, q.kind.as_deref(), limit).await;
     match result {
         Ok(list) => Json(list).into_response(),
         Err(e) => error_response(e),
@@ -245,7 +245,7 @@ async fn project_stats(
     Path(project_id): Path<Uuid>,
     state: State<Arc<AppState>>,
 ) -> Response {
-    let result = Repo::new(&state.pool).result_stats(project_id).await;
+    let result = Repo::new(state.pool.clone()).result_stats(project_id).await;
     match result {
         Ok(list) => Json(list).into_response(),
         Err(e) => error_response(e),
@@ -266,7 +266,7 @@ async fn update_project(
     state: State<Arc<AppState>>,
     body: Json<UpdateProject>,
 ) -> Response {
-    let result = Repo::new(&state.pool)
+    let result = Repo::new(state.pool.clone())
         .update_project(id, &body.name, body.description.as_deref())
         .await;
     match result {
@@ -280,7 +280,7 @@ async fn get_project(
     Path(id): Path<Uuid>,
     state: State<Arc<AppState>>,
 ) -> Response {
-    match Repo::new(&state.pool).project_by_id(id).await {
+    match Repo::new(state.pool.clone()).project_by_id(id).await {
         Ok(Some(p)) => Json(p).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => error_response(e),
@@ -292,7 +292,7 @@ async fn delete_project(
     Path(id): Path<Uuid>,
     state: State<Arc<AppState>>,
 ) -> Response {
-    match Repo::new(&state.pool).delete_project(id).await {
+    match Repo::new(state.pool.clone()).delete_project(id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => error_response(e),
@@ -324,7 +324,7 @@ async fn update_engine(
     state: State<Arc<AppState>>,
     body: Json<UpdateEngine>,
 ) -> Response {
-    let repo = Repo::new(&state.pool);
+    let repo = Repo::new(state.pool.clone());
     let Some(existing) = repo.engine_by_id(id).await.ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -348,7 +348,7 @@ async fn set_engine_enabled(
     body: Json<serde_json::Value>,
 ) -> Response {
     let enabled = body.0.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-    let repo = Repo::new(&state.pool);
+    let repo = Repo::new(state.pool.clone());
     let Some(existing) = repo.engine_by_id(id).await.ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -366,7 +366,7 @@ async fn delete_engine(
     Path((project_id, id)): Path<(Uuid, Uuid)>,
     state: State<Arc<AppState>>,
 ) -> Response {
-    let repo = Repo::new(&state.pool);
+    let repo = Repo::new(state.pool.clone());
     let Some(existing) = repo.engine_by_id(id).await.ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -382,7 +382,7 @@ async fn delete_engine(
 
 /// POST /api/jobs/{id}/cancel — cancel a pending or running job.
 async fn cancel_job(Path(id): Path<Uuid>, state: State<Arc<AppState>>) -> Response {
-    match Repo::new(&state.pool).cancel_job(id).await {
+    match Repo::new(state.pool.clone()).cancel_job(id).await {
         Ok(Some(j)) => Json(j).into_response(),
         Ok(None) => StatusCode::CONFLICT.into_response(),  // already terminal
         Err(e) => error_response(e),
@@ -399,7 +399,7 @@ async fn claim_job(
     Query(q): Query<ClaimQuery>,
     state: State<Arc<AppState>>,
 ) -> Response {
-    let result = Repo::new(&state.pool).claim_next_pending(q.project_id).await;
+    let result = Repo::new(state.pool.clone()).claim_next_pending(q.project_id).await;
     match result {
         Ok(Some(j)) => Json(j).into_response(),
         Ok(None) => Json(serde_json::json!({ "claimed": null })).into_response(),
@@ -425,7 +425,7 @@ async fn upsert_engine(
     state: State<Arc<AppState>>,
     body: Json<AddEngine>,
 ) -> Response {
-    let result = Repo::new(&state.pool)
+    let result = Repo::new(state.pool.clone())
         .upsert_engine(
             project_id,
             &body.engine_name,
@@ -454,7 +454,7 @@ async fn finish_job(
     body: Json<FinishJob>,
 ) -> Response {
     let status = JobStatus::parse(&body.status).unwrap_or(JobStatus::Done);
-    let result = Repo::new(&state.pool)
+    let result = Repo::new(state.pool.clone())
         .finish_job(id, status, body.last_error.as_deref())
         .await;
     match result {
@@ -510,7 +510,7 @@ async fn catalog_list(
 /// GET /api/settings/email — the operator email mailbox (GSA operator config).
 /// Returned shape: {"address": "...", "password": "..."}.
 async fn get_email_setting(State(state): State<Arc<AppState>>) -> Response {
-    let repo = Repo::new(&state.pool);
+    let repo = Repo::new(state.pool.clone());
     let (a, p) = match repo.email_mailbox().await {
         Ok(v) => v,
         Err(e) => return error_response(e),
@@ -529,7 +529,7 @@ async fn put_email_setting(
     State(state): State<Arc<AppState>>,
     body: Json<SetEmailSetting>,
 ) -> Response {
-    let repo = Repo::new(&state.pool);
+    let repo = Repo::new(state.pool.clone());
     if let Err(e) = repo.set_setting("email.address", &body.address).await {
         return error_response(e);
     }
@@ -629,7 +629,7 @@ async fn run_project(
 
     // Operator mailbox — authoritative for F#12 mail runs (the runner falls
     // back to this when the pool context is empty).
-    let (email_address, email_password) = Repo::new(&state.pool)
+    let (email_address, email_password) = Repo::new(state.pool.clone())
         .email_mailbox()
         .await
         .unwrap_or_default();
@@ -643,14 +643,14 @@ async fn run_project(
     // F#13 — if the project has `use_proxies`, route its jobs through the
     // enabled proxy list.  Otherwise the context stays empty and the runner
     // keeps using a direct connection.
-    let use_proxies = Repo::new(&state.pool)
+    let use_proxies = Repo::new(state.pool.clone())
         .project_use_proxies(project_id)
         .await
         .ok()
         .flatten()
         .unwrap_or(false);
     let proxies: Vec<engine::proxy::ProxySpec> = if use_proxies {
-        Repo::new(&state.pool)
+        Repo::new(state.pool.clone())
             .list_enabled_proxies()
             .await
             .map(|list| {
@@ -725,6 +725,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/proxies/{id}/enabled", put(set_proxy_enabled))
         .route("/api/proxies/{id}/test", post(proxy_test))
         .route("/api/projects/{id}/proxies", put(set_project_proxies))
+        .route("/api/proxies/{id}/country", put(set_proxy_country))
+        .route("/api/proxies/{id}/verify-geo", post(verify_proxy_geo))
+        .route("/api/proxies/verify-all", post(verify_all_proxies_geo))
         .route("/api/settings/email", get(get_email_setting).put(put_email_setting))
         .route("/api/catengine/stats", get(catalog_stats))
         .route("/api/catengine", get(catalog_list))
@@ -734,8 +737,11 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 // ─── F#13: proxy management ────────────────────────────────────────────────────
 
-async fn list_proxies(state: State<Arc<AppState>>) -> Response {
-    match Repo::new(&state.pool).list_proxies().await {
+async fn list_proxies(state: State<Arc<AppState>>, query: axum::extract::Query<std::collections::HashMap<String, String>>) -> Response {
+    let country = query.0.get("country").map(|s| s.trim()).filter(|s| !s.is_empty());
+    let repo = Repo::new(state.pool.clone());
+    let p = repo.list_all_proxies_by_country(country.as_deref()).await;
+    match p {
         Ok(p) => (StatusCode::OK, Json(serde_json::to_value(&p).unwrap())).into_response(),
         Err(e) => error_response(e),
     }
@@ -752,6 +758,9 @@ struct AddProxyReq {
     login: Option<String>,
     #[serde(default)]
     password: Option<String>,
+    /// F#14 — optional target country (GSA "Country" column).
+    #[serde(default)]
+    country: Option<String>,
 }
 
 fn default_port() -> u16 { 8080 }
@@ -762,15 +771,16 @@ async fn create_proxy(state: State<Arc<AppState>>, body: Json<AddProxyReq>) -> R
         return (StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "kind must be 'http' or 'socks5'" }))).into_response();
     }
-    match Repo::new(&state.pool)
+    match Repo::new(state.pool.clone())
         .add_proxy(
             &body.host,
             body.port as i32,
             &body.kind,
             body.login.as_deref().unwrap_or_default(),
             body.password.as_deref().unwrap_or_default(),
-                        true,
-                    )
+            true,
+            body.country.as_deref(),
+        )
         .await
     {
         Ok(p) => (StatusCode::CREATED, Json(serde_json::to_value(&p).unwrap())).into_response(),
@@ -779,7 +789,7 @@ async fn create_proxy(state: State<Arc<AppState>>, body: Json<AddProxyReq>) -> R
 }
 
 async fn delete_proxy(state: State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
-    match Repo::new(&state.pool).delete_proxy(id).await {
+    match Repo::new(state.pool.clone()).delete_proxy(id).await {
         Ok(true) => (StatusCode::NO_CONTENT, "").into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "not found" }))).into_response(),
         Err(e) => error_response(e),
@@ -796,7 +806,7 @@ async fn set_proxy_enabled(
         .and_then(|o| o.get("enabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    match Repo::new(&state.pool).set_proxy_enabled(id, enabled).await {
+    match Repo::new(state.pool.clone()).set_proxy_enabled(id, enabled).await {
         Ok(p) => (StatusCode::OK, Json(serde_json::to_value(&p).unwrap())).into_response(),
         Err(e) => error_response(e),
     }
@@ -805,7 +815,7 @@ async fn set_proxy_enabled(
 /// F#13 `POST /api/proxies/{id}/test` — runs the real-socket connectivity
 /// probe (GSA `proxy test`).  Returns `{ok, detail, latency_ms}`.
 async fn proxy_test(state: State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
-    let repo = Repo::new(&state.pool);
+    let repo = Repo::new(state.pool.clone());
     let proxy = match repo.proxy_by_id(id).await {
         Ok(Some(p)) => p,
         Ok(None) => {
@@ -836,8 +846,167 @@ async fn set_project_proxies(
 ) -> Response {
     let use_proxies = body.as_object().and_then(|o| o.get("use_proxies")).and_then(|v| v.as_bool())
         .unwrap_or(false);
-    match Repo::new(&state.pool).set_project_use_proxies(id, use_proxies).await {
+    match Repo::new(state.pool.clone()).set_project_use_proxies(id, use_proxies).await {
         Ok(p) => (StatusCode::OK, Json(serde_json::to_value(&p).unwrap())).into_response(),
         Err(e) => error_response(e),
     }
 }
+
+// ─── F#14: geo / IP handling ──────────────────────────────────────────────────
+/// F#14 `PUT /api/proxies/{id}/country` — set (or clear with `country: null`)
+/// the proxy's target country (GSA's "Country" column).  The pure matching
+/// policy lives in `engine::geo::normalize_country` for testability.
+async fn set_proxy_country(
+    state: State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    body: Json<serde_json::Value>,
+) -> Response {
+    let raw = body.0.get("country").cloned().unwrap_or(serde_json::Value::Null);
+    let country: Option<String> = match raw {
+        serde_json::Value::String(s) if !s.trim().is_empty() => {
+            engine::geo::normalize_country(&s).filter(|c| !c.is_empty())
+        }
+        serde_json::Value::Null => None,
+        serde_json::Value::String(_) => None, // blank string → clear
+        other => {
+            return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("country must be a string or null, got {other}") }))
+            ).into_response()
+        }
+    };
+    match Repo::new(state.pool.clone()).set_proxy_country(id, country.as_deref()).await {
+        Ok(p) => (StatusCode::OK, Json(serde_json::to_value(&p).unwrap())).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct VerifyGeoReq {
+    /// Optional override for the egress-IP endpoint (default: GSA's own
+    /// `https://api.ipify.org/?format=raw`).
+    #[serde(default)]
+    egress_url: Option<String>,
+    /// Optional timeout-seconds for the single hop (default: 6s).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+/// F#14 `POST /api/proxies/{id}/verify-geo` — run an egress-IP probe
+/// *through* the proxy and persist the result on the row.  The IP-verification
+/// contract: the returned address is the proxy's **egress** (a `127.0.0.1`
+/// / `10.x` back means the proxy did not route).  Optional country resolution
+/// is pluggable (today IP-only, the faithful GSA default).
+async fn verify_proxy_geo(
+    state: State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    body: Option<Json<VerifyGeoReq>>,
+) -> Response {
+    let req = body.map(|Json(v)| v).unwrap_or_default();
+    let repo = Repo::new(state.pool.clone());
+    let proxy = match repo.proxy_by_id(id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => return (StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not found" }))).into_response(),
+        Err(e) => return error_response(e),
+    };
+    let spec = engine::proxy::ProxySpec {
+        host: proxy.host.clone(),
+        port: proxy.port as u16,
+        proxy_kind: proxy.proxy_kind,
+        login: proxy.login,
+        password: proxy.password,
+    };
+    let egress_url = req
+        .egress_url
+        .unwrap_or_else(|| engine::geo_probe::DEFAULT_EGRESS_URL.to_string());
+    let timeout = std::time::Duration::from_secs(req.timeout_secs.unwrap_or(6));
+    let result = engine::geo_probe::resolve_ip(&spec, &egress_url, timeout, None).await;
+    let stored = repo
+        .store_geo_verification(
+            id,
+            if result.ip.is_empty() { None } else { Some(result.ip.as_str()) },
+            result.public,
+        )
+        .await;
+    let p = match stored {
+        Ok(p) => p,
+        Err(e) => return error_response(e),
+    };
+    (StatusCode::OK, Json(serde_json::json!({
+        "proxy_id": id,
+        "ip": result.ip,
+        "public": result.public,
+        "speed_ms": result.speed_ms,
+        "country": result.country,
+        "geo_verified_at": p.geo_verified_at,
+    }))).into_response()
+}
+
+/// F#14 `POST /api/proxies/verify-all` — bulk egress verification of every
+/// **enabled** proxy.  Returns per-proxy results (GSA's "verify all proxies"
+/// workflow).  Concurrency is bounded to 8 to not saturate the egress host.
+async fn verify_all_proxies_geo(
+    state: State<Arc<AppState>>,
+    body: Option<Json<VerifyGeoReq>>,
+) -> Response {
+    let req = body.map(|Json(v)| v).unwrap_or_default();
+    let repo = Repo::new(state.pool.clone());
+    let proxies = match repo.list_enabled_proxies().await {
+        Ok(p) => p,
+        Err(e) => return error_response(e),
+    };
+    let egress_url = req
+        .egress_url
+        .unwrap_or_else(|| engine::geo_probe::DEFAULT_EGRESS_URL.to_string());
+    let timeout = std::time::Duration::from_secs(req.timeout_secs.unwrap_or(6));
+    // Clone the SQL pool once up front — the `'static` spawned futures need
+    // an owned reference; `state` is a by-value axum extractor that dies with
+    // this frame.
+    let pool = state.pool.clone();
+
+    use futures_util::StreamExt;
+    type BoxedFuture = std::pin::Pin<Box<dyn std::future::Future<Output = serde_json::Value> + Send + 'static>>;
+    let results: Vec<BoxedFuture> = proxies
+        .into_iter()
+        .map(|p| -> BoxedFuture {
+            // `Repo` owns its pool, so a simple clone is enough — the future
+            // becomes `'static` and captures the Arc pool by value.
+            let repo = Repo::new(pool.clone());
+            let spec = engine::proxy::ProxySpec {
+                host: p.host,
+                port: p.port as u16,
+                proxy_kind: p.proxy_kind,
+                login: p.login,
+                password: p.password,
+            };
+            let id = p.id;
+            let egress_url = egress_url.clone();
+            Box::pin(async move {
+                let r = engine::geo_probe::resolve_ip(&spec, &egress_url, timeout, None).await;
+                let stored = repo
+                    .store_geo_verification(
+                        id,
+                        if r.ip.is_empty() { None } else { Some(r.ip.as_str()) },
+                        r.public,
+                    )
+                    .await;
+                let ok = stored.is_ok();
+                serde_json::json!({
+                    "proxy_id": id,
+                    "ip": r.ip,
+                    "public": r.public,
+                    "speed_ms": r.speed_ms,
+                    "ok": ok,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut out = Vec::with_capacity(results.len());
+    let mut stream = futures_util::stream::iter(results).buffer_unordered(8);
+    while let Some(v) = stream.next().await {
+        out.push(v);
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "results": out }))).into_response()
+}
+
+// ─── F#13: project proxy gate ────────────────────────────────────────────────

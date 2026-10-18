@@ -49,6 +49,14 @@ pub mod proxy;
 /// engine; gated on `http` because it lives alongside the HTTP driver).
 #[cfg(feature = "http")]
 pub mod proxy_test;
+/// F#14 — Geo/IP (GSA per-proxy country + egress-IP verification).  Pure
+/// value types + parse/validate/select policy; ungated so the logic is
+/// testable without the `http` feature.
+pub mod geo;
+/// F#14 — the network half of Geo/IP: reqwest egress probe (`ipify` through
+/// the proxy) + pluggable country lookup.  Gated on `http` like `proxy_test`.
+#[cfg(feature = "http")]
+pub mod geo_probe;
 
 pub use keyword::{expand as expand_keyword, normalize as normalize_keyword, resolve_one as resolve_keyword_one};
 
