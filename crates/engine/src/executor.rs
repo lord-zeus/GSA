@@ -461,6 +461,7 @@ pub fn extract_result_url(step: &StepPlan, html: &str, target: Option<&str>) -> 
 // ---------------------------------------------------------------------------
 
 use super::driver::{Driver, DriverResponse};
+use crate::captcha::{CaptchaContext, CaptchaSolver};
 
 /// Drive `plan.steps` through `driver`, applying [classify_step] and
 /// [extract_result_url] at each step.
@@ -471,6 +472,25 @@ use super::driver::{Driver, DriverResponse};
 pub async fn execute_plan(
     plan: &SubmissionPlan,
     driver: &dyn Driver,
+) -> ExecutionReport {
+    execute_plan_with_solver(plan, driver, None).await
+}
+
+/// As [`execute_plan`], but on a `CaptchaFailed` outcome we hand the
+/// driver's page body to `solver` and — if an answer comes back — retry
+/// the step once with the answer injected into the first text input.
+///
+/// This is the GSA parity path: GSA detects "captcha failed" in the
+/// response, asks its solver (local arithmetic or 2Captcha/Anti-Captcha),
+/// re-types the answer into the field named by the engine INI (`code`,
+/// `code2`, `answer`… here we pick the first non-hidden / non-submit
+/// input on the page, which is the common-case field) and resubmits.
+/// A step that succeeds on the retry is counted as `successful`, not
+/// `captcha_failed` — GSA's stats page shows the same.
+pub async fn execute_plan_with_solver(
+    plan: &SubmissionPlan,
+    driver: &dyn Driver,
+    solver: Option<&dyn CaptchaSolver>,
 ) -> ExecutionReport {
     let mut report = ExecutionReport {
         successful: 0,
@@ -487,10 +507,11 @@ pub async fn execute_plan(
         // A step that carries form fields is a *submit* step (register /
         // login / step-N); a step without fields is a read-only navigate
         // (e.g. `delete_step1` typically has `just download=1` and no form).
-        let res: DriverResponse = if !step.fields.is_empty() {
-            driver.submit(target.clone(), step.fields.clone(), std::time::Duration::from_secs(30)).await
-        } else {
+        let mut fields = step.fields.clone();
+        let mut res: DriverResponse = if fields.is_empty() {
             driver.navigate(target.clone()).await
+        } else {
+            driver.submit(target.clone(), fields.clone(), std::time::Duration::from_secs(30)).await
         };
         if !res.ok {
             report.errors.push(format!("{}: {}", step.name, res.error.unwrap_or_default()));
@@ -501,7 +522,43 @@ pub async fn execute_plan(
             });
             continue;
         }
-        let outcome = classify_step(step, &res.html);
+        let mut outcome = classify_step(step, &res.html);
+        // F#21 — captcha pipeline: if this step hit a captcha wall and
+        // we have a solver, solve it + re-submit once with the answer.
+        let should_solve = outcome.outcome == super::StepOutcome::CaptchaFailed
+            && solver.is_some();
+        if should_solve {
+            let solver_ref = solver.expect("checked above");
+            if let Some(answer) = solve_captcha(step, &res.html, solver_ref).await {
+                // Inject into the first non-hidden input; the engine's INI
+                // names the field but we don't re-parse it here — the
+                // first text input is the common-case captcha field.
+                let field_name = infer_captcha_field(&res.html);
+                if !fields.contains_key(&field_name) {
+                    fields.entry(field_name).or_insert_with(|| answer.clone());
+                }
+                match driver
+                    .submit(target.clone(), fields.clone(), std::time::Duration::from_secs(30))
+                    .await
+                {
+                    retry if retry.ok => {
+                        res = retry;
+                        report.retried += 1;
+                        outcome = classify_step(step, &res.html);
+                    }
+                    retry => {
+                        report.errors.push(format!("{}: captcha retry failed: {}", step.name, retry.error.unwrap_or_default()));
+                        report.captcha_failed += 1;
+                        report.failed += 1;
+                        report.steps.push(StepOutcomeRef {
+                            outcome: StepOutcome::CaptchaFailed,
+                            matched_phrase: outcome.matched_phrase,
+                        });
+                        continue;
+                    }
+                }
+            }
+        }
         if let Some(u) = extract_result_url(step, &res.html, Some(&plan.target_url)) {
             report.submitted_url = report.submitted_url.clone().or(Some(u.clone()));
             report.submitted_url_source = Some(format!("{}: {}", step.name, u));
@@ -521,6 +578,79 @@ pub async fn execute_plan(
     report
 }
 
+/// Ask a solver for the captcha answer on the given page body.
+async fn solve_captcha(
+    step: &StepPlan,
+    html: &str,
+    solver: &dyn CaptchaSolver,
+) -> Option<String> {
+    let ctx = CaptchaContext {
+        html: html.to_string(),
+        image_url: None,
+        field_name: infer_captcha_field(html),
+        engine_name: None,
+        url: step.nav.navigation_target(),
+        page_title: None,
+    };
+    solver.solve(&ctx).await.ok()
+}
+
+/// Find the name of the first non-hidden `<input>` that looks like a
+/// captcha answer field. Falls back to `captcha` when nothing is found.
+///
+/// Deliberately simple single-pass scan — no DOM. The GSA engine INIs name
+/// the field (`code` / `code2` / `answer` / `captcha`), but re-parsing the
+/// INI here would couple executor to enginespec parsing; the first
+/// non-hidden / non-submit input is the right field in the common case.
+fn infer_captcha_field(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    for tag_start in lower.match_indices("<input ").map(|(i, _)| i) {
+        let tag_end = lower[tag_start..]
+            .find('>')
+            .map(|e| tag_start + e)
+            .unwrap_or(lower.len());
+        let tag = &lower[tag_start..tag_end];
+        // Skip non-text widgets.
+        let t = tag.strip_prefix("<input").unwrap_or(tag);
+        let is_textish = !t.contains("type=\"hidden")
+            && !t.contains("type=\"submit\"")
+            && !t.contains("type=\"button\"")
+            && !t.contains("type=\"file\"")
+            && !t.contains("type=\"checkbox\"")
+            && !t.contains("type=\"radio\"")
+            && !t.contains("type=\"password\"")
+            && !t.contains("type=\"image\"")
+            && !t.contains("type=\"reset\"");
+        if !is_textish {
+            continue;
+        }
+        let ns = match t.find("name=\"") {
+            Some(i) => i + 6,
+            None => match t.find("name='") {
+                Some(i) => i + 5,
+                None => continue,
+            },
+        };
+        let close = match t[ns..].find('"') {
+            Some(c) => c,
+            None => match t[ns..].find('\'') {
+                Some(c) => c,
+                None => continue,
+            },
+        };
+        let name = t[ns..ns + close].to_string();
+        if name.is_empty()
+            || name.starts_with('_')
+            || name.contains("csrf")
+            || name.contains("token")
+            || matches!(name.as_str(), "email" | "url" | "site" | "title" | "subject")
+        {
+            continue;
+        }
+        return name;
+    }
+    "captcha".to_string()
+}
 // ===========================================================================
 //  Tests: real engine files, classification, extraction, ordering,
 //  determinism, and the execute_plan loop with a stub driver.
@@ -816,5 +946,94 @@ submit success=ok
         assert_eq!(report.failed, 1);
         assert!(!report.errors.is_empty());
         assert!(report.errors[0].contains("connection reset"));
+    }
+
+    // -- F#21: captcha pipeline (solve → retry → success) -------------------
+
+    /// A driver whose first `submit` returns the captcha-wall page and whose
+    /// second `submit` succeeds, but ONLY when the answer field is present
+    /// (proving the resolver injected it).
+    struct FirstCaptchaWallThenOk {
+        second_fields: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl FirstCaptchaWallThenOk {
+        fn new() -> Self {
+            Self {
+                second_fields: std::sync::Mutex::new(HashMap::new()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn submit_fields(&self, fields: std::collections::HashMap<String, String>) -> DriverResponse {
+            use std::sync::atomic::Ordering::SeqCst;
+            let n = self.calls.fetch_add(1, SeqCst) + 1;
+            if n == 1 {
+                // Engine wall: "2 + 2 = ?" (the LocalSolver's arithmetic) +
+                // the field the executor must inject into.
+                DriverResponse {
+                    ok: true,
+                    final_url: "mock".into(),
+                    html: "2 + 2 = ? <form><input type=\"text\" name=\"code\"> <b>the captcha does not match</b></form>"
+                        .into(),
+                    error: None,
+                }
+            } else {
+                *self.second_fields.lock().unwrap() = fields;
+                DriverResponse {
+                    ok: true,
+                    final_url: "mock".into(),
+                    html: "thank you for submitting".into(),
+                    error: None,
+                }
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl Driver for FirstCaptchaWallThenOk {
+        async fn navigate(&self, _url: String) -> DriverResponse {
+            self.submit_fields(HashMap::new())
+        }
+        async fn submit(
+            &self,
+            _url: String,
+            fields: HashMap<String, String>,
+            _timeout: std::time::Duration,
+        ) -> DriverResponse {
+            self.submit_fields(fields)
+        }
+    }
+
+    #[test]
+    fn infer_field_from_real_form() {
+        let html = r#"
+<form method="post">
+  <input type="hidden" name="_token" value="x">
+  <input type="text" name="code">
+  <input type="submit" value="Go">
+</form>"#;
+        assert_eq!(infer_captcha_field(html), "code");
+        // Falls back to `captcha` when there is no suitable input.
+        assert_eq!(infer_captcha_field("<p>no form here</p>"), "captcha");
+    }
+
+    #[tokio::test]
+    async fn execute_plan_with_solver_solves_captcha_and_retries() {
+        let solver = crate::captcha::LocalSolver::default();
+        let raw = r#"
+[step 1]
+url=http://s.example/
+submit success=thank you for submitting
+captcha failed=captcha does not match
+"#;
+        let eng = parse_engine_str(raw, "E").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        let driver = FirstCaptchaWallThenOk::new();
+        let report = execute_plan_with_solver(&plan, &driver, Some(&solver)).await;
+        // The wall was retried once and then classified as a success.
+        assert_eq!(report.successful, 1, "expected 1 success, got {:?}", report);
+        assert_eq!(report.captcha_failed, 0);
+        // And the retry actually carried the answer into field `code`.
+        let second = driver.second_fields.lock().unwrap();
+        assert!(second.contains_key("code"), "answer field missing in retry: {:?}", second);
     }
 }

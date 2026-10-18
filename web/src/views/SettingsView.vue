@@ -15,6 +15,11 @@ interface GlobalSettings {
   verify_links?: boolean
   pop3_delete_messages?: boolean
   pop3_delete_days?: number
+  // — F#21: captcha solver —
+  captcha_provider?: string
+  captcha_api_key?: string | null
+  captcha_timeout_secs?: number
+  captcha_poll_secs?: number
 }
 interface Override {
   engine_name: string
@@ -33,6 +38,11 @@ const fields = [
   { key: 'verify_links', label: 'Verify links by URL', hint: 'Re-verify every submitted link after the visit step.' },
   { key: 'pop3_delete_messages', label: 'Delete processed POP3 messages', hint: 'GSA "pop3 del message".' },
   { key: 'pop3_delete_days', label: 'Days to keep POP3 messages (0..=1440)', hint: 'GSA "pop3 del message days".' },
+  // — F#21: captcha solver (GSA parity: local arithmetic / 2Captcha / Anti-Captcha) —
+  { key: 'captcha_provider', label: 'Captcha solver', hint: 'local = free offline arithmetic math-captchas. 2captcha / anticaptcha / capmonster = paid image captchas (needs API key).' },
+  { key: 'captcha_api_key', label: 'Captcha API key', hint: 'Key for 2Captcha / CAPMonster / Anti-Captcha. Ignored when provider = local.' },
+  { key: 'captcha_timeout_secs', label: 'Captcha solve timeout (s, 5..=600)', hint: 'Max time to wait for a provider answer before the engine is marked captcha-blocked.' },
+  { key: 'captcha_poll_secs', label: 'Captcha poll interval (s, 1..=60)', hint: 'How often to poll a provider for its answer.' },
 ] as const
 
 // — state —
@@ -246,6 +256,26 @@ onMounted(() => {
             class="mono"
             style="font-size:12px"
             placeholder="empty = auto-rotate"
+            :title="f.hint"
+          />
+          <select
+            v-else-if="f.key === 'captcha_provider'"
+            v-model="(form as any)[f.key]"
+            :title="f.hint"
+          >
+            <option value="local">local (arithmetic, free)</option>
+            <option value="2captcha">2Captcha</option>
+            <option value="anticaptcha">Anti-Captcha</option>
+            <option value="capmonster">CAPMonster</option>
+          </select>
+          <input
+            v-else-if="f.key === 'captcha_api_key'"
+            v-model="(form as any)[f.key]"
+            type="text"
+            class="mono"
+            style="font-size:12px"
+            autocomplete="off"
+            placeholder="provider API key"
             :title="f.hint"
           />
           <input

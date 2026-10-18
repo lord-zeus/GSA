@@ -71,6 +71,20 @@ pub struct Settings {
     /// Days to keep POP3 messages around before cleanup (GSA "pop3 del message days").
     #[serde(default)]
     pub pop3_delete_days: Option<u32>,
+    // ---- F#21 — captcha solver settings -------------------------------------
+    /// Which captcha solver to use. `local` (free, offline, arithmetic only),
+    /// `2captcha`, `anticaptcha`, `capmonster`.
+    #[serde(default)]
+    pub captcha_provider: Option<String>,
+    /// API key for 2Captcha / Anti-Captcha / CAPMonster. `local` ignores this.
+    #[serde(default)]
+    pub captcha_api_key: Option<String>,
+    /// Max seconds a captcha solve may take (per task). Default 60.
+    #[serde(default)]
+    pub captcha_timeout_secs: Option<u32>,
+    /// Seconds between status polls for async solvers (2Captcha "get", CAPMonster).
+    #[serde(default)]
+    pub captcha_poll_secs: Option<u32>,
 }
 
 fn clamp_n(v: &mut Option<u32>, lo: u32, hi: u32) {
@@ -94,6 +108,10 @@ impl Settings {
             verify_links: Some(true),
             pop3_delete_messages: Some(false),
             pop3_delete_days: Some(7),
+            captcha_provider: Some("local".into()),
+            captcha_api_key: None,
+            captcha_timeout_secs: Some(60),
+            captcha_poll_secs: Some(2),
         }
     }
 
@@ -141,9 +159,11 @@ impl Settings {
             s.pop3_delete_days = None;
         }
         clamp_n(&mut s.pop3_delete_days, 1, MAX_DELETE_DAYS);
+        clamp_n(&mut s.captcha_timeout_secs, 5, 600);
+        clamp_n(&mut s.captcha_poll_secs, 1, 60);
     }
 
-    /// Stable field name → display value map (`None` → empty string).
+/// Stable field name → display value map (`None` → empty string).
     pub fn fields(&self) -> BTreeMap<&'static str, String> {
         let m = |v: Option<u32>| v.map(|n| n.to_string()).unwrap_or_default();
         let b = |v: Option<bool>| v.map(|n| n.to_string()).unwrap_or_default();
@@ -159,6 +179,10 @@ impl Settings {
             ("verify_links", b(self.verify_links)),
             ("pop3_delete_messages", b(self.pop3_delete_messages)),
             ("pop3_delete_days", m(self.pop3_delete_days)),
+            ("captcha_provider", self.captcha_provider.clone().unwrap_or_default()),
+            ("captcha_api_key", self.captcha_api_key.clone().unwrap_or_default()),
+            ("captcha_timeout_secs", m(self.captcha_timeout_secs)),
+            ("captcha_poll_secs", m(self.captcha_poll_secs)),
         ])
     }
 
@@ -203,6 +227,19 @@ impl Settings {
                 }
                 "pop3_delete_days" => {
                     if let Ok(n) = val.parse() { s.pop3_delete_days = Some(n); }
+                }
+                "captcha_provider" => {
+                    let p = val.to_ascii_lowercase();
+                    if matches!(p.as_str(), "local" | "2captcha" | "anticaptcha" | "capmonster") {
+                        s.captcha_provider = Some(p);
+                    }
+                }
+                "captcha_api_key" => { s.captcha_api_key = Some(val.to_string()); }
+                "captcha_timeout_secs" => {
+                    if let Ok(n) = val.parse() { s.captcha_timeout_secs = Some(n); }
+                }
+                "captcha_poll_secs" => {
+                    if let Ok(n) = val.parse() { s.captcha_poll_secs = Some(n); }
                 }
                 _ => {}
             }
@@ -385,18 +422,19 @@ mod tests {
 
     #[test]
     fn clamped_enforces_each_bound() {
+        let base = Settings::gsa_default();
         let raw = Settings {
             threads: Some(0),
-            user_agent: None,
             pause_after_submissions: Some(999_999),
             pause_minutes: Some(0),
             max_submit_seconds: Some(0),
             pop3_wait_between_logins: Some(99_999),
             proxy_check_seconds: Some(0),
             verify_link_max_seconds: Some(0),
-            verify_links: Some(true),
-            pop3_delete_messages: Some(false),
             pop3_delete_days: Some(999),
+            captcha_timeout_secs: Some(1),
+            captcha_poll_secs: Some(9999),
+            ..base
         };
         let s = raw.clamped();
         assert_eq!(s.threads, Some(1));
@@ -407,6 +445,8 @@ mod tests {
         assert_eq!(s.proxy_check_seconds, Some(1));
         assert_eq!(s.verify_link_max_seconds, Some(1));
         assert_eq!(s.pop3_delete_days, Some(365));
+        assert_eq!(s.captcha_timeout_secs, Some(5));
+        assert_eq!(s.captcha_poll_secs, Some(60));
     }
 
     #[test]
@@ -482,7 +522,10 @@ mod tests {
         let f = s.fields();
         assert_eq!(f.get("threads"), Some(&"8".to_string()));
         assert_eq!(f.get("user_agent"), Some(&"".to_string()));
-        assert_eq!(f.len(), 11);
+        assert_eq!(f.len(), 15);
+        // F#21 — captcha fields present with GSA defaults.
+        assert_eq!(f.get("captcha_provider"), Some(&"local".to_string()));
+        assert_eq!(f.get("captcha_api_key"), Some(&"".to_string()));
     }
 
     #[test]

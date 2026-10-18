@@ -8,7 +8,7 @@ use std::path::Path;
 
 use engine::driver::Driver;
 use engine::email_exec::{EmailContext, run_email_engine};
-use engine::executor::{execute_plan, resolve_plan, ExecutionReport, SubmissionInput};
+use engine::executor::{resolve_plan, ExecutionReport, SubmissionInput};
 use engine::proxy::ProxySpec;
 use engine::routing::DriverKind;
 use serde::Serialize;
@@ -455,6 +455,22 @@ impl JobRunner {
         let n = self.ctx.proxies.len();
         let mut attempt_idx: Option<usize> = if n > 0 { Some((seed as usize) % n) } else { None };
         let mut retried_down_proxy = false;
+        // F#21 (GSA parity: 2Captcha / Anti-Captcha / local-arithmetic) —
+        // the solver, if any, is built ONCE per job from the project's
+        // settings (not per-step, not per-attempt) so a paid call is made
+        // at most once per captcha wall and only when the solver is
+        // actually configured. `None` = fall through to the classic
+        // execute_plan (no captcha attempts, the step counts as
+        // captcha_failed, matching GSA's "blocked by captcha wall" bucket).
+        let solver: Option<std::sync::Arc<dyn engine::captcha::CaptchaSolver>> = {
+            let s = self.ctx.settings.as_ref();
+            let provider = engine::captcha::CaptchaProvider::parse(
+                s.captcha_provider.as_deref().unwrap_or("local"),
+            );
+            let api_key = s.captcha_api_key.clone().filter(|k| !k.trim().is_empty());
+            let timeout_secs = s.captcha_timeout_secs.unwrap_or(60);
+            engine::captcha::make_solver(provider, api_key.as_deref(), timeout_secs)
+        };
         let mut report = loop {
             let drv: std::sync::Arc<dyn Driver> = match attempt_idx {
                 Some(i) => {
@@ -467,7 +483,16 @@ impl JobRunner {
             };
             let used_idx = attempt_idx;
             let r: engine::executor::ExecutionReport =
-                match tokio::time::timeout(timeout, execute_plan(&plan, drv.as_ref())).await {
+                match tokio::time::timeout(
+                    timeout,
+                    engine::executor::execute_plan_with_solver(
+                        &plan,
+                        drv.as_ref(),
+                        solver.as_deref(),
+                    ),
+                )
+                .await
+                {
                     Ok(r) => r,
                     Err(_) => {
                         // Transport-level: the proxy/socket is what broke —

@@ -46,6 +46,7 @@ pub mod email_exec;
 /// F#13 — proxy value types + round-robin rotation (GSA `proxy list/type`).
 pub mod proxy;
 pub mod anchor;
+pub mod captcha;
 /// F#13 — real-socket proxy connectivity check (the `proxy test` endpoint's
 /// engine; gated on `http` because it lives alongside the HTTP driver).
 #[cfg(feature = "http")]
