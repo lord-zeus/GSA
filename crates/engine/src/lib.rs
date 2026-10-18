@@ -60,6 +60,7 @@ pub mod geo_probe;
 /// F#15 — Global / profile settings + engine-override cascade + import/export
 /// bundle format (pure core; DB/API/layers build on this).
 pub mod settings;
+pub mod stats;
 
 pub use keyword::{expand as expand_keyword, normalize as normalize_keyword, resolve_one as resolve_keyword_one};
 

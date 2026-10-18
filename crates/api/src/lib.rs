@@ -758,13 +758,111 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/settings/engine/{name}/effective", get(effective_engine_settings))
         .route("/api/settings/export", get(export_settings_bundle))
         .route("/api/settings/import", post(import_settings_bundle))
+        .route("/api/stats", get(stats_dashboard))
         .route("/api/catengine/stats", get(catalog_stats))
         .route("/api/catengine", get(catalog_list))
         .route("/api/catengine/import", post(catalog_import))
         .with_state(state)
 }
 
-// ─── F#13: proxy management ────────────────────────────────────────────────────
+// ─── F#16: stats & analytics dashboard ──────────────────────────────────────
+
+/// `GET /api/stats?days=30` — the GSA-style global dashboard.
+///
+/// Returns the whole model in one round-trip (one small `Repo` per query is
+/// fine: these are aggregate reads, not hot paths).  `days` bounds the
+/// timeline window (clamped to [1, 365], default 30).
+#[derive(Deserialize)]
+struct StatsQ {
+    #[serde(default)]
+    days: Option<u32>,
+}
+
+async fn stats_dashboard(Query(q): Query<StatsQ>, state: State<Arc<AppState>>) -> Response {
+    let days = q.days.unwrap_or(30).clamp(1, 365);
+    let repo = Repo::new(state.pool.clone());
+
+    // 1. Global job-status buckets.
+    let status_buckets = match repo.job_status_counts().await {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(status, count)| engine::stats::StatusBucket { status, count })
+            .collect::<Vec<_>>(),
+        Err(e) => return error_response(e),
+    };
+
+    // 2. Global result-kind buckets (from the same results table the per-day
+    //    query counts; one extra cheap aggregate keeps `summarize` honest).
+    let kind_buckets = match global_kind_buckets(&repo).await {
+        Ok(k) => k,
+        Err(e) => return error_response(e),
+    };
+
+    let captchas_total = match repo.captcha_count().await {
+        Ok(c) => c,
+        Err(e) => return error_response(e),
+    };
+    let unique_links = match repo.unique_link_count().await {
+        Ok(u) => u,
+        Err(e) => return error_response(e),
+    };
+
+    let summary = engine::stats::summarize(&status_buckets, &kind_buckets, captchas_total, unique_links);
+
+    // 3. Timeline over the requested window.
+    let today = chrono::Utc::now().date_naive();
+    let window_start = (today - chrono::Duration::days((days as i64) - 1))
+        .and_hms_opt(0,0,0).unwrap();
+    let daily_rows = match repo.stats_daily(window_start).await {
+        Ok(r) => r,
+        Err(e) => return error_response(e),
+    };
+    let days_series = engine::stats::day_series(&daily_rows, days, today);
+
+    // 4. Per-engine rollup.
+    let engines = match repo.stats_per_engine().await {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(id, name, j, s, f, c, u)| engine::stats::engine_stat(&id, &name, j, s, f, c, u))
+            .collect::<Vec<_>>(),
+        Err(e) => return error_response(e),
+    };
+
+    // 5. Per-project rollup.
+    let projects = match repo.stats_per_project().await {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|(id, name, j, s, f, c, u)| engine::stats::project_stat(&id, &name, j, s, f, c, u))
+            .collect::<Vec<_>>(),
+        Err(e) => return error_response(e),
+    };
+
+    let dash = engine::stats::Dashboard {
+        summary,
+        days: days_series,
+        engines,
+        projects,
+    };
+
+    match serde_json::to_value(&dash) {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => error_response(anyhow::anyhow!("serialize: {e}")),
+    }
+}
+
+/// Result-kind buckets across the whole results table (global).
+async fn global_kind_buckets(
+    repo: &Repo,
+) -> anyhow::Result<Vec<engine::stats::KindBucket>> {
+    // Delegate to the db layer — this is the "summarize" kind counts
+    // aggregated over *all* results (not per-project).
+    let rows = repo.result_kind_buckets().await?;
+    Ok(rows
+        .into_iter()
+        .map(|(kind, count)| engine::stats::KindBucket { kind, count })
+        .collect())
+}
+
 
 async fn list_proxies(state: State<Arc<AppState>>, query: axum::extract::Query<std::collections::HashMap<String, String>>) -> Response {
     let country = query.0.get("country").map(|s| s.trim()).filter(|s| !s.is_empty());

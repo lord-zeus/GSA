@@ -24,6 +24,171 @@ impl Repo {
         Self { pool }
     }
 
+
+    // ─────────────────────────────────────────────────────────────
+    // F#16 — stats & analytics queries (raw per-bucket counts; shaped by
+    // ser_engine::stats into the dashboard model).
+    // ─────────────────────────────────────────────────────────────
+
+    /// `status -> count` across ALL jobs (global stats page).
+    pub async fn job_status_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let rows =
+            sqlx::query("SELECT status, COUNT(*)::bigint FROM jobs GROUP BY status")
+                .fetch_all(&self.pool)
+                .await?;
+        let out = rows
+            .into_iter()
+            .map(|r| -> anyhow::Result<(String, i64)> {
+                Ok((r.try_get::<String, _>(0)?, r.try_get::<i64, _>(1)?))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(out)
+    }
+
+    /// `kind -> count` buckets across the WHOLE results table (global dashboard).
+    pub async fn result_kind_buckets(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let rows =
+            sqlx::query("SELECT kind, COUNT(*)::bigint FROM results GROUP BY kind")
+                .fetch_all(&self.pool)
+                .await?;
+        let out = rows
+            .into_iter()
+            .map(|r| -> anyhow::Result<(String, i64)> {
+                Ok((r.try_get::<String, _>(0)?, r.try_get::<i64, _>(1)?))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(out)
+    }
+
+    /// How many outcomes were captcha walls (the GSA-distinct metric).
+    pub async fn captcha_count(&self) -> anyhow::Result<i64> {
+        let row = sqlx::query(
+            "SELECT COUNT(*)::bigint FROM results WHERE captchas = TRUE",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get::<i64, _>(0)?)
+    }
+
+    /// Distinct created links across all successes (GSA "unique links").
+    pub async fn unique_link_count(&self) -> anyhow::Result<i64> {
+        let row = sqlx::query(
+            "SELECT COUNT(DISTINCT url)::bigint FROM results
+             WHERE kind = 'success' AND url IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get::<i64, _>(0)?)
+    }
+
+    /// Per-day `(date, links, captchas, other)` for a timeline window (`since`).
+    pub async fn stats_daily(
+        &self,
+        since: chrono::NaiveDateTime,
+    ) -> anyhow::Result<Vec<(chrono::NaiveDate, i64, i64, i64)>> {
+        let rows = sqlx::query(
+            "SELECT created_at::date AS d,
+                    COUNT(*) FILTER (WHERE kind = 'success' AND url IS NOT NULL)::bigint AS links,
+                    COUNT(*) FILTER (WHERE captchas = TRUE)::bigint AS captchas,
+                    COUNT(*) FILTER (WHERE kind <> 'success')::bigint AS other
+             FROM results
+             WHERE created_at >= $1
+             GROUP BY d
+             ORDER BY d",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        let out = rows
+            .into_iter()
+            .map(|r| -> anyhow::Result<(chrono::NaiveDate, i64, i64, i64)> {
+                Ok((
+                    r.try_get::<chrono::NaiveDate, _>(0)?,
+                    r.try_get::<i64, _>(1)?,
+                    r.try_get::<i64, _>(2)?,
+                    r.try_get::<i64, _>(3)?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(out)
+    }
+
+    /// Per-engine rollup: `(id, name, jobs, successes, failures, captchas, unique_links)`.
+    pub async fn stats_per_engine(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String, i64, i64, i64, i64, i64)>> {
+        let rows = sqlx::query(
+            "SELECT e.id::text, e.engine_name AS name,
+                (SELECT COUNT(*)::bigint FROM jobs j WHERE j.engine_id = e.id) AS jobs,
+                (SELECT COUNT(*)::bigint FROM results r JOIN jobs j ON j.id = r.job_id
+                     WHERE j.engine_id = e.id AND r.kind = 'success' AND r.url IS NOT NULL) AS successes,
+                (SELECT COUNT(*)::bigint FROM results r JOIN jobs j ON j.id = r.job_id
+                     WHERE j.engine_id = e.id AND r.kind IN ('error','rejected')) AS failures,
+                (SELECT COUNT(*)::bigint FROM results r JOIN jobs j ON j.id = r.job_id
+                     WHERE j.engine_id = e.id AND r.captchas = TRUE) AS captchas,
+                (SELECT COUNT(DISTINCT r.url)::bigint FROM results r JOIN jobs j ON j.id = r.job_id
+                     WHERE j.engine_id = e.id AND r.kind = 'success' AND r.url IS NOT NULL) AS unique_links
+             FROM engines e
+             WHERE EXISTS (SELECT 1 FROM jobs j WHERE j.engine_id = e.id)
+             ORDER BY successes DESC, jobs DESC, e.engine_name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let out = rows
+            .into_iter()
+            .map(|r| -> anyhow::Result<(String, String, i64, i64, i64, i64, i64)> {
+                Ok((
+                    r.try_get::<String, _>(0)?,
+                    r.try_get::<String, _>(1)?,
+                    r.try_get::<i64, _>(2)?,
+                    r.try_get::<i64, _>(3)?,
+                    r.try_get::<i64, _>(4)?,
+                    r.try_get::<i64, _>(5)?,
+                    r.try_get::<i64, _>(6)?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(out)
+    }
+
+    /// Per-project rollup: same shape, joined through `jobs.project_id`.
+    pub async fn stats_per_project(
+        &self,
+    ) -> anyhow::Result<Vec<(String, String, i64, i64, i64, i64, i64)>> {
+        let rows = sqlx::query(
+            "SELECT p.id::text, p.name,
+                (SELECT COUNT(*)::bigint FROM jobs j WHERE j.project_id = p.id) AS jobs,
+                (SELECT COUNT(*)::bigint FROM results r JOIN jobs j ON j.id = r.job_id
+                     WHERE j.project_id = p.id AND r.kind = 'success' AND r.url IS NOT NULL) AS successes,
+                (SELECT COUNT(*)::bigint FROM results r JOIN jobs j ON j.id = r.job_id
+                     WHERE j.project_id = p.id AND r.kind IN ('error','rejected')) AS failures,
+                (SELECT COUNT(*)::bigint FROM results r JOIN jobs j ON j.id = r.job_id
+                     WHERE j.project_id = p.id AND r.captchas = TRUE) AS captchas,
+                (SELECT COUNT(DISTINCT r.url)::bigint FROM results r JOIN jobs j ON j.id = r.job_id
+                     WHERE j.project_id = p.id AND r.kind = 'success' AND r.url IS NOT NULL) AS unique_links
+             FROM projects p
+             WHERE EXISTS (SELECT 1 FROM jobs j WHERE j.project_id = p.id)
+             ORDER BY successes DESC, jobs DESC, p.name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let out = rows
+            .into_iter()
+            .map(|r| -> anyhow::Result<(String, String, i64, i64, i64, i64, i64)> {
+                Ok((
+                    r.try_get::<String, _>(0)?,
+                    r.try_get::<String, _>(1)?,
+                    r.try_get::<i64, _>(2)?,
+                    r.try_get::<i64, _>(3)?,
+                    r.try_get::<i64, _>(4)?,
+                    r.try_get::<i64, _>(5)?,
+                    r.try_get::<i64, _>(6)?,
+                ))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(out)
+    }
+
     // ── projects ──────────────────────────────────────────────────────────
     pub async fn create_project(&self, name: &str, description: Option<&str>) -> anyhow::Result<Project> {
         let row = sqlx::query(
@@ -481,10 +646,12 @@ impl Repo {
         anchor: Option<&str>,
         message: Option<&str>,
         payload: Option<serde_json::Value>,
+        // F#16: captcha wall flag (GSA tracks this as its own metric, not a failure).
+        captchas: bool,
     ) -> anyhow::Result<()> {
         sqlx::query(
-            "INSERT INTO results (job_id, kind, url, anchor, message, payload)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO results (job_id, kind, url, anchor, message, payload, captchas)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(job_id)
         .bind(kind.as_str())
@@ -492,6 +659,7 @@ impl Repo {
         .bind(anchor)
         .bind(message)
         .bind(payload)
+        .bind(captchas)
         .execute(&self.pool)
         .await?;
         Ok(())

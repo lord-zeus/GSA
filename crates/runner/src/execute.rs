@@ -436,24 +436,59 @@ impl JobRunner {
         let _ = repo
             .finish_job(job_id, status, err.as_deref())
             .await;
-        if done {
-            if let Some(url) = &report.submitted_url {
-                let mut payload = serde_json::json!({ "engine": "runner" });
-                if let Some(p) = proxy_used {
-                    payload["proxy"] = serde_json::json!(p);
-                }
-                let _ = repo
-                    .record_result(
-                        job_id,
-                        ser_db::ResultKind::Success,
-                        Some(url.as_str()),
-                        Some(&keyword),
-                        None,
-                        Some(payload),
-                    )
-                    .await;
-            }
+
+        let mut payload = serde_json::json!({ "engine": "runner" });
+        if let Some(p) = proxy_used {
+            payload["proxy"] = serde_json::json!(p);
         }
+        if let Some(e) = err.as_ref() {
+            payload["error"] = serde_json::json!(e);
+        }
+        payload["steps"] = serde_json::json!({
+            "successful": report.successful,
+            "failed": report.failed,
+            "retried": report.retried,
+            "captcha_failed": report.captcha_failed,
+        });
+
+        // F#16 — record the OUTCOME row whether the job succeeded or not.
+        // GSA's stats page wants success/failure/**captcha** ratios, and a job
+        // blocked by a captcha wall used to leave NO results row at all.
+        // Success still takes precedence for the `kind` (matching result_kind).
+        let success = report.successful > 0;
+        let kind = if success {
+            ser_db::ResultKind::Success
+        } else if report.captcha_failed > 0 {
+            // captcha wall — its own bucket in the GSA UI
+            ser_db::ResultKind::Rejected
+        } else if err.is_some() {
+            ser_db::ResultKind::Error
+        } else {
+            ser_db::ResultKind::Error
+        };
+        let url = report.submitted_url.clone();
+        let message = if success {
+            None
+        } else {
+            err.clone().or_else(|| match (report.captcha_failed > 0, report.failed > 0) {
+                (true, _) => Some("blocked by captcha wall".to_string()),
+                (_, true) => Some("submission failed".to_string()),
+                (false, false) => Some("no submission link found".to_string()),
+            })
+        };
+        let captchas = report.captcha_failed > 0;
+        let _ = repo
+            .record_result(
+                job_id,
+                kind,
+                url.as_deref(),
+                Some(&keyword),
+                message.as_deref(),
+                Some(payload),
+                captchas,
+            )
+            .await;
+
         JobOutcome {
             job_id,
             status: if done { "done" } else { "failed" },

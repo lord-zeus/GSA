@@ -531,12 +531,12 @@ async fn f10_project_results_and_stats_api() {
         Some(erow.id), Some(kwid)).await.unwrap().id;
     repo.claim_next_pending(uuid::Uuid::parse_str(&proj_id).unwrap()).await.unwrap().unwrap();
     repo.record_result(jid, ResultKind::Success, Some("https://ex.com/r1"),
-        Some("f10 api kw"), Some("ok"), None).await.unwrap();
+        Some("f10 api kw"), Some("ok"), None, false).await.unwrap();
     repo.record_result(jid, ResultKind::Success, Some("https://ex.com/r2"),
-        Some("f10 api kw"), Some("ok"), None).await.unwrap();
-    repo.record_result(jid, ResultKind::Error, None, None, Some("captcha"), None).await.unwrap();
+        Some("f10 api kw"), Some("ok"), None, false).await.unwrap();
+    repo.record_result(jid, ResultKind::Error, None, None, Some("captcha"), None, false).await.unwrap();
     repo.record_result(jid, ResultKind::Success, Some("https://ex.com/r1"),
-        Some("dup"), None, None).await.unwrap(); // duplicate URL
+        Some("dup"), None, None, false).await.unwrap(); // duplicate URL
     repo.finish_job(jid, JobStatus::Done, None).await.unwrap();
     let _ = proj_id; // keep
 
@@ -907,4 +907,109 @@ async fn f15_proxy_duplicate_returns_409_not_500() {
             .await.unwrap(),
         ).await;
     }
+}
+
+/// F#16 — the stats dashboard endpoint.  GET /api/stats?days=N returns the
+/// full GSA-style model: a global summary (jobs + outcome ratios + capchas +
+/// unique links), a continuous per-day timeline, and per-engine / per-project
+/// rollups.  This test only asserts the SHAPE and invariants (it is independent
+/// of what data happens to be in the DB).
+#[tokio::test]
+async fn f16_stats_dashboard_shape_and_invariants() {
+    let Ok(state) = app_state(None).await else {
+        eprintln!("SKIP f16_stats: no Postgres (docker compose up -d)");
+        return;
+    };
+    let app = router(state);
+
+    let (status, body) = body_to_json(
+        app.clone().oneshot(
+            Request::builder().method("GET").uri("/api/stats?days=30").body(Body::empty()).unwrap(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "GET /api/stats must be 200, got {status}: {body}");
+
+    // ── top-level keys ──────────────────────────────────────────────────
+    assert!(body.get("summary").is_some(), "missing summary");
+    assert!(body.get("days").is_some(), "missing days (timeline)");
+    assert!(body.get("engines").is_some(), "missing engines");
+    assert!(body.get("projects").is_some(), "missing projects");
+
+    // ── summary invariants ──────────────────────────────────────────────
+    let s = &body["summary"];
+    for k in ["jobs_total", "results_total", "successes", "failures", "captchas", "unique_links", "success_rate"] {
+        assert!(s.get(k).is_some(), "summary.{k} missing");
+    }
+    // success rate must be within [0,1]
+    let rate = s["success_rate"].as_f64().unwrap_or(-1.0);
+    assert!((0.0..=1.0).contains(&rate), "success_rate out of [0,1]: {rate}");
+    // successes can never exceed results_total
+    assert!(
+        s["successes"].as_i64().unwrap_or(0) <= s["results_total"].as_i64().unwrap_or(0),
+        "successes > results_total: {s}"
+    );
+
+    // ── timeline invariants ─────────────────────────────────────────────
+    let days = body["days"].as_array().expect("days must be a JSON array");
+    assert_eq!(days.len(), 30, "days=30 must return exactly 30 points, got {}", days.len());
+    for (i, pt) in days.iter().enumerate() {
+        for k in ["date", "links", "captchas"] {
+            assert!(pt.get(k).is_some(), "days[{i}].{k} missing");
+        }
+        // `date` must be an ISO `YYYY-MM-DD` string
+        assert_eq!(pt["date"].as_str().map(|d| d.len()).unwrap_or(0), 10, "date not YYYY-MM-DD: {}", pt["date"]);
+        // counts are non-negative integers
+        assert!(pt["links"].as_i64().unwrap_or(-1) >= 0, "days[{i}].links negative");
+        assert!(pt["captchas"].as_i64().unwrap_or(-1) >= 0, "days[{i}].captchas negative");
+    }
+    // timeline must be chronologically ascending
+    let mut dts: Vec<&str> = days.iter().map(|p| p["date"].as_str().unwrap_or("")).collect();
+    let mut sorted = dts.clone();
+    sorted.sort();
+    assert_eq!(dts, sorted, "timeline not in ascending date order");
+
+    // ── per-engine / per-project shape ──────────────────────────────────
+    for key in ["engines", "projects"] {
+        let arr = body[key].as_array().expect("{key} must be an array");
+        for (i, row) in arr.iter().enumerate() {
+            for k in ["name", "jobs", "successes", "failures", "captchas", "unique_links", "success_rate"] {
+                assert!(row.get(k).is_some(), "{key}[{i}].{k} missing");
+            }
+            let r = row["success_rate"].as_f64().unwrap_or(-1.0);
+            assert!((0.0..=1.0).contains(&r), "{key}[{i}].success_rate out of [0,1]: {r}");
+        }
+    }
+}
+
+/// F#16 — `days` is clamped to [1, 365].  days=0 -> still succeeds (1 day);
+/// days=99999 -> still succeeds (365 days).  Catches a bare `unwrap()` or a
+/// panicking `checked_sub` in the timeline window.
+#[tokio::test]
+async fn f16_stats_days_clamped() {
+    let Ok(state) = app_state(None).await else {
+        eprintln!("SKIP f16_days: no Postgres (docker compose up -d)");
+        return;
+    };
+    let app = router(state);
+
+    // days=0 -> treated as 1 day
+    let (status0, body0) = body_to_json(
+        app.clone().oneshot(
+            Request::builder().method("GET").uri("/api/stats?days=0").body(Body::empty()).unwrap(),
+        ).await.unwrap(),
+    ).await;
+    assert_eq!(status0, StatusCode::OK, "days=0 should succeed (clamped to 1), was {status0}: {body0}");
+    assert_eq!(body0["days"].as_array().map(|a| a.len()).unwrap_or(0), 1, "days=0 must return 1 point");
+
+    // days=99999 -> clamped to 365
+    let (status, body) = body_to_json(
+        app.oneshot(
+            Request::builder().method("GET").uri("/api/stats?days=99999").body(Body::empty()).unwrap(),
+        ).await.unwrap(),
+    ).await;
+    assert_eq!(status, StatusCode::OK, "days=99999 should succeed (clamped to 365), was {status}: {body}");
+    assert_eq!(body["days"].as_array().map(|a| a.len()).unwrap_or(0), 365, "days=99999 must return 365 points");
 }

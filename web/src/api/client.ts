@@ -135,6 +135,56 @@ export interface RunSummary {
   panics: number
 }
 
+// ── F#16 · stats & analytics (GSA dashboard metrics) ──
+export interface StatsSummary {
+  jobs_total: number
+  jobs_done: number
+  jobs_failed: number
+  jobs_inflight: number
+  jobs_cancelled: number
+  results_total: number
+  successes: number
+  failures: number
+  rejected: number
+  errors: number
+  info: number
+  captchas: number
+  unique_links: number
+  success_rate: number
+}
+export interface TimelinePoint {
+  date: string   // YYYY-MM-DD
+  links: number
+  captchas: number
+  other: number
+}
+export interface EngineStat {
+  engine_id: string
+  name: string
+  jobs: number
+  successes: number
+  failures: number
+  captchas: number
+  unique_links: number
+  success_rate: number
+}
+export interface ProjectStat {
+  project_id: string
+  name: string
+  jobs: number
+  successes: number
+  failures: number
+  captchas: number
+  unique_links: number
+  success_rate: number
+}
+export interface Dashboard {
+  summary: StatsSummary
+  days: TimelinePoint[]
+  engines: EngineStat[]
+  projects: ProjectStat[]
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
@@ -153,6 +203,10 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => req<Health>('/healthz'),
+
+  // — F#16 · stats & analytics dashboard (one round-trip: summary + timeline + per-engine + per-project) —
+  stats: (days?: number) =>
+    req<Dashboard>(`/api/stats${days != null ? `?days=${days}` : ''}`),
 
   catalogList: async (q?: { kind?: string; search?: string; offset?: number; limit?: number }): Promise<CatalogList> => {
     const p = new URLSearchParams()

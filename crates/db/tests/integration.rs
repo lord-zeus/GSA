@@ -95,8 +95,7 @@ async fn full_pipeline_project_engines_keywords_jobs_results_history() {
         Some("https://aardvark-topsites.com/entry/12345"),
         Some("buy running shoes online"),
         Some("submission confirmed"),
-        Some(serde_json::json!({"http": 200})),
-    )
+        Some(serde_json::json!({"http": 200})), false)
     .await
     .unwrap();
     let results = repo.results_for_job(job.id).await.unwrap();
@@ -287,11 +286,11 @@ async fn f10_project_results_and_stats() {
     let a = repo.create_job(project.id, Some(erow.id), Some(kw.id)).await.unwrap();
     repo.claim_next_pending(project.id).await.unwrap().expect("claim a");
     repo.record_result(a.id, ResultKind::Success, Some("https://ex.com/entry/1"),
-        Some("buy f10 backlink keyword"), Some("ok"), None).await.unwrap();
+        Some("buy f10 backlink keyword"), Some("ok"), None, false).await.unwrap();
     repo.record_result(a.id, ResultKind::Success, Some("https://ex.com/entry/2"),
-        Some("f10 backlink keyword"), Some("ok"), None).await.unwrap();
+        Some("f10 backlink keyword"), Some("ok"), None, false).await.unwrap();
     repo.record_result(a.id, ResultKind::Error, None, None,
-        Some("captcha wall"), None).await.unwrap();
+        Some("captcha wall"), None, false).await.unwrap();
     repo.finish_job(a.id, JobStatus::Done, None).await.unwrap();
 
     // Job B — no engine/keyword, 1 rejection + 1 info, and a DUPLICATE success URL
@@ -299,9 +298,9 @@ async fn f10_project_results_and_stats() {
     let b = repo.create_job(project.id, None, None).await.unwrap();
     repo.claim_next_pending(project.id).await.unwrap().expect("claim b");
     repo.record_result(b.id, ResultKind::Success, Some("https://ex.com/entry/1"),
-        Some("dup url"), None, None).await.unwrap();
-    repo.record_result(b.id, ResultKind::Rejected, None, None, Some("already listed"), None).await.unwrap();
-    repo.record_result(b.id, ResultKind::Info, None, None, Some("rate-limited, will retry"), None).await.unwrap();
+        Some("dup url"), None, None, false).await.unwrap();
+    repo.record_result(b.id, ResultKind::Rejected, None, None, Some("already listed"), None, false).await.unwrap();
+    repo.record_result(b.id, ResultKind::Info, None, None, Some("rate-limited, will retry"), None, false).await.unwrap();
     repo.finish_job(b.id, JobStatus::Done, None).await.unwrap();
 
     // 1) project_results: all 7 rows present, sorted newest-first, joined to
@@ -435,7 +434,7 @@ async fn f11_project_crud_and_lifecycle() {
     let rjob = repo.create_job(p.id, None, None).await.unwrap();
     // claim+finish so results can exist
     let _ = repo.claim_next_pending(p.id).await.unwrap();
-    repo.record_result(rjob.id, ResultKind::Success, Some("https://cascade.example/x"), None, None, None).await.unwrap();
+    repo.record_result(rjob.id, ResultKind::Success, Some("https://cascade.example/x"), None, None, None, false).await.unwrap();
     repo.finish_job(rjob.id, JobStatus::Done, None).await.unwrap();
     assert_eq!(repo.results_for_job(rjob.id).await.unwrap().len(), 1);
     assert!(repo.keyword_by_id(kw.id).await.unwrap().is_some());
