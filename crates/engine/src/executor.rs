@@ -124,14 +124,39 @@ impl StepNav {
             .unwrap_or_default()
     }
 
-    /// Best-fit target URL for the driver to navigate to: first candidate
-    /// of `form_url`, else `alternative_url`, else `find_url`, else `find_link`.
+    /// Best-fit target URL for the driver to navigate to.
+    ///
+    /// Preference order: first absolute candidate (form_url → alternative_url
+    /// → find_url → find_link), else the first relative candidate.
+    /// If that relative candidate's `modify_url` is absolute, promote it
+    /// (GSA INIs often put `form url=*/path` with `modify url=http://host/path`
+    /// — CDP's `Page.navigate` needs the absolute form).
     pub fn navigation_target(&self) -> Option<String> {
-        self.form_url.first()
-            .cloned()
+        fn is_absolute(u: &str) -> bool {
+            u.starts_with("http://") || u.starts_with("https://")
+        }
+        let all: [Option<&String>; 4] = [
+            self.form_url.first(),
+            self.alternative_url.first(),
+            self.find_url.first(),
+            self.find_link.first(),
+        ];
+        // First absolute candidate wins
+        if let Some(s) = all.into_iter().flatten().find(|u| is_absolute(u)) {
+            return Some(s.clone());
+        }
+        // Fall back to the first (relative) candidate
+        let raw = self.form_url.first().cloned()
             .or_else(|| self.alternative_url.first().cloned())
             .or_else(|| self.find_url.first().cloned())
-            .or_else(|| self.find_link.first().cloned())
+            .or_else(|| self.find_link.first().cloned())?;
+        // Promote modify_url when it is absolute and raw is relative
+        if let Some(m) = &self.modify_url {
+            if is_absolute(m) {
+                return Some(m.clone());
+            }
+        }
+        Some(raw)
     }
 }
 
@@ -1291,5 +1316,53 @@ captcha failed=captcha does not match
         assert_eq!(report.failed, 0);
         assert_eq!(report.submitted_url.as_deref(), Some("http://rlu.ru/5i1b6"));
         let _ = bare;
+    }
+
+    /// Regression: CDP `Page.navigate` rejects relative URLs but GSA INIs
+    /// routinely use `form url=*/path` alongside `modify url=http://host/path`.
+    /// `navigation_target()` must prefer the absolute candidate or promote
+    /// `modify_url` when all `form_url` entries are relative.
+    #[tokio::test]
+    async fn navigation_target_prefers_absolute_over_relative() {
+        let nav = StepNav {
+            find_link: vec![],
+            find_url: vec![],
+            alternative_url: vec!["http://thedatahub.org/user/login".into()],
+            form_url: vec!["*/user/register".into()],
+            form_name: vec![],
+            link_type: None,
+            modify_url: Some("http://thedatahub.org/user/register".into()),
+        };
+        // absolute alternative_url should win over relative form_url
+        let t = nav.navigation_target().unwrap();
+        assert!(t.starts_with("http://"), "got {t}");
+        assert!(t.contains("thedatahub.org"), "got {t}");
+
+        // when ONLY form_url is relative, modify_url (absolute) must be returned
+        let nav2 = StepNav {
+            find_link: vec![],
+            find_url: vec![],
+            alternative_url: vec![],
+            form_url: vec!["*/user/register".into()],
+            form_name: vec![],
+            link_type: None,
+            modify_url: Some("http://thedatahub.org/user/register".into()),
+        };
+        let t2 = nav2.navigation_target().unwrap();
+        assert!(t2.starts_with("http://"), "must be absolute: {t2}");
+        assert!(t2.contains("thedatahub.org/user/register"), "got {t2}");
+
+        // all relative + no modify_url → fall back to the relative candidate
+        let nav3 = StepNav {
+            find_link: vec![],
+            find_url: vec![],
+            alternative_url: vec![],
+            form_url: vec!["/relative/path".into()],
+            form_name: vec![],
+            link_type: None,
+            modify_url: None,
+        };
+        let t3 = nav3.navigation_target().unwrap();
+        assert_eq!(t3, "/relative/path");
     }
 }
