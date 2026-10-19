@@ -69,7 +69,7 @@ impl FromStr for EngineType {
         let s = s.replace([' ', '_'], "-");
         Ok(match s.as_str() {
             "url-shortener" => EngineType::UrlShortener,
-            "web-2-0" | "web20" => EngineType::Web20,
+            "web-2-0" | "web-2.0" | "web20" => EngineType::Web20,
             "guestbook" => EngineType::Guestbook,
             "directory" => EngineType::Directory,
             "article" | "articles" => EngineType::Article,
@@ -410,9 +410,36 @@ link=%url%
 
     #[test]
     fn unknown_engine_type_degrades_gracefully() {
-        let raw = "[engine]\r\nengine type=super-duper-new-cat\r\nurl=http://x\r\n";
+        let raw = "[engine]
+\nengine type=super-duper-new-cat
+\nurl=http://x
+\n";
         let e = parse_engine_str(raw, "q").unwrap();
         assert_eq!(e.engine_type, EngineType::Unknown);
+    }
+
+    #[test]
+    fn web20_type_parses_from_setup_real_corpus_shape() {
+        // Real corpus shape (43things.com.ini): no [engine] section — the
+        // type lives in [setup] with the dotted value `Web 2.0`.  Before the
+        // fix this parsed to `Unknown` and 126 engines dropped out of the
+        // Article family pool.
+        let raw = "[setup]
+\nenabled=0
+\nfixed url=http://www.43things.com/
+\nengine type=Web 2.0
+\ndofollow=1
+\n[Your E-Mail]
+\ntype=email
+\n[URL]
+\ntype=url
+\n";
+        let e = parse_engine_str(raw, "43things.com").unwrap();
+        assert_eq!(e.engine_type, EngineType::Web20, "Web 2.0 must classify as Web20");
+        assert!(e.dofollow);
+        // And the family mapping still routes it to Article.
+        use crate::families::Family;
+        assert_eq!(Family::for_type(&e.engine_type), Some(Family::Article));
     }
 
     #[test]
