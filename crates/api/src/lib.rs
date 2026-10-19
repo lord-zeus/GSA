@@ -1283,6 +1283,111 @@ async fn put_email_setting(
 
 
 
+// ---------------------------------------------------------------------------
+// E2 — Mailbox creation (GSA SERE flow).  GSA's answer to the register →
+// email-verify → login wall: create the disposable mailbox FIRST via the
+// email engines (anonmails.de register chain / hidebox.de visit flow),
+// persist it as the operator mailbox, so registration-family target engines
+// resolve their `%your e-mail%`/`%login%` tokens and the F#12 verification
+// inbox is real.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CreateEmailBody {
+    /// Optional engine name to pin (e.g. "anonmails.de"); omitted =
+    /// provider auto-select (verifiable register flow first).
+    #[serde(default)]
+    engine: String,
+}
+
+/// POST /api/email/create — create a mailbox via a GSA email engine and
+/// persist it as the operator mailbox. Response: the full creation report
+/// (`engine`, `address`, `password`, `domain`, `steps: [{kind,url,ok,detail}]`);
+/// `ok`/`verified` distinguish "confirmed" from "HTTP 200 only".
+async fn create_email(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<CreateEmailBody>>,
+) -> Response {
+    let repo = Repo::new(state.pool.clone());
+
+    let in_use_addr = repo.email_mailbox().await.unwrap_or_default().0;
+
+    let gsa_root = std::env::var("GSA_INSTALL_ROOT")
+        .unwrap_or_else(|_| r"C:\Users\kingsly\GSA_SER_portable".into());
+    let root = std::path::PathBuf::from(gsa_root);
+    let engines = match tokio::task::spawn_blocking(move || {
+        engine::email_create::load_email_engines(&root)
+    })
+    .await
+    {
+        Ok(e) => e,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+            )
+                .into_response()
+        }
+    };
+    if engines.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "no email engines found under GSA_INSTALL_ROOT/Email_Engines"
+            })),
+        )
+            .into_response();
+    }
+
+    let pin = body.as_ref().map(|b| b.engine.clone()).unwrap_or_default();
+    let in_use: Vec<String> = (!in_use_addr.trim().is_empty())
+        .then(|| in_use_addr.clone())
+        .into_iter()
+        .collect();
+
+    let driver: std::sync::Arc<dyn engine::Driver> = std::sync::Arc::new(engine::HttpDriver::new());
+    let created = match tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        tokio::task::spawn_blocking(move || {
+            engine::email_create::create_mailbox(&engines, &pin, &in_use, None, None, &driver)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ok": false, "error": e.to_string()})),
+            )
+                .into_response()
+        }
+        Err(_) => {
+            return (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({"ok": false, "error": "mailbox creation timed out (90s)"})),
+            )
+                .into_response()
+        }
+    };
+
+    if created.ok && !created.address.is_empty() {
+        if let Err(e) = repo.set_setting("email.address", &created.address).await {
+            return error_response(e);
+        }
+        if let Err(e) = repo.set_setting("email.password", &created.password).await {
+            return error_response(e);
+        }
+    }
+    (
+        if created.ok { StatusCode::OK } else { StatusCode::UNPROCESSABLE_ENTITY },
+        Json(created),
+    )
+        .into_response()
+}
+
+
 /// POST /api/catengine/import — import the live GSA engine directories.
 
 async fn catalog_import(
@@ -2742,6 +2847,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/proxies/scrape", post(proxy_scrape))
 
         .route("/api/settings/email", get(get_email_setting).put(put_email_setting))
+        .route("/api/email/create", post(create_email))
 
         .route("/api/settings/global", get(get_global_settings).put(put_global_settings))
 

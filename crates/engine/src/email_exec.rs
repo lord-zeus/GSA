@@ -563,7 +563,7 @@ fn extract_candidates(engine: &EmailEngine, body: &str) -> Vec<EmailSubmission> 
 /// Each call spawns a one-shot current-thread runtime — correct here
 /// because the pipeline runs under the runner's `spawn_blocking` (no
 /// runtime in context) and each call is one-shot.
-fn block_on_driver(
+pub(crate) fn block_on_driver(
     d: &dyn Driver,
     url: String,
     fields: HashMap<String, String>,

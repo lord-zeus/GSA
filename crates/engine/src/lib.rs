@@ -43,6 +43,11 @@ pub mod pop3;
 /// / TLS, WEB-inbox over `Driver`, and the shared fetch→extract→visit run
 /// used by the runner for all 217 `Email_Engines` specs).
 pub mod email_exec;
+/// E2 — mailbox CreationRunner (GSA SERE creation flow over HTTP): provider
+/// pick → address + password generation → execution of the plan (start-url
+/// GET, register POST, success-marker verification). Sync like the inbox
+/// pipeline; driven from `spawn_blocking`.
+pub mod email_create;
 /// F#13 — proxy value types + round-robin rotation (GSA `proxy list/type`).
 pub mod proxy;
 pub mod anchor;
