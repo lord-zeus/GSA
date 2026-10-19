@@ -1293,7 +1293,7 @@ async fn catalog_import(
 
     let gsa_root = std::env::var("GSA_INSTALL_ROOT").unwrap_or_else(|_| {
 
-        r"C:\Users\kingsly\Downloads\GSA_SER_v18.20_FINAL\GSA_SER_v18.20_FINAL".into()
+        r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install".into()
 
     });
 
@@ -1451,7 +1451,7 @@ pub async fn run_project_pool(project_id: Uuid, state: &Arc<AppState>) -> anyhow
 
     let root = std::env::var("GSA_INSTALL_ROOT")
 
-        .unwrap_or_else(|_| r"C:\Users\kingsly\Downloads\GSA_SER_v18.20_FINAL\GSA_SER_v18.20_FINAL".into());
+        .unwrap_or_else(|_| r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install".into());
 
     let roots = vec![std::path::PathBuf::from(root)];
 

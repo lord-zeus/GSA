@@ -803,7 +803,7 @@ mod tests {
         // fully rendered — no `{`, `}`, `|` (top level) or `%url%`/… tokens
         // left raw, and every variant must be anchored by the target page URL.
         let raw = std::fs::read(
-            r"C:\Users\kingsly\Downloads\GSA_SER_v18.20_FINAL\GSA_SER_v18.20_FINAL\Engines\auto_anchor.dat",
+            r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install\Engines\auto_anchor.dat",
         )
         .expect("shipped with GSA on this machine");
         let raw = String::from_utf8_lossy(&raw).into_owned();

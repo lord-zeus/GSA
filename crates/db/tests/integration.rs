@@ -8,7 +8,7 @@ use ser_db::{JobStatus, ResultKind, Repo};
 use engine::enginespec::parse_engine_file;
 
 const GSA_AARDVARK: &str =
-    r"C:\Users\kingsly\Downloads\GSA_SER_v18.20_FINAL\GSA_SER_v18.20_FINAL\Engines\Aardvark Topsites.ini";
+    r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install\Engines\Aardvark Topsites.ini";
 
 async fn pool_or_skip() -> Option<sqlx::PgPool> {
     match ser_db::connect(None).await {

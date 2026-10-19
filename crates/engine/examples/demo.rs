@@ -78,7 +78,7 @@ fn main() {
         "\n=== 3) A real GSA engine file parsed into our typed model ==="
     );
     let aardvark =
-        r"C:\Users\kingsly\Downloads\GSA_SER_v18.20_FINAL\GSA_SER_v18.20_FINAL\Engines\Aardvark Topsites.ini";
+        r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install\Engines\Aardvark Topsites.ini";
     match parse_engine_file(std::path::Path::new(aardvark)) {
         Ok(e) => {
             let steps: Vec<String> = e.steps.iter().map(|s| s.name.clone()).collect();

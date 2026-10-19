@@ -75,6 +75,7 @@ fn ctx(url: &str, kw: &str) -> SubmissionContext {
         proxies: Default::default(),
         // F#15 — empty settings → `job_timeout` falls back to `RunnerConfig::per_job_timeout`.
         settings: std::sync::Arc::new(engine::settings::Settings::default()),
+        ..Default::default()
     }
 }
 #[tokio::test]
@@ -510,6 +511,7 @@ enabled=1"##;
         proxies: Default::default(),
         // F#15 — empty settings → `job_timeout` falls back to `RunnerConfig::per_job_timeout`.
         settings: std::sync::Arc::new(engine::settings::Settings::default()),
+        ..Default::default()
     };
 
     let cfg = RunnerConfig {

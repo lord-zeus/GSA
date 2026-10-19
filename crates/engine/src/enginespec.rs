@@ -337,7 +337,7 @@ link=%url%
     #[test]
     fn parse_real_aardvark_engine_file() {
         let bytes = std::fs::read(
-            r"C:\Users\kingsly\Downloads\GSA_SER_v18.20_FINAL\GSA_SER_v18.20_FINAL\Engines\Aardvark Topsites.ini",
+            r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install\Engines\Aardvark Topsites.ini",
         )
         .expect("file should exist on this machine");
         // GSA ships some engine files in Windows-1252; decode lossily rather

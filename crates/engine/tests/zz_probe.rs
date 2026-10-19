@@ -3,7 +3,7 @@ use std::path::Path;
 
 #[test]
 fn probe_all_gsa_files() {
-    let root = r"C:\Users\kingsly\Downloads\GSA_SER_v18.20_FINAL\GSA_SER_v18.20_FINAL";
+    let root = r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install";
     for dir in ["Engines", "Email_Engines"] {
         let (mut ok, mut bad, mut samples) = (0u32, 0u32, Vec::new());
         for e in std::fs::read_dir(Path::new(root).join(dir)).unwrap() {

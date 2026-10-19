@@ -1,13 +1,15 @@
 //! Feature #3 — engine catalog import, verified against the REAL GSA corpus.
 //!
+//! Uses the v19.06 install (959 web + 93 email = 1,052 engines).
 //! Skipped (not failed) when Postgres or the GSA install is absent.
 
 use ser_db::{Registry, CatalogEngine};
 
 const GSA_ROOT: &str =
-    r"C:\Users\kingsly\Downloads\GSA_SER_v18.20_FINAL\GSA_SER_v18.20_FINAL";
-const WEB_COUNT: u32 = 825;
-const EMAIL_COUNT: u32 = 217;
+    r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install";
+const WEB_COUNT: u32 = 959;
+const EMAIL_COUNT: u32 = 93;
+const TOTAL_COUNT: u32 = 1052;
 
 async fn pool_or_skip() -> Option<sqlx::PgPool> {
     match ser_db::connect(None).await {
@@ -28,7 +30,7 @@ async fn import_full_gsa_corpus_idempotent() {
         return;
     }
 
-    // 1) import the full real corpus (1,042 engines)
+    // 1) import the full real corpus (1,052 engines)
     let s1 = reg.import_gsa_root(GSA_ROOT).await.unwrap();
     assert_eq!(s1.len(), 2, "web + email imports");
     let web = s1.iter().find(|s| s.category == "web").unwrap();
@@ -37,17 +39,17 @@ async fn import_full_gsa_corpus_idempotent() {
     assert_eq!((mail.scanned, mail.imported, mail.failed), (EMAIL_COUNT, EMAIL_COUNT, 0));
 
     let total = reg.count().await.unwrap();
-    assert_eq!(total, 1042, "full corpus in catalog");
+    assert_eq!(total as u32, TOTAL_COUNT, "full corpus in catalog");
 
     // 2) import AGAIN — idempotent: same rows, no duplicates, no drift
     let s2 = reg.import_gsa_root(GSA_ROOT).await.unwrap();
     let web2 = s2.iter().find(|s| s.category == "web").unwrap();
     assert_eq!(web2.imported, WEB_COUNT);
-    assert_eq!(reg.count().await.unwrap(), 1042, "re-import must not duplicate");
+    assert_eq!(reg.count().await.unwrap() as u32, TOTAL_COUNT, "re-import must not duplicate");
 
     // 3) read back a known engine (Aardvark) and check its shape
     let all = reg.list(None, None, 5000, 0).await.unwrap();
-    assert_eq!(all.len(), 1042);
+    assert_eq!(all.len() as u32, TOTAL_COUNT);
     let aardvark = all.iter().find(|e| e.engine_name.eq_ignore_ascii_case("aardvark topsites"))
         .expect("Aardvark Topsites present");
     assert_eq!(aardvark.category, "web");
@@ -72,11 +74,11 @@ async fn import_full_gsa_corpus_idempotent() {
     let found = reg.list(None, Some("aardvark"), 100, 0).await.unwrap();
     assert_eq!(found.len(), 1);
 
-    // 5) breakdown is exhaustive: sums back to 1042
+    // 5) breakdown is exhaustive: sums back to the corpus total
     let bd = reg.type_breakdown().await.unwrap();
     assert!(bd.len() >= 5, "many engine types in corpus; got {bd:?}");
     let sum: i64 = bd.iter().map(|(_, c)| c).sum();
-    assert_eq!(sum, 1042);
+    assert_eq!(sum as u32, TOTAL_COUNT);
 
     // 6) unknown id -> None (no panic)
     assert!(reg.get(9_999_999_999).await.unwrap().is_none());
