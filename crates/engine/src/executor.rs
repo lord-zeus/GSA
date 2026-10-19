@@ -29,7 +29,7 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
-use super::enginespec::{Engine, Step};
+use super::enginespec::{Engine, EngineType, Step};
 use super::spin::{Context, SpintaxResolver};
 
 // ---------------------------------------------------------------------------
@@ -277,9 +277,41 @@ pub struct ExecutionReport {
 /// * Unresolved `%name%` tokens are preserved verbatim *and* recorded in
 ///   [SubmissionPlan::unresolved_fields] so the UI can flag them.
 pub fn resolve_plan(engine: &Engine, input: &SubmissionInput) -> SubmissionPlan {
-    let seed = input.seed.unwrap_or(SpintaxResolver::default().seed());
+    // `seed = None` (direct API calls, test-engine runs) draws a fresh
+    // per-submission seed from wall-clock + pid entropy — matching real
+    // GSA, where every submission re-rolls its spintax.  Pools always pass
+    // an explicit per-job seed, and tests fix one explicitly, so
+    // byte-stable plans are preserved wherever determinism is required.
+    let seed = input.seed.unwrap_or_else(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        SpintaxResolver::default().seed() ^ nanos ^ (std::process::id() as u64).rotate_left(17)
+    });
     let resolver = SpintaxResolver::new(seed);
-    let ctx = input.into_context();
+    let mut ctx = input.into_context();
+    // GSA-style shortener engines (`just download=1`) submit the *long* URL
+    // to services that dedupe — rlu.ru mints the same short code for the
+    // same long URL on every run (observed live 2026-10).  GSA copes by
+    // shipping a `%random%` slug token in each INI's modify-url; many INIs
+    // don't.  We make it engine-generic: append a seed-derived query
+    // fragment to the submitted long URL.  The fragment never changes where
+    // the redirect lands (browsers/services treat `https://site/?gsa_x` and
+    // `https://site/` as the same destination) but it is a distinct URL, so
+    // deduping shortener services issue a fresh code every submission.
+    if engine
+        .steps
+        .iter()
+        .any(|s| flag_truthy(s.field("just download")) && matches!(phase_and_order(&s.name).0, StepPhase::Submit))
+        || engine.engine_type == EngineType::UrlShortener
+    {
+        if let Some(u) = ctx.get("url") {
+            let sep = if u.contains('?') { "&" } else { "?" };
+            let jittered = format!("{}{}gsa_{:06x}", u, sep, seed);
+            ctx.set("url", &jittered);
+        }
+    }
 
     let mut ordered: Vec<StepPlan> = engine
         .steps
@@ -539,6 +571,38 @@ fn step_target_from_modify(step: &StepPlan, base: &str) -> String {
     String::new()
 }
 
+/// Resolve a possibly-relative step target against the plan's base URL
+/// (the engine's `fixed url`).
+///
+/// GSA INIs routinely ship *relative* targets:
+///
+/// * `modify url=/?save=y&url=%url%`      (tighturl.com, ux.nu, ity.im)
+/// * `form url=*create.php`                (0rz.tw, v.gd, tiny.cc — the
+///                                           leading `*` is a GSA glob)
+///
+/// A relative target handed to reqwest/CDP is a "builder error" / invalid
+/// navigation.  Join it against the absolute base; pass absolute targets
+/// straight through.
+fn resolve_against_base(raw: &str, base: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return base.trim().to_string();
+    }
+    if t.starts_with("http://") || t.starts_with("https://") {
+        return t.to_string();
+    }
+    let b = base.trim().trim_end_matches('/');
+    if b.is_empty() {
+        return t.to_string();
+    }
+    let path = t.strip_prefix('*').unwrap_or(t);
+    if path.starts_with('/') {
+        format!("{}{}", b, path)
+    } else {
+        format!("{}/{}", b, path)
+    }
+}
+
 /// Pull the first absolute-URL `<input value="...">` (double or single
 /// quoted) out of `html`.  For a URL-shortener that is the created short
 /// link.  Avoids echo of the submitted (target) URL by preferring a value
@@ -643,9 +707,15 @@ pub async fn execute_plan_with_solver(
         // carries the created (short) link.  Navigate — never POST.
         let mut fields = step.fields.clone();
         let target = if step.just_download {
-            step_target_from_modify(step, &plan.target_url)
+            resolve_against_base(&step_target_from_modify(step, &plan.target_url), &plan.target_url)
         } else {
-            step.nav.navigation_target().unwrap_or_else(|| plan.target_url.clone())
+            resolve_against_base(
+                &step
+                    .nav
+                    .navigation_target()
+                    .unwrap_or_else(|| plan.target_url.clone()),
+                &plan.target_url,
+            )
         };
         let mut res: DriverResponse = if step.just_download || fields.is_empty() {
             driver.navigate(target.clone()).await
@@ -884,8 +954,12 @@ mod tests {
             .find(|(k, _)| k.to_ascii_lowercase() == "url")
             .map(|(_, v)| v.clone());
         // GSA's Aardvark register uses `url=%url%` which resolves to the
-        // project URL.
-        assert_eq!(url_field.as_deref(), Some("https://mysite.example/"));
+        // project URL.  Aardvark's STEP1 is a `just download=1` GET-link
+        // submit that dedupes repeated links, so resolve_plan appends the
+        // deterministic `?gsa_<seed>` anti-dedup fragment to %url%
+        // (test_input seed 0xC0FFEE ⇒ `?gsa_c0ffee`).  Same redirect
+        // target, distinct submission URL.
+        assert_eq!(url_field.as_deref(), Some("https://mysite.example/?gsa_c0ffee"));
         // description=%description_250% → the file's random item (spintax
         // resolved; one of "A really long description about shoes." or
         // "A really short description about shoes.").
@@ -1237,8 +1311,9 @@ captcha failed=captcha does not match
 
         // The navigation target must be the resolved `modify url`, which
         // already embeds the project URL (this is what a browser GETs).
-        let expect_target =
-            "https://3le.ru/includes/actions.php?long_url=https://nordiccomps.com/";
+        // Seed 0xC0FFEE ⇒ deterministic `?gsa_c0ffee` anti-dedup fragment
+        // (shortener improvement: distinct submission per run, same landing).
+        let expect_target = "https://3le.ru/includes/actions.php?long_url=https://nordiccomps.com/?gsa_c0ffee";
         assert_eq!(step_target_from_modify(step, &plan.target_url), expect_target);
 
         // The shortener answers with the created short link in a text input.
@@ -1365,4 +1440,132 @@ captcha failed=captcha does not match
         let t3 = nav3.navigation_target().unwrap();
         assert_eq!(t3, "/relative/path");
     }
+    // ── relative-target joining (FIX: "STEP1: builder error") ────────────
+
+    #[test]
+    fn resolve_against_base_joins_relative_modify_url() {
+        // tighturl.com shape: modify url=/?save=y&url=%url%
+        assert_eq!(
+            resolve_against_base("/?save=y&url=x", "http://tighturl.com/"),
+            "http://tighturl.com/?save=y&url=x"
+        );
+        // ux.nu shape: modify url=/api/short?url=%url%
+        assert_eq!(
+            resolve_against_base("/api/short?url=x", "https://ux.nu"),
+            "https://ux.nu/api/short?url=x"
+        );
+    }
+
+    #[test]
+    fn resolve_against_base_strips_glob_form_url() {
+        // 0rz.tw shape: form url=*create.php
+        assert_eq!(
+            resolve_against_base("*create.php", "http://0rz.tw/"),
+            "http://0rz.tw/create.php"
+        );
+        // v.gd shape: form url=*create.php with base without trailing slash
+        assert_eq!(
+            resolve_against_base("*create.php", "http://v.gd"),
+            "http://v.gd/create.php"
+        );
+    }
+
+    #[test]
+    fn resolve_against_base_passthrough_and_empty() {
+        assert_eq!(
+            resolve_against_base("https://is.gd/create.php?x=1", "http://is.gd/"),
+            "https://is.gd/create.php?x=1"
+        );
+        assert_eq!(resolve_against_base("", "http://b.example/"), "http://b.example/");
+    }
+
+    #[test]
+    fn form_step_with_glob_form_url_resolves_absolute() {
+        // 0rz.tw shape INI: form POST to *create.php — the plan's submit
+        // target must be absolute after the join fix.
+        let ini = r#"
+[setup]
+enabled=1
+url must have=http://0rz.tw/*
+engine type=URL Shortener
+fixed url=http://0rz.tw/
+
+[STEP1]
+submit success=id="link" value="http://0rz.tw/
+form id=redirect-form
+form url=*create.php
+url=%url%
+"#;
+        let eng = parse_engine_str(ini, "0rz").unwrap();
+        let input = SubmissionInput {
+            url: "https://nordiccomps.com/".to_string(),
+            ..Default::default()
+        };
+        let plan = resolve_plan(&eng, &input);
+        let step = &plan.steps[0];
+        let raw = step.nav.navigation_target().unwrap();
+        let target = resolve_against_base(&raw, &plan.target_url);
+        assert_eq!(target, "http://0rz.tw/create.php", "glob form url must join against fixed url");
+    }
+
+    // ── unique-target jitter (FIX: same-URL re-submissions) ──────────────
+
+    #[test]
+    fn shortener_plan_jitters_target_for_deduping_services() {
+        // rlu.ru shape: just-download GET of modify url=...nam=%url%
+        let ini = r#"
+[setup]
+enabled=1
+engine type=URL Shortener
+fixed url=http://rlu.ru/
+
+[URL]
+type=url
+
+[STEP1]
+submit success=http://rlu.ru/?*
+modify url=http://rlu.ru/index.sema?a=ujax&sa=links_add&nam=%url%
+just download=1
+"#;
+        let eng = parse_engine_str(ini, "rlu").unwrap();
+        let mk = |seed: u64| SubmissionInput {
+            url: "https://nordiccomps.com/".to_string(),
+            seed: Some(seed),
+            ..Default::default()
+        };
+        let p1 = resolve_plan(&eng, &mk(0x111));
+        let p2 = resolve_plan(&eng, &mk(0x222));
+        let url1 = p1.steps[0].fields.get("modify url").cloned().unwrap();
+        let url2 = p2.steps[0].fields.get("modify url").cloned().unwrap();
+        assert_eq!(url1, "http://rlu.ru/index.sema?a=ujax&sa=links_add&nam=https://nordiccomps.com/?gsa_000111");
+        assert_eq!(url2, "http://rlu.ru/index.sema?a=ujax&sa=links_add&nam=https://nordiccomps.com/?gsa_000222");
+        assert_ne!(url1, url2, "same long URL must yield distinct submissions");
+    }
+
+    #[test]
+    fn jitter_does_not_touch_non_shortener_engines() {
+        // Article-style engine (POST form, no just download) keeps %url% as-is.
+        let ini = r#"
+[setup]
+enabled=1
+engine type=Article
+fixed url=http://blog.example/
+
+[STEP1]
+submit success=Posted
+form url=*post.php
+url=%url%
+title=T
+"#;
+        let eng = parse_engine_str(ini, "art").unwrap();
+        let input = SubmissionInput {
+            url: "https://nordiccomps.com/".to_string(),
+            seed: Some(0x333),
+            ..Default::default()
+        };
+        let plan = resolve_plan(&eng, &input);
+        let url = plan.steps[0].fields.get("url").cloned().unwrap();
+        assert_eq!(url, "https://nordiccomps.com/");
+    }
+
 }
