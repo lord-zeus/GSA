@@ -104,6 +104,8 @@ pub use driver::{Driver, DriverResponse, MockDriver};
 pub use routing::{DriverKind, required_driver_kind, required_driver_kind_from_text};
 #[cfg(feature = "http")]
 pub use http_driver::{HttpDriver, default_user_agent, form_urlencode};
+#[cfg(feature = "browser")]
+pub use browser_bridge::{CdpError, Transport, WebDriver, WsTransport};
 pub use executor::{
     SubmissionInput, SubmissionPlan, StepPlan, StepNav, StepOutcome, StepOutcomeRef,
     StepPhase, ExecutionReport, resolve_plan, classify_step, extract_result_url, execute_plan,

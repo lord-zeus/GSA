@@ -26,8 +26,9 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # In-process job execution (F#12): run a project's queued jobs via the
 # worker pool + HTTP driver. `http` feature pulls the real reqwest HttpDriver
 # (used for both the plain-form web engines and the WEB-inbox email engines).
+# `browser` pulls the CDP `WebDriver` (WizBridge) for JS-heavy engines.
 runner = { package = "ser-runner", path = "../runner", default-features = false }
-engine = { package = "ser-engine", path = "../engine", default-features = false, features = ["http"] }
+engine = { package = "ser-engine", path = "../engine", default-features = false, features = ["http", "browser"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -1389,6 +1389,85 @@ async fn catalog_stats(State(state): State<Arc<AppState>>) -> Response {
 
 // ── F#12 glue: in-process job execution ────────────────────────────────────
 
+// F#8b — CDP helpers (browser pool).  See the F#8b block in
+// [`run_project_pool`] / [`test_engine_pool`].
+
+/// GET `{base}/json` (CDP target list) and return the first `page`
+/// target's `webSocketDebuggerUrl`.
+use engine::Driver as _;  // F#8b — CDP/HTTP verb calls (navigate)
+
+async fn probe_cdp_pages(base: &str) -> Option<String> {
+    let http = engine::HttpDriver::new();
+    let resp = http.navigate(format!("{base}/json")).await;
+    if !resp.ok {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&resp.html).ok()?;
+    let arr = v.as_array()?;
+    for t in arr {
+        if t.get("type").and_then(|x| x.as_str()) == Some("page") {
+            if let Some(ws) = t.get("webSocketDebuggerUrl").and_then(|x| x.as_str()) {
+                return Some(ws.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a usable CDP `webSocketDebuggerUrl` from `base`:
+/// probe `{base}/json`; if the endpoint isn't up and `base` is one of the
+/// default 127.0.0.1:9222 endpoints, spawn a headless Edge with a dedicated
+/// profile and poll for up to ~15 s.
+async fn browser_ws_endpoint(base: &str) -> Option<String> {
+    let base = base.trim_end_matches('/');
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        return None;
+    }
+    if let Some(ws) = probe_cdp_pages(base).await {
+        return Some(ws);
+    }
+    let is_default = matches!(base, "http://127.0.0.1:9222" | "http://localhost:9222");
+    if !is_default {
+        return None;
+    }
+    // Spawn headless Edge (dedicated profile so the user's session is untouched).
+    let edge = std::env::var("SER_EDGE_PATH")
+        .or_else(|_| {
+            std::env::var("PROGRAMFILES(X86)")
+                .map(|pf| format!("{pf}\\Microsoft\\Edge\\Application\\msedge.exe"))
+        })
+        .or_else(|_| {
+            std::env::var("PROGRAMFILES")
+                .map(|pf| format!("{pf}\\Microsoft\\Edge\\Application\\msedge.exe"))
+        })
+        .unwrap_or_else(|_| {
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe".to_string()
+        });
+    let profile = std::env::temp_dir().join("ser-replica-edge-profile");
+    let _ = std::fs::create_dir_all(&profile);
+    if std::path::Path::new(&edge).exists() {
+        let _child = std::process::Command::new(&edge)
+            .args([
+                "--headless=new",
+                "--remote-debugging-port=9222",
+                "--remote-debugging-address=127.0.0.1",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-gpu",
+            ])
+            .arg(format!("--user-data-dir={}", profile.to_string_lossy()))
+            .spawn();
+    }
+    for _ in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if let Some(ws) = probe_cdp_pages(base).await {
+            return Some(ws);
+        }
+    }
+    None
+}
+
+
 /// POST /api/projects/{id}/run — execute this project's queued `pending`
 
 /// jobs now, in-process, and report how many completed.
@@ -1576,12 +1655,38 @@ pub async fn run_project_pool(project_id: Uuid, state: &Arc<AppState>) -> anyhow
 
 
 
-    let drivers = runner::DriverRegistry::new()
+    let mut drivers = runner::DriverRegistry::new()
 
         .with_http(engine::HttpDriver::new())
 
         .with_email(engine::HttpDriver::new());
 
+    // F#8b — CDP browser pool (GSA's "browser-submit" half): JS-heavy engines
+    // (set unknown variable / page must have / recaptcha / …) route to
+    // `DriverKind::Browser`.  Connect a `WebDriver` to a headless Edge on
+    // `SER_EDGE_CDP` (default http://127.0.0.1:9222), spawning Edge if the
+    // endpoint isn't up.  `SER_EDGE_CDP=0` disables the pool → the previous
+    // clean "driver not registered for kind Browser" behaviour.
+    //
+    // A bound WebDriver owns ONE live page target, so with the browser
+    // driver registered the run serializes (`concurrent_workers = 1`):
+    // interleaving two multi-step engine runs on one page cross-talks.
+    {
+        let base = std::env::var("SER_EDGE_CDP")
+            .unwrap_or_else(|_| "http://127.0.0.1:9222".to_string());
+        if base != "0" {
+            match browser_ws_endpoint(&base).await {
+                Some(ws) => match engine::WebDriver::connect(ws).await {
+                    Ok(wd) => {
+                        drivers = drivers.with_browser(wd);
+                        cfg.concurrent_workers = 1;
+                    }
+                    Err(e) => eprintln!("[browser] CDP ws connect failed: {e}"),
+                },
+                None => eprintln!("[browser] no CDP endpoint at {base} (15s probe) — browser-routed engines will report a clean failure"),
+            }
+        }
+    }
 
 
     let pool = runner::pool_for_disk(state.pool.clone(), cfg, roots, drivers)
@@ -1995,9 +2100,36 @@ async fn test_engine_pool(
     let root = std::env::var("GSA_INSTALL_ROOT")
         .unwrap_or_else(|_| r"C:\Users\kingsly\GSA_SER_portable".into());
     let roots = vec![std::path::PathBuf::from(root)];
-    let drivers = runner::DriverRegistry::new()
+    let mut drivers = runner::DriverRegistry::new()
         .with_http(engine::HttpDriver::new())
         .with_email(engine::HttpDriver::new());
+
+    // F#8b — CDP browser pool (GSA's "browser-submit" half): JS-heavy engines
+    // (set unknown variable / page must have / recaptcha / …) route to
+    // `DriverKind::Browser`.  Connect a `WebDriver` to a headless Edge on
+    // `SER_EDGE_CDP` (default http://127.0.0.1:9222), spawning Edge if the
+    // endpoint isn't up.  `SER_EDGE_CDP=0` disables the pool → the previous
+    // clean "driver not registered for kind Browser" behaviour.
+    //
+    // A bound WebDriver owns ONE live page target, so with the browser
+    // driver registered the run serializes (`concurrent_workers = 1`):
+    // interleaving two multi-step engine runs on one page cross-talks.
+    {
+        let base = std::env::var("SER_EDGE_CDP")
+            .unwrap_or_else(|_| "http://127.0.0.1:9222".to_string());
+        if base != "0" {
+            match browser_ws_endpoint(&base).await {
+                Some(ws) => match engine::WebDriver::connect(ws).await {
+                    Ok(wd) => {
+                        drivers = drivers.with_browser(wd);
+                        cfg.concurrent_workers = 1;
+                    }
+                    Err(e) => eprintln!("[browser] CDP ws connect failed: {e}"),
+                },
+                None => eprintln!("[browser] no CDP endpoint at {base} ({0}s probe) — browser-routed engines will report a clean failure", 15),
+            }
+        }
+    }
 
     let pool = runner::pool_for_disk(state.pool.clone(), cfg, roots, drivers).with_context(ctx);
     let outcome = pool.run_one_job(job.id).await;
