@@ -60,6 +60,10 @@ pub mod site;
 /// engine; gated on `http` because it lives alongside the HTTP driver).
 #[cfg(feature = "http")]
 pub mod proxy_test;
+/// F#24 — proxy-list scraper (GSA "add free proxies from list/source"):
+/// pure `parse_line` / `parse_proxy_list` + `known_sources` + the
+/// network `scrape` (reqwest, gated on `http`).
+pub mod proxy_scraper;
 /// F#14 — Geo/IP (GSA per-proxy country + egress-IP verification).  Pure
 /// value types + parse/validate/select policy; ungated so the logic is
 /// testable without the `http` feature.

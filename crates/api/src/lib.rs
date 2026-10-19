@@ -2144,6 +2144,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/proxies/{id}/verify-geo", post(verify_proxy_geo))
 
         .route("/api/proxies/verify-all", post(verify_all_proxies_geo))
+        .route("/api/proxies/sources", get(proxy_sources))
+        .route("/api/proxies/scrape", post(proxy_scrape))
 
         .route("/api/settings/email", get(get_email_setting).put(put_email_setting))
 
@@ -2509,6 +2511,73 @@ async fn create_proxy(state: State<Arc<AppState>>, body: Json<AddProxyReq>) -> R
 }
 
 
+
+
+// — F#24: proxy list scraper (GSA "add free proxies from list") —
+/// GET /api/proxies/sources — the built-in free-proxy source catalog.
+async fn proxy_sources() -> Response {
+    let list: Vec<serde_json::Value> = engine::proxy_scraper::known_sources()
+        .iter()
+        .map(|s| serde_json::json!({
+            "name": s.name, "url": s.url, "proto": s.proto, "format": s.format,
+        }))
+        .collect();
+    Json(serde_json::json!({ "count": list.len(), "sources": list })).into_response()
+}
+
+/// Inbound for `POST /api/proxies/scrape` — a free-proxy publisher `url` to
+/// fetch + import (parsed rows become DISABLED proxies ready for F#13
+/// `/test` promotion).  `format` is "html" (default for table sites) or
+/// "text" (one endpoint per line).
+#[derive(serde::Deserialize)]
+struct ScrapeBody {
+    url: String,
+    #[serde(default)]
+    format: Option<String>,
+}
+
+/// POST /api/proxies/scrape — fetch a free-proxy source, parse
+/// `host:port` rows, import each as a DISABLED proxy row (uq_proxies_host_port
+/// on conflict = counted as duplicate).  GSA's "add free proxies from list":
+/// scraped rows enter the list disabled; the user tests (F#13) + geo-verifies
+/// (F#14) to promote.
+async fn proxy_scrape(state: State<Arc<AppState>>, Json(body): Json<ScrapeBody>) -> Response {
+    let url = body.url.trim().to_string();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "url must start with http:// or https://"}))).into_response();
+    }
+    let fmt = body.format.as_deref().unwrap_or("text").to_string().to_lowercase();
+    let fmt = if fmt == "html" { "html" } else { "text" };
+
+    let parsed = match engine::proxy_scraper::scrape(&url, fmt).await {
+        Ok(p) => p,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": format!("scrape failed: {e}") }))).into_response();
+        }
+    };
+
+    let repo = Repo::new(state.pool.clone());
+    let mut imported = 0usize;
+    let mut duplicates = 0usize;
+    let mut failed = Vec::new();
+    for p in parsed {
+        match repo.add_proxy(&p.host, p.port as i32, "http", "", "", false, None).await {
+            Ok(_) => imported += 1,
+            Err(e) if is_unique_violation(&e) => duplicates += 1,
+            Err(e) => failed.push(format!("{}:{} — {}", p.host, p.port, e)),
+        }
+    }
+    (StatusCode::OK, Json(serde_json::json!({
+        "url": url,
+        "format": fmt,
+        "parsed": imported + duplicates + failed.len(),
+        "imported": imported,
+        "duplicates": duplicates,
+        "failed": failed,
+    }))).into_response()
+}
 
 async fn delete_proxy(state: State<Arc<AppState>>, Path(id): Path<Uuid>) -> Response {
 
