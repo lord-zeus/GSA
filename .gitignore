@@ -25,3 +25,6 @@ _prefix.txt
 *.swp
 *~
 .DS_Store
+
+# windows nul artifact
+nul

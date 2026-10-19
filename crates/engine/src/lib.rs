@@ -56,6 +56,11 @@ pub mod humanize;
 /// is pure Rust; it owns the pipeline and the driver I/O boundary stays in
 /// the executor (F#6/7 drivers).
 pub mod site;
+/// Stage B — multi-family backlink selection: classify every engine into
+/// Article / Comment / Link and rank the strongest candidate per family so a
+/// run posts the best backlink of each KIND rather than one engine on a
+/// hunch.  Pure core — no `http` gate (testable offline).
+pub mod families;
 /// F#13 — real-socket proxy connectivity check (the `proxy test` endpoint's
 /// engine; gated on `http` because it lives alongside the HTTP driver).
 #[cfg(feature = "http")]
@@ -103,3 +108,4 @@ pub use executor::{
     SubmissionInput, SubmissionPlan, StepPlan, StepNav, StepOutcome, StepOutcomeRef,
     StepPhase, ExecutionReport, resolve_plan, classify_step, extract_result_url, execute_plan,
 };
+pub use families::{CandidateEngine, Family, best_per_family, score as family_score};

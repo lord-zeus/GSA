@@ -180,6 +180,11 @@ pub struct StepPlan {
     pub failed: Vec<String>,
     pub failed_retry: Vec<String>,
     pub captcha_failed: Vec<String>,
+    /// GSA `just download=1` — a navigate-only step (URL-shortener /
+    /// redirect / delete).  The driver GETs the resolved `modify url`
+    /// (which already embeds the target) and reads the result page; no
+    /// form data is POSTed.
+    pub just_download: bool,
 }
 
 /// The phase a [StepPlan] belongs to — drives ordering + UI labels.
@@ -272,7 +277,7 @@ pub fn resolve_plan(engine: &Engine, input: &SubmissionInput) -> SubmissionPlan 
     SubmissionPlan {
         engine_name: engine.name.clone(),
         engine_type: engine.engine_type.to_string(),
-        target_url: engine.url.clone(),
+        target_url: engine.base_url(),
         anchor: input.anchor.clone(),
         seed,
         steps: ordered,
@@ -316,6 +321,16 @@ fn resolve_step(
         failed: StepNav::split(f("submit failed")),
         failed_retry: StepNav::split(f("submit failed retry")),
         captcha_failed: StepNav::split(f("captcha failed")),
+        just_download: flag_truthy(step.field("just download")),
+    }
+}
+
+/// GSA boolean flag (`just download=1`, `dofollow=1`, …): truthy on
+/// `1` / `true` / `yes` / `y`, case-insensitive.
+fn flag_truthy(v: Option<&String>) -> bool {
+    match v {
+        Some(s) => matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "y"),
+        None => false,
     }
 }
 
@@ -400,6 +415,22 @@ pub fn classify_step(step: &StepPlan, html: &str) -> StepOutcomeRef {
 pub fn extract_result_url(step: &StepPlan, html: &str, target: Option<&str>) -> Option<String> {
     use super::extraction::{find_bare_url, find_url};
 
+    // 0. `just download=1` shorteners commonly return the created (short)
+    //    link as the ENTIRE body — a bare absolute URL with no markup
+    //    (e.g. rlu.ru -> `http://rlu.ru/5i1b6`).  Return it directly when
+    //    its host differs from the submitted target (that is the short
+    //    link, not an echo of our own URL).
+    if step.just_download {
+        let t = html.trim();
+        if t.starts_with("http://") || t.starts_with("https://") {
+            if let (Some(uh), Some(th)) = (host_of(t), target.and_then(|x| host_of(x))) {
+                if uh != th {
+                    return Some(t.to_string());
+                }
+            }
+        }
+    }
+
     // 1. Every navigation hint (`find url`, `alternative url`, `modify url`)
     //    is a matcher: pull the first absolute href on the page that contains
     //    it (after stripping glob/star/dot prefixes GSA uses for matches).
@@ -453,7 +484,81 @@ pub fn extract_result_url(step: &StepPlan, html: &str, target: Option<&str>) -> 
             }
         }
     }
-    None
+    // 4. URL-shortener / redirect engines (`just download=1`): the created
+    //    (short) link is returned in a text input — `<input value="https://
+    //    short.tld/abc">` — rather than in an `<a href>`.  Prefer an input
+    //    whose value's host differs from the target's host (that's the
+    //    short link, not the echoed long URL); fall back to the first
+    //    absolute-URL input value.
+    extract_input_value_url(html, target)
+}
+
+/// The navigation target for a `just download=1` step: the *resolved*
+/// `modify url` (which already carries the `%url%` target), else the raw
+/// navigation hint, else the plan's base URL.
+fn step_target_from_modify(step: &StepPlan, base: &str) -> String {
+    if let Some(m) = step.fields.get("modify url") {
+        let t = m.trim();
+        if !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    if let Some(n) = step.nav.navigation_target() {
+        if !n.is_empty() {
+            return n;
+        }
+    }
+    if !base.is_empty() {
+        return base.to_string();
+    }
+    String::new()
+}
+
+/// Pull the first absolute-URL `<input value="...">` (double or single
+/// quoted) out of `html`.  For a URL-shortener that is the created short
+/// link.  Avoids echo of the submitted (target) URL by preferring a value
+/// whose host differs from the target host.
+fn extract_input_value_url(html: &str, target: Option<&str>) -> Option<String> {
+    let target_host = target.and_then(|t| host_of(t));
+    let mut first_any: Option<String> = None;
+    for q in ['"' as char, '\'' as char] {
+        let needle = format!("value={q}");
+        let mut from = 0usize;
+        while let Some(pos) = html[from..].find(&needle) {
+            let start = from + pos + needle.len();
+            if let Some(e) = html[start..].find(q) {
+                let v = html[start..start + e].trim();
+                if v.starts_with("http://") || v.starts_with("https://") {
+                    if let Some(th) = &target_host {
+                        if host_of(v) == Some(th.clone()) {
+                            if first_any.is_none() {
+                                first_any = Some(v.to_string());
+                            }
+                        } else {
+                            return Some(v.to_string());
+                        }
+                    } else if first_any.is_none() {
+                        first_any = Some(v.to_string());
+                    }
+                }
+                from = start + e + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    first_any
+}
+
+/// Bare host (`host[:port]`) of an absolute URL, lowercased.
+fn host_of(u: &str) -> Option<String> {
+    let rest = u.split_once("://")?.1;
+    let host = rest.split('/').next()?.to_string();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -503,12 +608,21 @@ pub async fn execute_plan_with_solver(
         steps: Vec::new(),
     };
     for step in plan.steps.iter() {
-        let target = step.nav.navigation_target().unwrap_or_else(|| plan.target_url.clone());
         // A step that carries form fields is a *submit* step (register /
         // login / step-N); a step without fields is a read-only navigate
         // (e.g. `delete_step1` typically has `just download=1` and no form).
+        //
+        // GSA `just download=1` (URL-shortener / redirect engines): the
+        // resolved `modify url` already embeds the target URL, the engine
+        // expects a plain GET ("download") of it, and the returned page
+        // carries the created (short) link.  Navigate — never POST.
         let mut fields = step.fields.clone();
-        let mut res: DriverResponse = if fields.is_empty() {
+        let target = if step.just_download {
+            step_target_from_modify(step, &plan.target_url)
+        } else {
+            step.nav.navigation_target().unwrap_or_else(|| plan.target_url.clone())
+        };
+        let mut res: DriverResponse = if step.just_download || fields.is_empty() {
             driver.navigate(target.clone()).await
         } else {
             driver.submit(target.clone(), fields.clone(), std::time::Duration::from_secs(30)).await
@@ -523,6 +637,25 @@ pub async fn execute_plan_with_solver(
             continue;
         }
         let mut outcome = classify_step(step, &res.html);
+        // GSA `just download=1` (URL shorteners): the INI's `submit success`
+        // marker is only a hint, and the real signal is "a short link came
+        // back".  If the markers didn't classify the step but we extracted a
+        // distinct short link (host != submitted target), call it a success —
+        // that is exactly what GSA does for the shortener family.
+        if outcome.outcome == super::StepOutcome::Unknown && step.just_download {
+            if let Some(u) = extract_result_url(step, &res.html, Some(&plan.target_url)) {
+                if let (Some(uh), Some(th)) = (host_of(&u), host_of(&plan.target_url)) {
+                    if uh != th {
+                        report.submitted_url = report.submitted_url.clone().or(Some(u.clone()));
+                        report.submitted_url_source = Some(format!("{}: {}", step.name, u));
+                        outcome = StepOutcomeRef {
+                            outcome: StepOutcome::Success,
+                            matched_phrase: Some("short-link-returned".to_string()),
+                        };
+                    }
+                }
+            }
+        }
         // F#21 — captcha pipeline: if this step hit a captcha wall and
         // we have a solver, solve it + re-submit once with the answer.
         let should_solve = outcome.outcome == super::StepOutcome::CaptchaFailed
@@ -685,7 +818,7 @@ mod tests {
 
     fn aardvark_engine() -> Engine {
         let raw = std::fs::read(
-            r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install\Engines\Aardvark Topsites.ini",
+            r"C:\Users\kingsly\GSA_SER_portable\Engines\Aardvark Topsites.ini",
         )
         .expect("Aardvark Topsites.ini must be on this machine");
         // File is Windows-1252; lossy-decode like the real import pipeline does.
@@ -809,6 +942,7 @@ custom=%totally_undefined_variable%
             failed: StepNav::split(Some(failed)),
             failed_retry: Vec::new(),
             captcha_failed: StepNav::split(Some(captcha)),
+            just_download: false,
         }
     }
 
@@ -1035,5 +1169,127 @@ captcha failed=captcha does not match
         // And the retry actually carried the answer into field `code`.
         let second = driver.second_fields.lock().unwrap();
         assert!(second.contains_key("code"), "answer field missing in retry: {:?}", second);
+    }
+
+    // -- F#27 (Stage A) — GSA `just download=1` URL-shortener family ---------
+
+    /// 3le.ru — a real GSA URL-shortener engine.  The executor must:
+    ///  * detect `just download=1` (navigate-only, no form POST),
+    ///  * target the *resolved* `modify url` (carrying the project URL),
+    ///  * base the plan on `fixed url` (3le.ru has no `url=`),
+    ///  * classify `submit success` and extract the created short link
+    ///    from the returned `<input value="...">`.
+    #[tokio::test]
+    async fn just_download_shortener_resolves_navigates_and_extracts_short_link() {
+        let bytes =
+            std::fs::read(r"C:\Users\kingsly\GSA_SER_portable\Engines\3le.ru.ini")
+                .expect("3le.ru.ini must be on this machine");
+        let raw = String::from_utf8_lossy(&bytes).into_owned();
+        let eng = parse_engine_str(&raw, "3le.ru").unwrap();
+
+        // `fixed url` is the site base; `url=` is empty, so base_url() falls back.
+        assert_eq!(eng.base_url(), "https://3le.ru/");
+        assert!(eng.dofollow, "3le.ru is dofollow");
+        assert_eq!(
+            eng.engine_type,
+            crate::enginespec::EngineType::UrlShortener
+        );
+
+        let input = SubmissionInput {
+            url: "https://nordiccomps.com/".to_string(),
+            keyword: "nordiccomps".to_string(),
+            anchor: None,
+            seed: Some(0xC0FFEE),
+            extra: HashMap::new(),
+            files: HashMap::new(),
+            random_options: Vec::new(),
+        };
+        let plan = resolve_plan(&eng, &input);
+        assert_eq!(plan.target_url, "https://3le.ru/");
+        let step = plan.steps.iter().find(|s| s.name.eq_ignore_ascii_case("step1"))
+            .expect("3le.ru has STEP1");
+        assert!(step.just_download, "STEP1 is just download=1");
+
+        // The navigation target must be the resolved `modify url`, which
+        // already embeds the project URL (this is what a browser GETs).
+        let expect_target =
+            "https://3le.ru/includes/actions.php?long_url=https://nordiccomps.com/";
+        assert_eq!(step_target_from_modify(step, &plan.target_url), expect_target);
+
+        // The shortener answers with the created short link in a text input.
+        let driver = MockDriver::with_html(
+            "<html><body>\
+             <input type=\"text\" value=\"https://3le.ru/xyZ9\" />\
+             <a href=\"https://3le.ru/xyZ9\">your short link</a>\
+             </body></html>",
+        );
+        let report = execute_plan(&plan, &driver).await;
+        assert_eq!(report.successful, 1, "submit success must classify Success: {:?}", report);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.submitted_url.as_deref(), Some("https://3le.ru/xyZ9"));
+    }
+
+    /// Regression: the "STEP1: builder error" came from POSTing to an empty
+    /// target (fixed-url shortener had no `form url`).  Now a just-download
+    /// step navigates the populated modify-url, so the driver never sees "".
+    #[tokio::test]
+    async fn just_download_step_never_targets_empty_url() {
+        let bytes =
+            std::fs::read(r"C:\Users\kingsly\GSA_SER_portable\Engines\3le.ru.ini")
+                .expect("3le.ru.ini must be on this machine");
+        let raw = String::from_utf8_lossy(&bytes).into_owned();
+        let eng = parse_engine_str(&raw, "3le.ru").unwrap();
+        let input = SubmissionInput {
+            url: "https://nordiccomps.com/".to_string(),
+            keyword: "nordiccomps".to_string(),
+            anchor: None, seed: Some(1), extra: HashMap::new(),
+            files: HashMap::new(), random_options: Vec::new(),
+        };
+        let plan = resolve_plan(&eng, &input);
+        let step = &plan.steps[0];
+        let t = step_target_from_modify(step, &plan.target_url);
+        assert!(!t.is_empty(), "just-download target must never be empty");
+        assert!(t.starts_with("https://"), "target must be absolute: {t}");
+        // base fallback also non-empty so the plan target_url is usable.
+        assert!(!plan.target_url.is_empty());
+        let _ = eng;
+    }
+
+    /// F#28 — the shortener family where the site returns the created short
+    /// link as the ENTIRE bare body (no `<a href>`, no `<input>`), e.g.
+    /// rlu.ru -> `http://rlu.ru/5i1b6`.  The INI's `submit success` marker
+    /// (`http://rlu.ru/?*`) no longer matches the bare body, so the
+    /// just-download "a distinct short link came back" rule must classify
+    /// it as a success and extract the link.
+    #[tokio::test]
+    async fn bare_body_shortener_classifies_success_and_extracts_link() {
+        let bytes =
+            std::fs::read("C:/Users/kingsly/GSA_SER_portable/Engines/rlu.ru.ini")
+                .expect("rlu.ru.ini must be on this machine");
+        let raw = String::from_utf8_lossy(&bytes).into_owned();
+        let eng = parse_engine_str(&raw, "rlu.ru").unwrap();
+        assert!(eng.dofollow, "rlu.ru is dofollow");
+
+        let input = SubmissionInput {
+            url: "https://nordiccomps.com/".to_string(),
+            keyword: "nordiccomps".to_string(),
+            anchor: None, seed: Some(7), extra: HashMap::new(),
+            files: HashMap::new(), random_options: Vec::new(),
+        };
+        let plan = resolve_plan(&eng, &input);
+        let step = plan.steps.iter().find(|s| s.just_download).expect("rlu.ru STEP1 is just download");
+        // Its `submit success` marker should NOT substring-match the bare body —
+        // this is exactly the case the new fallback covers.
+        let bare = "http://rlu.ru/5i1b6";
+        let outcome = classify_step(step, bare);
+        assert_eq!(outcome.outcome, StepOutcome::Unknown,
+            "marker alone must not classify the bare body: {:?}", outcome);
+
+        let driver = MockDriver::with_html(bare);
+        let report = execute_plan(&plan, &driver).await;
+        assert_eq!(report.successful, 1, "bare-body shortener must succeed: {:?}", report);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.submitted_url.as_deref(), Some("http://rlu.ru/5i1b6"));
+        let _ = bare;
     }
 }

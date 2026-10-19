@@ -9,8 +9,12 @@ use axum::http::{Request, StatusCode};
 use ser_api::{app_state, router};
 use tower::ServiceExt;
 
-const GSA_AARDVARK: &str =
-    r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install\Engines\Aardvark Topsites.ini";
+// Vendored fixture (was a hard-coded C:\Users\...\Downloads path that rotted
+// when the original installer folder was cleaned up — tests must be self-contained).
+const GSA_AARDVARK: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/Aardvark Topsites.ini"
+);
 
 async fn body_to_json(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
     let status = response.status();

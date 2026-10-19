@@ -475,7 +475,7 @@ enabled=1
     #[test]
     fn parses_all_real_gsa_email_engines() {
         let dir = std::env::var("GSA_EMAIL_ENGINES").unwrap_or_else(|_| {
-            "C:/Users/kingsly/Downloads/Compressed/toCrack/ser_setup/install/Email_Engines".to_string()
+            "C:/Users/kingsly/GSA_SER_portable/Email_Engines".to_string()
         });
         let entries: Vec<_> = std::fs::read_dir(&dir)
             .map(|d| d.filter_map(|e| e.ok()).collect())

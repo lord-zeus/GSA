@@ -104,6 +104,10 @@ pub struct Engine {
     pub engine_type: EngineType,
     /// Base URL of the site (e.g. `http://aardvark-topsites.com/`).
     pub url: String,
+    /// GSA `fixed url` — a fixed target site URL.  URL-shortener / redirect
+    /// engines (the `just download=1` family) carry this in place of a
+    /// per-account `url`, so the executor can fall back to it as the base.
+    pub fixed_url: Option<String>,
     /// Whether the created link is dofollow (default false).
     pub dofollow: bool,
     /// Whether the engine registers a fresh account (config: `enabled`).
@@ -120,6 +124,20 @@ impl Engine {
         let target = name.to_ascii_lowercase();
         self.steps.iter().find(|s| s.name.to_ascii_lowercase() == target)
     }
+
+    /// Effective base site URL: `url=` if set, else GSA's `fixed url=`.
+    /// URL-shortener / redirect engines carry `fixed url` and leave `url`
+    /// empty; both address the same site.
+    pub fn base_url(&self) -> String {
+        let u = self.url.trim();
+        if !u.is_empty() {
+            return u.to_string();
+        }
+        self.fixed_url
+            .clone()
+            .filter(|f| !f.trim().is_empty())
+            .unwrap_or_default()
+    }
 }
 
 /// Parse a complete engine `.ini` file on disk.  Reads the bytes and lossy-
@@ -134,6 +152,37 @@ pub fn parse_engine_file(path: &Path) -> Result<Engine, EngineError> {
         .unwrap_or("engine")
         .to_string();
     parse_engine_str(&raw, &name)
+}
+
+/// GSA INI escaping: values are unquoted, so a literal `"` is written as
+/// `\"` (likewise `\'`, and a literal backslash as `\\`).  Downstream, these
+/// values are matched/parsed against *real* HTML, which uses plain quotes —
+/// so we unescape at read time.  Anything else keeps its backslash.
+fn unescape_ini_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    let mut it = v.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.peek() {
+                Some('"') => {
+                    out.push('"');
+                    it.next();
+                }
+                Some('\'') => {
+                    out.push('\'');
+                    it.next();
+                }
+                Some('\\') => {
+                    out.push('\\');
+                    it.next();
+                }
+                _ => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Parse an engine from an in-memory string (used by the tests and import
@@ -156,7 +205,7 @@ pub fn parse_engine_str(raw: &str, engine_name: &str) -> Result<Engine, EngineEr
             continue; // tolerate free-text lines
         };
         let k = k.trim().to_string();
-        let v = v.trim().to_string();
+        let v = unescape_ini_value(v.trim());
         let Some(sec_idx) = sections.iter().rposition(|(n, _)| cur_section.as_deref() == Some(n.as_str()))
         else {
             continue;
@@ -174,6 +223,7 @@ pub fn parse_engine_str(raw: &str, engine_name: &str) -> Result<Engine, EngineEr
         name: engine_name.to_string(),
         engine_type: EngineType::Unknown,
         url: String::new(),
+        fixed_url: None,
         dofollow: false,
         register: false,
         verify_url: None,
@@ -194,12 +244,14 @@ pub fn parse_engine_str(raw: &str, engine_name: &str) -> Result<Engine, EngineEr
             let t = t.and_then(|v| v.parse().ok()).unwrap_or(EngineType::Unknown);
             let u = s.field("url").map(|s| s.clone()).unwrap_or_default();
             let d = s.field("dofollow").map(|b| b != "false").unwrap_or(false);
-            Some((t, u, d))
+            let fu = s.field("fixed url").map(|s| s.clone());
+            Some((t, u, d, fu))
         });
-    if let Some((t, u, d)) = engine_sec {
+    if let Some((t, u, d, fu)) = engine_sec {
         e.engine_type = t;
         e.url = u;
         e.dofollow = d;
+        e.fixed_url = fu;
     }
     let (register, verify_url) = {
         let reg = e
@@ -337,7 +389,7 @@ link=%url%
     #[test]
     fn parse_real_aardvark_engine_file() {
         let bytes = std::fs::read(
-            r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install\Engines\Aardvark Topsites.ini",
+            r"C:\Users\kingsly\GSA_SER_portable\Engines\Aardvark Topsites.ini",
         )
         .expect("file should exist on this machine");
         // GSA ships some engine files in Windows-1252; decode lossily rather

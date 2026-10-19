@@ -90,7 +90,14 @@ const effBusy = ref(false)
 async function loadGlobal() {
   loadError.value = ''
   try {
-    form.value = (await api.settingsGetGlobal()) as GlobalSettings
+    const g = (await api.settingsGetGlobal()) as GlobalSettings
+    // GSA's built-in default captcha solver is the free local arithmetic
+    // solver. A fresh DB returns `null` for captcha_provider, which made the
+    // <select> render completely blank (no option matched) — so first-time
+    // users had an empty dropdown. Normalize to the real default so the
+    // solver control is always usable and matches GSA behaviour.
+    if (g.captcha_provider == null || g.captcha_provider === '') g.captcha_provider = 'local'
+    form.value = g
   } catch (e: any) {
     loadError.value = e.message || String(e)
   }

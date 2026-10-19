@@ -7,8 +7,12 @@
 use ser_db::{JobStatus, ResultKind, Repo};
 use engine::enginespec::parse_engine_file;
 
-const GSA_AARDVARK: &str =
-    r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install\Engines\Aardvark Topsites.ini";
+// Vendored fixture (was a hard-coded C:\Users\...\Downloads path that rotted
+// when the original installer folder was cleaned up — tests must be self-contained).
+const GSA_AARDVARK: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/Aardvark Topsites.ini"
+);
 
 async fn pool_or_skip() -> Option<sqlx::PgPool> {
     match ser_db::connect(None).await {

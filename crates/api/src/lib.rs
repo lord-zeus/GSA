@@ -1293,7 +1293,7 @@ async fn catalog_import(
 
     let gsa_root = std::env::var("GSA_INSTALL_ROOT").unwrap_or_else(|_| {
 
-        r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install".into()
+        r"C:\Users\kingsly\GSA_SER_portable".into()
 
     });
 
@@ -1451,7 +1451,7 @@ pub async fn run_project_pool(project_id: Uuid, state: &Arc<AppState>) -> anyhow
 
     let root = std::env::var("GSA_INSTALL_ROOT")
 
-        .unwrap_or_else(|_| r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install".into());
+        .unwrap_or_else(|_| r"C:\Users\kingsly\GSA_SER_portable".into());
 
     let roots = vec![std::path::PathBuf::from(root)];
 
@@ -1651,6 +1651,233 @@ async fn run_project(State(state): State<Arc<AppState>>, Path(project_id): Path<
 
 
 // ─────────────────────────────────────────────────────────────
+// Stage B — multi-family best-engine selection + mixed run.
+// A SER run posts the BEST backlink of each KIND (article / comment /
+// link) rather than one engine on a hunch: classify every enabled engine
+// into a family, rank the strongest per family (dofollow-first, live,
+// low-friction), and drive each family's best engine(s) against the target.
+// ─────────────────────────────────────────────────────────────
+
+/// One engine the selector is pointing at (its DB id, for enqueue + display).
+#[derive(serde::Serialize, Clone)]
+struct PickedEngine {
+    id: Uuid,
+    name: String,
+    engine_type: String,
+    live: bool,
+}
+
+/// Resolve a stored engine `file_path` (usually relative, e.g. `Engines` + name)
+/// against the GSA install root so `parse_engine_file` finds the file.
+fn resolve_engine_path(file_path: &str) -> std::path::PathBuf {
+    let root = std::env::var("GSA_INSTALL_ROOT")
+        .unwrap_or_else(|_| r"C:\Users\kingsly\GSA_SER_portable".to_string());
+    let p = std::path::Path::new(file_path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::path::PathBuf::from(root).join(file_path)
+    }
+}
+
+/// Liveness check: does this host answer an HTTPS request through the proxy?
+/// Used so the family selector PREFERs live sites over dead ones (the "best
+/// engine for the article" is one that actually responds, not just one with
+/// the fewest fields).
+fn probe_live(host: &str, proxy: &str) -> bool {
+    if host.is_empty() || host.contains('%') {
+        return false;
+    }
+    let mut cmd = std::process::Command::new("curl");
+    cmd.args(["-s", "-o", "/dev/null", "-m", "6", "-w", "%{http_code}", "-A", "Mozilla/5.0"]);
+    if !proxy.is_empty() {
+        cmd.args(["--proxy", &format!("http://{}", proxy)]);
+    }
+    cmd.arg(format!("https://{}/", host));
+    match cmd.output() {
+        Ok(out) => {
+            let code = std::str::from_utf8(&out.stdout).unwrap_or("").trim().to_string();
+            matches!(code.parse::<u16>(), Ok(c) if (200..400).contains(&c))
+        }
+        Err(_) => false,
+    }
+}
+
+/// For each enabled project engine, read its INI to recover dofollow /
+/// just-download / field count, then rank the candidates per family.  Returns
+/// the top-N per family (indices into `picked`) and the parallel `picked`
+/// list so a caller can map index → DB engine id.
+fn build_family_selection(
+    rows: Vec<ser_db::Engine>,
+    per_family: usize,
+    proxy: &str,
+) -> (
+    std::collections::BTreeMap<engine::Family, Vec<usize>>,
+    Vec<PickedEngine>,
+) {
+    use engine::EngineType;
+    let mut cands: Vec<engine::CandidateEngine> = Vec::new();
+    let mut picked: Vec<PickedEngine> = Vec::new();
+    for row in rows.into_iter().filter(|r| r.enabled) {
+        let (dofollow, just_dl, fields, etype, host, live) =
+            match engine::parse_engine_file(resolve_engine_path(&row.file_path).as_path()) {
+                Ok(eng) => {
+                    let host = eng
+                        .base_url()
+                        .split("://")
+                        .nth(1)
+                        .map(|h| h.split('/').next().unwrap_or(h))
+                        .unwrap_or("")
+                        .to_string();
+                    let fields = eng.steps.iter().map(|s| s.fields.len()).sum::<usize>();
+                    let (df, jd, et) = (eng.dofollow, eng.fixed_url.is_some(), eng.engine_type);
+                    (df, jd, fields, et, host.clone(), probe_live(&host, proxy))
+                }
+                Err(_) => (false, false, 0_usize, EngineType::Unknown, String::new(), false),
+            };
+        cands.push(engine::CandidateEngine {
+            engine_name: row.engine_name.clone(),
+            engine_type: etype,
+            dofollow,
+            field_count: fields,
+            just_download: just_dl,
+            is_enabled: true,
+            is_live: Some(live),
+        });
+        picked.push(PickedEngine {
+            id: row.id,
+            name: row.engine_name,
+            engine_type: row.engine_type,
+            live,
+        });
+    }
+    let sel = engine::best_per_family(&cands, per_family);
+    (sel, picked)
+}
+
+/// Preferred proxy for liveness probes: the first enabled project proxy
+/// (host:port), or empty for direct access.
+async fn first_proxy(repo: &Repo) -> String {
+    repo.list_enabled_proxies()
+        .await
+        .ok()
+        .into_iter()
+        .flatten()
+        .next()
+        .map(|p| format!("{}:{}", p.host, p.port))
+        .unwrap_or_default()
+}
+
+/// Optional `?per=N` cap on how many engines per family (default 2).
+#[derive(Deserialize)]
+struct PerFamilyQ {
+    #[serde(default)]
+    per: Option<usize>,
+}
+
+fn per_from_query(q: &PerFamilyQ) -> usize {
+    q.per.map(|n| n.clamp(1, 10)).unwrap_or(2)
+}
+
+/// DRY — which engines WOULD be picked per family for this project (best-
+/// engine-per-family), without enqueueing or running anything.
+async fn family_plan(
+    Path(project_id): Path<Uuid>,
+    Query(q): Query<PerFamilyQ>,
+    state: State<Arc<AppState>>,
+) -> Response {
+    let repo = Repo::new(state.pool.clone());
+    match repo.list_engines_all(project_id).await {
+        Ok(rows) => {
+            let per = per_from_query(&q);
+            let (sel, picked) = build_family_selection(rows, per, &first_proxy(&repo).await);
+            let families: std::collections::BTreeMap<String, Vec<PickedEngine>> = sel
+                .into_iter()
+                .map(|(fam, idxs)| {
+                    let engines: Vec<PickedEngine> = idxs
+                        .iter()
+                        .filter_map(|&i| picked.get(i).cloned())
+                        .collect();
+                    (fam.as_str().to_string(), engines)
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "per_family": per,
+                    "families": families,
+                    "total_selected": families.values().map(Vec::len).sum::<usize>(),
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => error_response(e),
+    }
+}
+
+/// Stage B run — enqueue the best engine of EACH family (article / comment /
+/// link) crossed with every project keyword, then drive the pool.  This is
+/// the "post the best backlink of each kind" flow the project actually wants.
+async fn run_mixed(
+    Path(project_id): Path<Uuid>,
+    Query(q): Query<PerFamilyQ>,
+    state: State<Arc<AppState>>,
+) -> Response {
+    let repo = Repo::new(state.pool.clone());
+    let (rows, kws) = match (
+        repo.list_engines_all(project_id).await,
+        repo.list_keywords(project_id).await,
+    ) {
+        (Ok(r), Ok(k)) => (r, k),
+        (Err(e), _) | (_, Err(e)) => return error_response(e),
+    };
+
+    let per = per_from_query(&q);
+    let (sel, picked) = build_family_selection(rows, per, &first_proxy(&repo).await);
+    if sel.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "nothing-to-run",
+                "reason": "no enabled engine maps to a posting family (article/comment/link)",
+            })),
+        )
+            .into_response();
+    }
+
+    let mut enqueued = 0usize;
+    for idxs in sel.values() {
+        for &i in idxs {
+            if let Some(ep) = picked.get(i) {
+                for kw in &kws {
+                    if repo
+                        .create_job(project_id, Some(ep.id), Some(kw.id))
+                        .await
+                        .is_ok()
+                    {
+                        enqueued += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    match run_project_pool(project_id, &state).await {
+        Ok(v) => {
+            let mut v = v;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("multi_family".to_string(), serde_json::json!(true));
+                obj.insert("per_family".to_string(), serde_json::json!(per));
+                obj.insert("enqueued_jobs".to_string(), serde_json::json!(enqueued));
+            }
+            (StatusCode::OK, Json(v)).into_response()
+        }
+        Err(e) => error_response(e),
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────
 // F#26 — Polish: Notes / Color / Pause-after-N + Test dry-run.
 // ─────────────────────────────────────────────────────────────
 
@@ -1766,7 +1993,7 @@ async fn test_engine_pool(
     };
 
     let root = std::env::var("GSA_INSTALL_ROOT")
-        .unwrap_or_else(|_| r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install".into());
+        .unwrap_or_else(|_| r"C:\Users\kingsly\GSA_SER_portable".into());
     let roots = vec![std::path::PathBuf::from(root)];
     let drivers = runner::DriverRegistry::new()
         .with_http(engine::HttpDriver::new())
@@ -2357,6 +2584,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         // pause, and the per-engine "Test" dry-run (drive one engine, no DB
         // side effects).
         .route("/api/projects/{id}/test-engine", post(test_engine))
+        // Stage B — multi-family best-engine selection (dry) + mixed run.
+        .route("/api/projects/{id}/family-plan", get(family_plan))
+        .route("/api/projects/{id}/run-mixed", post(run_mixed))
         .route("/api/projects/{id}/pause-after", put(set_project_pause_after))
         .route("/api/projects/{id}/polish", patch(set_project_polish))
         .route("/api/projects/{id}/resume", post(resume_project))
