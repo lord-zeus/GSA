@@ -319,6 +319,113 @@ async function saveMailbox() {
   }
 }
 
+// — F#26: Polish (notes · color · pause-after-N) —
+const polishNotes = ref('')
+const polishColor = ref('')
+const polishPauseAfter = ref(0)
+const polishSaved = ref(false)
+const polishSaving = ref(false)
+const polishErr = ref<string | null>(null)
+const isPaused = ref(false)
+const resuming = ref(false)
+const resumeMsg = ref('')
+
+async function loadPolish(projectId: string) {
+  polishSaved.value = false
+  isPaused.value = false
+  try {
+    const p: any = await api.projectGet(projectId)
+    polishNotes.value = p.notes || ''
+    polishColor.value = p.color || ''
+    polishPauseAfter.value = p.pause_after ?? 0
+    isPaused.value = !!p.paused_at
+    polishErr.value = null
+  } catch (e: any) {
+    polishErr.value = e?.message ?? String(e)
+  }
+}
+
+async function savePolish() {
+  if (!selected.value) return
+  polishSaving.value = true
+  polishSaved.value = false
+  try {
+    const p: any = await api.projectSetPolish(selected.value, {
+      notes: polishNotes.value.trim(),
+      color: polishColor.value || null,
+      pause_after: polishPauseAfter.value || null,
+    })
+    isPaused.value = !!p.paused_at
+    polishSaved.value = true
+    polishErr.value = null
+    setTimeout(() => (polishSaved.value = false), 2000)
+  } catch (e: any) {
+    polishErr.value = e?.message ?? String(e)
+  } finally {
+    polishSaving.value = false
+  }
+}
+
+async function resumeRun() {
+  if (!selected.value) return
+  resuming.value = true
+  resumeMsg.value = ''
+  try {
+    const p: any = await api.projectResume(selected.value)
+    isPaused.value = !!p.paused_at
+    resumeMsg.value = 'Cleared — the run can continue.'
+    setTimeout(() => (resumeMsg.value = ''), 3000)
+  } catch (e: any) {
+    resumeMsg.value = e?.message ?? String(e)
+  } finally {
+    resuming.value = false
+  }
+}
+
+// — F#26: Test engine (dry run) —
+const testRunning = ref('')
+const testResult = ref<{
+  engineId: string
+  success: boolean
+  message: string | null
+  url: string | null
+  anchor: string | null
+  attempts: number
+  elapsed_ms: number
+} | null>(null)
+
+async function testEngine(id: string) {
+  if (!selected.value) return
+  testRunning.value = id
+  testResult.value = null
+  try {
+    const r = await api.projectTestEngine(selected.value, id)
+    const rep = r.report
+    const successful = rep?.successful ?? 0
+    const failed = rep?.failed ?? 0
+    const errs: string[] = (rep?.errors ?? []).slice(0, 3)
+    const ok = !r.error && successful > 0
+    let message: string
+    if (r.error) message = r.error
+    else if (successful > 0) message = `Submitted OK — ${successful} success${failed ? `, ${failed} failed` : ''}${rep?.captcha_failed ? ` (${rep.captcha_failed} captcha failures)` : ''}`
+    else message = `No submission succeeded — ${errs.join(' · ') || `${failed} failure(s), ${rep?.retried ?? 0} retried`}`
+    testResult.value = {
+      engineId: id,
+      success: ok,
+      message,
+      url: rep?.submitted_url || null,
+      anchor: null,
+      attempts: (rep?.successful ?? 0) + (rep?.failed ?? 0) + (rep?.retried ?? 0),
+      elapsed_ms: 0,
+    }
+    await loadPolish(selected.value)
+  } catch (e: any) {
+    testResult.value = { engineId: id, success: false, message: e?.message ?? String(e), url: null, anchor: null, attempts: 0, elapsed_ms: 0 }
+  } finally {
+    testRunning.value = ''
+  }
+}
+
 // — F#13: per-project `use_proxies` gate —
 const useProxies = ref(false)
 const useProxiesLoaded = ref(false)
@@ -423,6 +530,7 @@ async function load() {
       loadCatalog()
       loadMailbox()
       loadUseProxies(selected.value)
+      loadPolish(selected.value)
     }
   }
 }
@@ -434,6 +542,7 @@ async function selectProject(p: Project) {
   loadJobs()
   loadResults()
   loadUseProxies(p.id)
+  loadPolish(p.id)
 }
 
 async function createProject() {
@@ -508,6 +617,8 @@ function onProjectChange() {
   loadKeywords()
   loadJobs()
   loadResults()
+  loadUseProxies(selected.value)
+  loadPolish(selected.value)
   if (tab.value === 'options') loadProjectOptions()
 }
 
@@ -803,12 +914,49 @@ function cls(status: string) {
                   />
                 </td>
                 <td style="white-space:nowrap">
+                  <button
+                    class="muted"
+                    :disabled="!!testRunning"
+                    title="dry-run this engine end-to-end (no results saved)"
+                    @click="testEngine(e.id)"
+                  >{{ testRunning === e.id ? 'testing…' : '▶ test' }}</button>
                   <button class="muted" title="edit" @click="startEditEngine(e)">✎</button>
                   <button class="muted" title="delete" @click="deleteEngine(e)">✕</button>
                 </td>
               </tr>
             </tbody>
           </table>
+        </div>
+
+        <!-- F#26: test-engine result -->
+        <div
+          v-if="testResult"
+          class="card"
+          style="margin-top:10px"
+          :style="testResult.success ? 'border:1.5px solid rgba(22,163,74,.5)' : 'border:1.5px solid rgba(239,68,68,.5)'"
+        >
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+            <div>
+              <strong :style="testResult.success ? 'color:#22c55e' : 'color:#ef4444'">
+                {{ testResult.success ? '✓ Test succeeded' : '✗ Test failed' }}
+              </strong>
+              <span class="muted" style="font-size:12px;margin-left:8px">
+                {{ engines.find((e) => e.id === testResult!.engineId)?.engine_name || testResult.engineId }}
+              </span>
+            </div>
+            <span class="muted mono" style="font-size:12px">{{ testResult.attempts }} check{{ testResult.attempts === 1 ? '' : 's' }}</span>
+          </div>
+          <div class="muted" style="margin-top:6px;font-size:13px">
+            <span v-if="testResult.message">{{ testResult.message }}</span>
+            <span v-else>no message</span>
+          </div>
+          <div class="row" style="gap:12px;margin-top:6px;font-size:12px;flex-wrap:wrap" v-if="testResult.url || testResult.anchor">
+            <span v-if="testResult.anchor"><span class="muted">anchor:</span> {{ testResult.anchor }}</span>
+            <a v-if="testResult.url" :href="testResult.url" target="_blank" rel="noreferrer" style="color:#60a5fa">{{ testResult.url }}</a>
+          </div>
+          <div style="margin-top:8px">
+            <button class="muted" @click="testResult = null">close</button>
+          </div>
         </div>
 
         <div v-if="editEngine" class="card" style="margin-top:10px">
@@ -884,6 +1032,71 @@ function cls(status: string) {
                 {{ useProxies ? 'PROXIES ON' : 'proxies off' }}
               </label>
               <a class="muted" href="/proxies">manage proxies →</a>
+            </div>
+          </div>
+        </div>
+
+        <!-- F#26: Polish (notes · color · pause-after-N) -->
+        <div class="card" style="margin-top:12px;border:1.5px solid rgba(168,85,247,.45)">
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:20px;flex-wrap:wrap">
+            <div style="flex:1;min-width:280px">
+              <strong>🎨 Polish — notes, color tag, and run ceiling (F#26)</strong>
+              <p class="muted" style="margin:3px 0 0;max-width:70vw">
+                Sticky metadata for this project (like GSA's project notes + color dot) plus a
+                <em>pause-after-N</em> ceiling: when a run succeeds this many submissions it stops
+                automatically (the rest stays queued) so you can review, then <em>resume</em>.
+              </p>
+
+              <div style="display:flex;gap:16px;margin-top:12px;flex-wrap:wrap;align-items:flex-end">
+                <label style="flex:1;min-width:240px;display:flex;flex-direction:column;gap:4px">
+                  <span class="muted">Notes</span>
+                  <textarea
+                    v-model="polishNotes"
+                    rows="2"
+                    placeholder="internal note — this project targets …"
+                    style="width:100%;font-family:inherit;resize:vertical"
+                  ></textarea>
+                </label>
+                <label style="display:flex;flex-direction:column;gap:4px">
+                  <span class="muted">Color tag</span>
+                  <input
+                    type="color"
+                    v-model="polishColor"
+                    :style="{ width:'52px', height:'34px', padding:'2px', background:'transparent', border:'1px solid #2a2f3a', borderRadius:'8px', cursor:'pointer' }"
+                  />
+                </label>
+                <label style="display:flex;flex-direction:column;gap:4px;min-width:150px">
+                  <span class="muted">Pause after N successes (0 = no limit)</span>
+                  <input
+                    type="number"
+                    min="0"
+                    v-model.number="polishPauseAfter"
+                    placeholder="0"
+                    style="width:150px"
+                  />
+                </label>
+              </div>
+            </div>
+
+            <div style="display:flex;flex-direction:column;gap:8px;align-items:stretch">
+              <div class="row" style="gap:10px;align-items:center">
+                <button style="padding:8px 16px" :disabled="polishSaving" @click="savePolish">
+                  {{ polishSaving ? 'Saving…' : (polishSaved ? '✓ Saved' : 'Save polish') }}
+                </button>
+                <button
+                  class="muted"
+                  :disabled="resuming || !isPaused"
+                  @click="resumeRun"
+                  :title="isPaused ? 'clear the pause ceiling and let the run continue' : 'set a pause-after-N ceiling first'"
+                >
+                  {{ resuming ? 'Clearing…' : '▶ Resume' }}
+                </button>
+              </div>
+              <span v-if="isPaused" style="color:#f59e0b;font-weight:600;font-size:13px">
+                ⏸ This project is PAUSED — run halted at the ceiling; resume to continue.
+              </span>
+              <span v-if="resumeMsg" class="muted" style="font-size:12px">{{ resumeMsg }}</span>
+              <span v-if="polishErr" style="color:#ef4444;font-size:12px">{{ polishErr }}</span>
             </div>
           </div>
         </div>

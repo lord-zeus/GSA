@@ -35,6 +35,11 @@ pub struct PoolSummary {
     pub failed: usize,
     /// Worker tasks that panicked (crash isolation caught them).
     pub panics: usize,
+    /// F#26 — count of jobs that completed `done` AND submitted at least one
+    /// successful link. The leader uses this against `pause_after` to
+    /// soft-stop a run once the ceiling is reached (remaining pending jobs
+    /// stay queued for the next run).
+    pub successful: usize,
     /// Wall-clock runtime of the whole pool run.
     pub duration: std::time::Duration,
 }
@@ -49,6 +54,10 @@ pub struct WorkerPool {
     spec: SpecSource,
     drivers: Arc<DriverRegistry>,
     ctx: crate::execute::SubmissionContext,
+    /// F#26 — Pause after N: soft-stop a single pool run once this many
+    /// successful submissions have happened (0 / None = run to completion,
+    /// the default). Mirrors `projects.pause_after`; set via `with_pause_after`.
+    pause_after: usize,
 }
 
 impl WorkerPool {
@@ -65,13 +74,54 @@ impl WorkerPool {
             spec,
             drivers: Arc::new(drivers),
             ctx: Default::default(),
+            pause_after: 0,
         }
+    }
+
+    /// F#26 — set the Pause-after-N ceiling for this pool run. `0` (the
+    /// default) means "run to completion" — the previous behavior.
+    pub fn with_pause_after(mut self, pause_after: usize) -> Self {
+        self.pause_after = pause_after.max(0);
+        self
     }
 
     /// Attach the project-level context (target URL, keyword, files, seed).
     pub fn with_context(mut self, ctx: crate::execute::SubmissionContext) -> Self {
         self.ctx = ctx;
         self
+    }
+
+    /// F#26 — Test Button: drive ONE already-created job end-to-end using
+    /// the same worker path a pool worker uses (atomic claim → runner →
+    /// finish), but without spawning a worker pool. `Err(None)` if the job
+    /// was claimed by another worker (race), `Err(Some(e))` on failure.
+    /// Returns the `JobOutcome` on success.
+    ///
+    /// Used by the API's `POST /api/projects/{id}/test-engine` so a single
+    /// engine can be exercised end-to-end (spec → plan → executor → captcha)
+    /// in `dry_run` mode (see [`crate::execute::SubmissionContext::dry_run`])
+    /// without any side effects on the real `results` table.
+    pub async fn run_one_job(&self, job_id: Uuid) -> anyhow::Result<crate::execute::JobOutcome> {
+        let repo = ser_db::Repo::new(self.db.clone());
+        let job = repo
+            .claim_by_id(job_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("job {job_id} already claimed or terminal"))?;
+        let cfg = self.cfg.clone();
+        let spec = self.spec.clone();
+        let drivers = Arc::clone(&self.drivers);
+        let ctx = self.ctx.clone();
+        let runner = crate::execute::JobRunner::new(cfg, spec, drivers, ctx);
+        let timeout = self.cfg.per_job_timeout;
+        match tokio::time::timeout(timeout, runner.run_one(&repo, &job)).await {
+            Ok(outcome) => Ok(outcome),
+            Err(_) => {
+                let _ = repo
+                    .finish_job(job_id, ser_db::JobStatus::Failed, Some("run_one_job timeout"))
+                    .await;
+                Err(anyhow::anyhow!("worker-side timeout (outer)"))
+            }
+        }
     }
 
     /// Run until the project's `jobs` table has no `pending` rows.
@@ -95,18 +145,47 @@ impl WorkerPool {
         }
 
         let summary = Arc::new(std::sync::Mutex::new(PoolSummary::default()));
+        // F#26 — pause-after-N: a shared atomic count of successful
+        // submissions. Workers increment it (lock-free) and the leader
+        // reads it between batches to decide when to soft-stop.
+        let successful = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut set = JoinSet::new();
         for rx in receivers {
-            set.spawn(worker_loop(self.clone(), Arc::clone(&summary), rx));
+            set.spawn(worker_loop(
+                self.clone(),
+                Arc::clone(&summary),
+                Some(Arc::clone(&successful)),
+                rx,
+            ));
         }
 
         // Leader: pull pending ids, dispatch round-robin, until the
         // queue drains.  After the loop, drop every sender so each
         // worker's `recv()` returns None and the worker exits.
+        let mut dispatched = 0usize;
         {
             let repo = ser_db::Repo::new(self.db.clone());
+            let pause_after = self.pause_after;
             let mut next = 0usize;
             loop {
+                // F#26 — Pause after N: soft-stop BEFORE dispatching the next
+                // batch once the shared successful count has reached the
+                // project's ceiling. In-flight workers finish (already
+                // claimed), but no new jobs are claimed, so the remaining
+                // pending jobs stay queued for the next run. We also flag the
+                // project `paused_at=now()` so the UI can show "paused
+                // after N".
+                if pause_after > 0 && successful.load(std::sync::atomic::Ordering::Acquire) >= pause_after {
+                    if dispatched > 0 {
+                        let _ = repo.set_project_paused(project_id, true).await;
+                        let in_flight = successful.load(std::sync::atomic::Ordering::Acquire);
+                        eprintln!(
+                            "runner: paused after {pause_after} successful submissions; {dispatched} dispatched this run; {in_flight} in flight"
+                        );
+                    }
+                    break;
+                }
+
                 let jobs = match repo
                     .list_jobs(project_id, Some(ser_db::JobStatus::Pending))
                     .await
@@ -127,6 +206,7 @@ impl WorkerPool {
                         break; // that worker is gone; the rest will be
                         // unblocked by the drop below anyway.
                     }
+                    dispatched += 1;
                 }
                 tokio::time::sleep(self.cfg.leader_idle_timeout).await;
             }
@@ -155,14 +235,21 @@ impl WorkerPool {
 
         let mut s = summary.lock().unwrap();
         s.panics = panics;
+        s.successful = successful.load(std::sync::atomic::Ordering::Acquire);
         s.duration = started.elapsed();
         *s
     }
 }
 
 /// One worker's loop: pull `job_id` over the channel, claim atomically,
-/// run the job, persist, continue.
-async fn worker_loop(pool: WorkerPool, summary: Arc<std::sync::Mutex<PoolSummary>>, mut rx: mpsc::Receiver<Uuid>) {
+/// run the job, persist, continue. `successful` (F#26) is the shared
+/// pause-after counter — `None` in tests that don't need it.
+async fn worker_loop(
+    pool: WorkerPool,
+    summary: Arc<std::sync::Mutex<PoolSummary>>,
+    successful: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    mut rx: mpsc::Receiver<Uuid>,
+) {
     let cfg = pool.cfg.clone();
     let spec = pool.spec.clone();
     let drivers = Arc::clone(&pool.drivers);
@@ -217,6 +304,15 @@ async fn worker_loop(pool: WorkerPool, summary: Arc<std::sync::Mutex<PoolSummary
             s.done += 1;
         } else {
             s.failed += 1;
+        }
+        drop(s);
+
+        // F#26 — Pause-after-N: count this job toward the ceiling iff it
+        // actually submitted ≥1 link (the same condition as a `done` job).
+        if successful.is_some() && outcome.successful() {
+            if let Some(counter) = successful.as_ref() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
         }
     }
 }

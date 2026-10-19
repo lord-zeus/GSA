@@ -71,6 +71,12 @@ pub struct SubmissionContext {
     /// downstream tier projects import). Default `false` to keep old-test
     /// behavior; set per project from `projects.auto_export`.
     pub auto_export: bool,
+    /// F#26 — Test Button (GSA "Test" per engine): when `true`, the runner
+    /// drives the engine end-to-end (spec → plan → executor → captcha) but
+    /// **persists nothing** — no job status flip, no `results` row, no
+    /// auto-export CSV append. Used by the UI "Test engine" dry-run so a
+    /// single submission can be observed without polluting a real run's data.
+    pub dry_run: bool,
 }
 
 /// The terminal state of one job's execution.
@@ -577,6 +583,18 @@ impl JobRunner {
         proxy_used: Option<&str>,
     ) -> JobOutcome {
         let status = if done { ser_db::JobStatus::Done } else { ser_db::JobStatus::Failed };
+
+        // F#26 — Test Button: drive the engine end-to-end but persist
+        // nothing. The API caller deletes the transient job afterward.
+        if self.ctx.dry_run {
+            return JobOutcome {
+                job_id,
+                status: if done { "done" } else { "failed" },
+                report,
+                driver_error: err,
+            };
+        }
+
         let _ = repo
             .finish_job(job_id, status, err.as_deref())
             .await;

@@ -45,6 +45,20 @@ pub struct Project {
     /// and F#24-lite linkwheel (upstream verified URLs) to it per job.
     #[serde(default)]
     pub url: String,
+    /// F#26 — GSA "Notes" free text (shown on the project card / export header).
+    #[serde(default)]
+    pub notes: String,
+    /// F#26 — GSA "Custom Project Color" (a CSS hex like `#4f9d5d`; UI only).
+    #[serde(default)]
+    pub color: String,
+    /// F#26 — GSA "Pause after N submissions": soft-stop a single pool run once
+    /// this many successful links have been submitted (0 / None = no pause).
+    #[serde(default)]
+    pub pause_after: i32,
+    /// F#26 — set by the pool the moment it hits the pause_after ceiling so the
+    /// UI can show "paused after N" and the remaining pending jobs stay queued.
+    #[serde(default)]
+    pub paused_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

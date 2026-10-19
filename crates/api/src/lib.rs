@@ -41,7 +41,7 @@ pub mod livebus;
 /// F#18 — the single emission funnel (persist → broadcast → email).
 pub mod notifier;
 
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 
 use axum::{Json, Router};
 
@@ -1584,7 +1584,9 @@ pub async fn run_project_pool(project_id: Uuid, state: &Arc<AppState>) -> anyhow
 
 
 
-    let pool = runner::pool_for_disk(state.pool.clone(), cfg, roots, drivers).with_context(ctx);
+    let pool = runner::pool_for_disk(state.pool.clone(), cfg, roots, drivers)
+        .with_context(ctx)
+        .with_pause_after(project_row.as_ref().map(|p| p.pause_after as usize).unwrap_or(0));
 
 
     // F#18 — time the run so the alert can carry a duration.
@@ -1643,6 +1645,228 @@ async fn run_project(State(state): State<Arc<AppState>>, Path(project_id): Path<
 
     match run_project_pool(project_id, &state).await {
         Ok(v) => Json(v).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// F#26 — Polish: Notes / Color / Pause-after-N + Test dry-run.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct TestEngineBody {
+    engine_id: Uuid,
+    /// Optional: which keyword to submit for the dry run. `None` = the
+    /// project's first keyword (if any).
+    #[serde(default)]
+    keyword_id: Option<Uuid>,
+}
+
+/// F#26 — Test Button (GSA "Test" per engine): drive ONE engine against
+/// the live target end-to-end (spec → plan → executor → captcha) WITHOUT
+/// persisting any `results` row, job status, or auto-export CSV append.
+///
+/// The API creates a transient job (the runner needs a real row to read
+/// its file path + keyword id), runs it in `dry_run` mode via
+/// `WorkerPool::run_one_job`, then marks it `cancelled` so the pool does
+/// NOT pick it up on the next run. Returns the execution report as JSON
+/// so the UI can show `{success, error?, steps, captcha_failed, ...}`.
+///
+/// This is the GSA "Test" button — it tells you *whether the engine
+/// works* before you burn real run slots on it.
+async fn test_engine(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    Json(body): Json<TestEngineBody>,
+) -> Response {
+    match test_engine_pool(project_id, body, &state).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn test_engine_pool(
+    project_id: Uuid,
+    body: TestEngineBody,
+    state: &Arc<AppState>,
+) -> anyhow::Result<serde_json::Value> {
+    let repo = Repo::new(state.pool.clone());
+
+    // 1) Create the transient job. If there's no engine for this project
+    //    yet, `create_job` still works — the runner errors out on the
+    //    "spec missing" path and the outcome reflects that.
+    let job = repo.create_job(project_id, Some(body.engine_id), body.keyword_id).await?;
+
+    // 2) Build a context mirroring `run_project_pool`, with `dry_run=true`
+    //    and `auto_export=false` (a test should not append to the CSV).
+    let (email_address, email_password) = repo.email_mailbox().await.unwrap_or_default();
+    let global_settings = repo.global_settings().await.unwrap_or_default();
+    let mut cfg = runner::RunnerConfig::default();
+    cfg.concurrent_workers = 1; // one worker — we're testing one engine
+    cfg.per_job_timeout = std::time::Duration::from_secs(
+        global_settings.max_submit_seconds.unwrap_or(90).clamp(1, 3600) as u64,
+    );
+    cfg.leader_idle_timeout = std::time::Duration::from_millis(800);
+
+    let project_row = repo.project_by_id(project_id).await.ok().flatten();
+    let use_proxies = repo
+        .project_use_proxies(project_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    let proxies: Vec<engine::proxy::ProxySpec> = if use_proxies {
+        repo.list_enabled_proxies()
+            .await
+            .map(|list| {
+                list.into_iter()
+                    .map(|p| engine::proxy::ProxySpec {
+                        host: p.host,
+                        port: p.port as u16,
+                        proxy_kind: p.proxy_kind,
+                        login: p.login,
+                        password: p.password,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let ctx = runner::SubmissionContext {
+        email_address,
+        email_password,
+        proxies,
+        settings: std::sync::Arc::new(global_settings.clamped_ref()),
+        project_id,
+        project_url: project_row.as_ref().map(|p| p.url.clone()).unwrap_or_default(),
+        anchor: project_row
+            .as_ref()
+            .and_then(|p| p.anchor_mix.as_deref())
+            .and_then(|s| serde_json::from_str::<engine::anchor::PoolConfig>(s).ok())
+            .filter(|c| !c.is_empty()),
+        url_options: engine::anchor::UrlOptions {
+            use_random_url: project_row.as_ref().map(|p| p.use_random_url).unwrap_or(false),
+            url_variations: u32::try_from(project_row.as_ref().map(|p| p.url_variations).unwrap_or(0))
+                .unwrap_or(0),
+            root_url: u32::try_from(project_row.as_ref().map(|p| p.root_url).unwrap_or(0))
+                .unwrap_or(0),
+        },
+        linkwheel_project_ids: project_row.as_ref().map(|p| p.linkwheel.clone()).unwrap_or_default(),
+        // F#26 — test run should NOT pollute the export feed, regardless
+        // of the project's setting.
+        auto_export: false,
+        // F#26 — THE critical flag: no job status / result row / CSV
+        // append — just drive the engine and report back.
+        dry_run: true,
+
+        ..Default::default()
+    };
+
+    let root = std::env::var("GSA_INSTALL_ROOT")
+        .unwrap_or_else(|_| r"C:\Users\kingsly\Downloads\Compressed\toCrack\ser_setup\install".into());
+    let roots = vec![std::path::PathBuf::from(root)];
+    let drivers = runner::DriverRegistry::new()
+        .with_http(engine::HttpDriver::new())
+        .with_email(engine::HttpDriver::new());
+
+    let pool = runner::pool_for_disk(state.pool.clone(), cfg, roots, drivers).with_context(ctx);
+    let outcome = pool.run_one_job(job.id).await;
+
+    // 3) Ensure the transient job is in a terminal state so a subsequent
+    //    `run` doesn't pick it up. In dry_run the runner's own
+    //    `finish_job` path already set a terminal status — this is a
+    //    belt-and-suspenders.
+    let _ = repo
+        .finish_job(job.id, ser_db::JobStatus::Cancelled, Some("test-engine dry-run (F#26)"))
+        .await;
+
+    // 4) Build the response: either the outcome (success path) or an
+    //    error report (failure path).
+    let (outcome_json, err_json) = match outcome {
+        Ok(o) => (
+            serde_json::json!({
+                "successful": o.report.successful,
+                "failed": o.report.failed,
+                "retried": o.report.retried,
+                "captcha_failed": o.report.captcha_failed,
+                "errors": o.report.errors,
+                "submitted_url": o.report.submitted_url.clone(),
+            }),
+            serde_json::Value::Null,
+        ),
+        Err(e) => (serde_json::json!({}), serde_json::json!({ "error": e.to_string() })),
+    };
+
+    Ok(serde_json::json!({
+        "project_id": project_id.to_string(),
+        "engine_id": body.engine_id.to_string(),
+        "job_id": job.id.to_string(),
+        "report": outcome_json,
+        "error": err_json,
+    }))
+}
+
+#[derive(Deserialize)]
+struct PauseAfterBody {
+    pause_after: i32,
+}
+
+/// F#26 — Pause after N: set the project's pause-after ceiling. `0`
+/// means "run to completion" (the default). `None` in the body = "don't
+/// change this field" (for the `set_project_polish` path).
+async fn set_project_pause_after(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    Json(body): Json<PauseAfterBody>,
+) -> Response {
+    match Repo::new(state.pool.clone())
+        .set_project_polish(project_id, None, None, Some(body.pause_after.max(0)))
+        .await
+    {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// F#26 — Polish: save per-project notes, color tag, and/or the
+/// pause-after-N ceiling. Any field omitted from the body is left
+/// untouched (server-side COALESCE semantics in `set_project_polish`).
+#[derive(Deserialize)]
+struct SetPolishBody {
+    /// Free-form notes for the project (GSA "New Project Data" notes tab).
+    notes: Option<String>,
+    /// Color tag, e.g. `#E11D48` (GSA project color for quick scanning).
+    color: Option<String>,
+    /// `0` = run to completion (default); `n` = pause after n submissions.
+    pause_after: Option<i32>,
+}
+
+async fn set_project_polish(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    Json(body): Json<SetPolishBody>,
+) -> Response {
+    match Repo::new(state.pool.clone())
+        .set_project_polish(project_id, body.notes.clone(), body.color.clone(), body.pause_after)
+        .await
+    {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// F#26 — Resume: clear the project's `paused_at` flag. The run is
+/// resumable by calling `POST /api/projects/{id}/run` again — the pool
+/// reads pending jobs and picks up where it left off.
+async fn resume_project(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+) -> Response {
+    match Repo::new(state.pool.clone()).set_project_paused(project_id, false).await {
+        Ok(p) => Json(p).into_response(),
         Err(e) => error_response(e),
     }
 }
@@ -2128,6 +2352,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/jobs/{id}", get(get_job))
 
         .route("/api/projects/{id}/run", post(run_project))
+
+        // F#26 — Polish: per-project Notes/Color/Pause-after-N, resume from
+        // pause, and the per-engine "Test" dry-run (drive one engine, no DB
+        // side effects).
+        .route("/api/projects/{id}/test-engine", post(test_engine))
+        .route("/api/projects/{id}/pause-after", put(set_project_pause_after))
+        .route("/api/projects/{id}/polish", patch(set_project_polish))
+        .route("/api/projects/{id}/resume", post(resume_project))
 
         .route("/api/proxies", get(list_proxies).post(create_proxy))
 

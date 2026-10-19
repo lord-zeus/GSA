@@ -402,6 +402,36 @@ export const api = {
   projectSetUseProxies: (projectId: string, useProxies: boolean) =>
     req<Project>(`/api/projects/${projectId}/proxies`, { method: 'PUT', body: JSON.stringify({ use_proxies: useProxies }) }),
 
+  // — F#26: Polish (notes · color · pause-after-N · test engine) —
+  /** Save polish fields: project notes, color tag, and pause-after-N ceiling. */
+  projectSetPolish: (
+    id: string,
+    o: { notes?: string | null; color?: string | null; pause_after?: number | null },
+  ) =>
+    req<Project>(`/api/projects/${id}/polish`, { method: 'PATCH', body: JSON.stringify(o) }),
+  /** Clear the pause ceiling so a paused run can resume. */
+  projectResume: (id: string) =>
+    req<Project>(`/api/projects/${id}/resume`, { method: 'POST' }),
+  /** Dry-run one engine end-to-end (no results persisted) and report the outcome.
+   *  Matches `POST /api/projects/{id}/test-engine` (F#26): the server drives
+   *  the engine once and returns the JobReport — nothing is written to the
+   *  results table. */
+  projectTestEngine: (id: string, engineId: string) =>
+    req<{
+      project_id: string
+      engine_id: string
+      job_id: string
+      report: {
+        successful: number
+        failed: number
+        retried: number
+        captcha_failed: number
+        errors: string[]
+        submitted_url: string | null
+      } | null
+      error: string | null
+    }>(`/api/projects/${id}/test-engine`, { method: 'POST', body: JSON.stringify({ engine_id: engineId }) }),
+
   // — F#17 · scheduled runs (cron) —
   // Row shape (mirrors `Schedule` in crates/db/src/model.rs).
   scheduleList: (projectId?: string) =>
