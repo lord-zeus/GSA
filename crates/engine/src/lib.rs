@@ -51,6 +51,11 @@ pub mod captcha;
 /// (titlegen / comments / user_agents / charspin / typos / stop-words) — the
 /// "humanize" layer.  Wired into the spin resolver's `%...%` dispatch.
 pub mod humanize;
+/// F#23 — Site finder (GSA "Filter URLs / Find New Sites" — se.dat 2525-entry
+/// catalog + query modes + result extraction + quality filters).  This module
+/// is pure Rust; it owns the pipeline and the driver I/O boundary stays in
+/// the executor (F#6/7 drivers).
+pub mod site;
 /// F#13 — real-socket proxy connectivity check (the `proxy test` endpoint's
 /// engine; gated on `http` because it lives alongside the HTTP driver).
 #[cfg(feature = "http")]

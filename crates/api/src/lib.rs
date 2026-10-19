@@ -1908,6 +1908,164 @@ pub fn spec_from_row(r: &ser_db::Schedule) -> engine::schedule::ScheduleSpec {
         run_count: r.run_count as i64,
     }
 }
+// ---------------------------------------------------------------------------
+// F#23 — Site finding (backlink candidate discovery) — the GSA `se.dat` 2,525-
+// site engine catalog.  `GET /api/sites` browses the catalog; `POST
+// /api/sites/find` runs the finder against it using a real `HttpDriver` and
+// returns `FoundSite` candidates deduped across sources.
+// ---------------------------------------------------------------------------
+
+/// GET /api/sites?limit=&offset=&q= — browse the `se.dat` site catalog.
+async fn site_catalog(Query(q): Query<CatalogQuery>) -> Response {
+    let sites = match engine::site::load_site_catalog() {
+        Ok(sites) => sites,
+        Err(e) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        ).into_response(),
+    };
+    let total = sites.len() as i64;
+    let limit = q.limit.unwrap_or(100).max(1).min(1000);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let needle = q.q.map(|s| s.to_ascii_lowercase()).filter(|s| !s.is_empty());
+    let page: Vec<serde_json::Value> = sites
+        .into_iter()
+        .skip(offset as usize)
+        .map(|s| serde_json::json!({
+            "name": s.name,
+            "country": s.country,
+            "languages": s.languages,
+            "enabled": s.enabled,
+            "url": s.url,
+        }))
+        .filter(|v| needle.as_ref().is_none_or(|n| {
+            v.get("name").and_then(|x| x.as_str()).map(|x| x.to_ascii_lowercase().contains(n)).unwrap_or(false)
+                || v.get("country").and_then(|x| x.as_str()).map(|x| x.to_ascii_lowercase().contains(n)).unwrap_or(false)
+        }))
+        .take(limit as usize)
+        .collect();
+    Json(serde_json::json!({ "total": total, "limit": limit, "offset": offset, "sites": page }))
+        .into_response()
+}
+
+/// POST /api/sites/find — run the site finder.
+/// Body: {keyword, domain?, mode?, quotes?, stop_words_pct?, limit?, pages?}.
+async fn site_find(body: Json<serde_json::Value>) -> Response {
+    let v = &body.0;
+    let keyword = v.get("keyword").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if keyword.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "keyword is required" }))).into_response();
+    }
+    let domain = v.get("domain").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let quotes = v.get("quotes").and_then(|x| x.as_bool()).unwrap_or(false);
+    let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(20).min(200) as usize;
+    let pages = v.get("pages").and_then(|x| x.as_u64()).unwrap_or(2).min(5) as u32;
+    let max_sites = v.get("max_sites").and_then(|x| x.as_u64()).unwrap_or(12).min(100) as usize;
+    let stop_words_pct = v.get("stop_words_pct").and_then(|x| x.as_u64()).unwrap_or(20) as u32;
+    let mode = match v.get("mode").and_then(|x| x.as_str()) {        Some("site") => engine::site::QueryMode::Site,
+        Some("inurl") => engine::site::QueryMode::Inurl,
+        Some("plain") => engine::site::QueryMode::Plain,
+        _ => engine::site::QueryMode::Intitle,
+    };
+
+    let sites = match engine::site::load_site_catalog() {
+        Ok(sites) => sites,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e }))).into_response(),
+    };
+
+    let cfg = engine::site::SiteFindConfig {
+        keyword: keyword.clone(),
+        domain,
+        mode,
+        quotes,
+        stop_words_pct,
+        max_results: limit,
+        max_sites,
+        max_pages: pages.max(1),
+        min_keywords_present: 0,
+        skip_countries: Vec::new(),
+        skip_languages: Vec::new(),
+        block_domains: Vec::new(),
+        seen_ips: std::collections::HashSet::new(),
+        seed: 0xC0FFEE,
+    };
+
+    let driver: std::sync::Arc<dyn engine::driver::Driver> =
+        std::sync::Arc::new(engine::HttpDriver::new());
+
+    let started = std::time::Instant::now();
+    let found = engine::site::find_sites(cfg, driver, sites).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    let sites_out: Vec<serde_json::Value> = found
+        .into_iter()
+        .take(limit)
+        .map(|f| serde_json::json!({
+            "url": f.url,
+            "title": f.title,
+            "source_site": f.source_site,
+            "source_page": f.source_page,
+        }))
+        .collect();
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "keyword": keyword,
+        "elapsed_ms": elapsed_ms,
+        "count": sites_out.len(),
+        "sites": sites_out,
+    })).into_response()
+}
+
+// POST /api/sites/find_on — single-page live check of F#23 extraction on a
+// real URL (no engine lookup).
+#[derive(Deserialize)]
+struct FindOnBody {
+    url: String,
+    #[serde(default = "default_anchor")]
+    anchor_text: String,
+    #[serde(default)]
+    #[serde(rename = "ignore")]
+    ignore: Vec<String>,
+}
+
+fn default_anchor() -> String { String::new() }
+
+async fn site_find_on(
+    Json(body): Json<FindOnBody>,
+) -> Response {
+    let driver: std::sync::Arc<dyn engine::driver::Driver> = std::sync::Arc::new(engine::HttpDriver::new());
+    let kw = if body.anchor_text.is_empty() { String::from("test") } else { body.anchor_text.clone() };
+    let site = engine::site::SiteSpec {
+        name: "test".into(),
+        url: body.url.clone(),
+        ..Default::default()
+    };
+    let cfg = engine::site::SiteFindConfig {
+        keyword: kw,
+        max_results: 50,
+        block_domains: body.ignore.clone(),
+        ..Default::default()
+    };
+    let res = engine::site::find_sites_on_site(&site, &cfg, Arc::clone(&driver)).await;
+    let hits: Vec<serde_json::Value> = res
+        .into_iter()
+        .map(|f| serde_json::json!({ "url": f.url }))
+        .collect();
+    (StatusCode::OK,
+        Json(serde_json::json!({
+            "anchor_on": body.url,
+            "anchor_text": body.anchor_text,
+            "count": hits.len(),
+            "sites": hits,
+            "status": "ok"
+        }))).into_response()
+}
+
+
+
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -2013,6 +2171,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/catengine", get(catalog_list))
 
         .route("/api/catengine/import", post(catalog_import))
+
+        // F#23 — site finding (the se.dat 2,525-site catalog + finder).
+        .route("/api/sites", get(site_catalog))
+        .route("/api/sites/find", post(site_find))
+.route("/api/sites/find_on", post(site_find_on))
 
         // F#17 — per-project scheduled runs (schedule CRUD + run-now).
         .route(
