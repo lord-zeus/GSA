@@ -12,7 +12,7 @@ use engine::email_create::load_email_engines;
 use engine::email_exec::{build_source, EmailContext, run_email_engine};
 use engine::executor::{resolve_plan, ExecutionReport, StepPhase, SubmissionInput};
 use engine::proxy::ProxySpec;
-use engine::{engine_uses_email_verify, resolve_email_verify};
+use engine::{engine_uses_email_verify};
 use engine::routing::DriverKind;
 use serde::Serialize;
 use uuid::Uuid;
@@ -659,39 +659,67 @@ impl JobRunner {
             self.spec.gsa_roots(),
             std::sync::Arc::clone(driver),
         );
-        let body = match tokio::task::spawn_blocking(move || {
-            if addr.trim().is_empty() {
-                return Err("no operator mailbox configured (set the email pool)".to_string());
-            }
-            let provider = roots.iter().find_map(|root| {
-                let engines = load_email_engines(root);
-                engines.into_iter().find(|e| matches_address(e, &addr))
-            });
-            let provider =
-                provider.ok_or_else(|| format!("no Email_Engines provider matches {addr}"))?;
-            let mail = EmailContext {
-                email_address: addr,
-                password: pw,
-            };
-            let inbox = build_source(&provider, &mail, drv);
-            let messages = inbox.fetch()?;
-            let body = messages
-                .iter()
-                .rev()
-                .map(|m| m.body.clone())
-                .find(|b| !b.trim().is_empty())
-                .ok_or_else(|| "activation mail not found in inbox (register pending or wrong inbox)".to_string())?;
-            Ok::<String, String>(body)
-        })
+        // `move` closures need `'static` — capture the owned pieces outside.
+        let ctx_in = input.into_context();
+        let engine_captured = engine.clone();
+        let result = match tokio::task::spawn_blocking(
+            move || -> Result<engine::EmailVerifyResult, String> {
+                if addr.trim().is_empty() {
+                    return Err("no operator mailbox configured (set the email pool)".to_string());
+                }
+                let provider = roots.iter().find_map(|root| {
+                    let engines = load_email_engines(root);
+                    engines.into_iter().find(|e| matches_address(e, &addr))
+                });
+                let provider =
+                    provider.ok_or_else(|| format!("no Email_Engines provider matches {addr}"))?;
+                let mail = EmailContext {
+                    email_address: addr,
+                    password: pw,
+                };
+                let inbox = build_source(&provider, &mail, drv);
+                // Pure — build the extraction context up-front (url/keyword/files).
+                // (ctx_in + engine_captured were moved into this closure from the
+                // caller — they are owned.)
+                // Poll the inbox: the confirmation mail lands a few seconds after
+                // the register POST. Early-exit ONLY when the extractor produces
+                // a real activation URL — a signed-in *empty* inbox (anonmails
+                // ships `confirmDialog` JS in every page) has no verification
+                // link to extract, so keep polling.
+                let start = std::time::Instant::now();
+                let max_wait = std::time::Duration::from_secs(120);
+                let mut last_err = String::new();
+                loop {
+                    match inbox.fetch() {
+                        Ok(messages) => {
+                            for m in messages.iter().rev() {
+                                let res = engine::resolve_email_verify(&engine_captured, &m.body, &ctx_in);
+                                if res.activation_url.is_some() {
+                                    return Ok(res);
+                                }
+                            }
+                        }
+                        Err(e) => last_err = e,
+                    }
+                    if std::time::Instant::now() - start >= max_wait {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(8));
+                }
+                if last_err.is_empty() {
+                    Err("activation mail not found in inbox after 120s (register pending or wrong inbox)".to_string())
+                } else {
+                    Err(last_err)
+                }
+            },
+        )
         .await
         {
-            Ok(Ok(b)) => b,
+            Ok(Ok(res)) => res,
             Ok(Err(e)) => return (engine::EmailVerifyResult::default(), e),
             Err(je) => return (engine::EmailVerifyResult::default(), format!("inbox worker panicked: {je}")),
         };
-        let ctx = input.into_context();
-        let res = resolve_email_verify(engine, &body, &ctx);
-        (res, String::new())
+        (result, String::new())
     }
 
     /// Resolve the effective keyword for this job.

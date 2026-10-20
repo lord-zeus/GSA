@@ -304,6 +304,10 @@ pub struct WebInbox {
     pub url: String,
     /// `web parse url post data` (form-urlencoded or `None` for GET).
     pub post_body: Option<String>,
+    /// `start url` — GET to prime session cookies (anonmails SID, etc.)
+    /// before the inbox fetch hits it. `None` for hidebox-style providers
+    /// where the inbox URL IS the landing page.
+    pub start_url: Option<String>,
     pub driver: Arc<dyn Driver>,
 }
 
@@ -312,19 +316,33 @@ impl std::fmt::Debug for WebInbox {
         f.debug_struct("WebInbox")
             .field("url", &self.url)
             .field("post_body", &self.post_body.is_some())
+            .field("start_url", &self.start_url.is_some())
             .finish()
     }
 }
 
 impl WebInbox {
     pub fn new(url: impl Into<String>, post_body: Option<String>, driver: Arc<dyn Driver>) -> Self {
-        Self { url: url.into(), post_body, driver }
+        Self { url: url.into(), post_body, start_url: None, driver }
+    }
+    /// Prime session cookies before the inbox fetch (GSA `start url`).
+    pub fn with_start_url(mut self, url: impl Into<String>) -> Self {
+        self.start_url = Some(url.into());
+        self
     }
 }
 
 impl InboxSource for WebInbox {
     fn fetch(&self) -> Result<Vec<InboxMessage>, String> {
         let fields = parse_form_body(self.post_body.as_deref().unwrap_or(""));
+        // `start url` (GSA anonmails `start url` etc.) — GET to prime
+        // session cookies (SID) so the inbox fetch below is signed in.
+        // A failed priming GET is non-fatal — GSA tolerates it (the
+        // inbox fetch may still work, and a follow-up retry gets a
+        // fresh SID anyway).
+        if let Some(s) = self.start_url.clone() {
+            let _ = block_on_driver(self.driver.as_ref(), s, HashMap::new());
+        }
         // With a body → `Driver::submit` (a form POST); without → `navigate`.
         let resp = block_on_driver(self.driver.as_ref(), self.url.clone(), fields);
         if !resp.ok {
@@ -424,7 +442,13 @@ pub fn build_source(
         let post_body = engine.web_parse_post.clone().map(|p| {
             crate::email::resolve_email_tokens(&p, &ctx.email_address, &ctx.password)
         });
-        Box::new(WebInbox { url, post_body, driver })
+        let mut box_ = WebInbox { url, post_body, start_url: None, driver };
+        // `start url` (anonmails `https://anonmails.de/` etc.) — token-resolve
+        // then attach so `fetch()` GETs it first to prime the SID cookie.
+        if let Some(s) = engine.start_url.clone() {
+            box_ = box_.with_start_url(s);
+        }
+        Box::new(box_)
     } else {
         let host = engine.pop3_server.clone();
         let port = engine.pop3_port.max(1) as u16;
