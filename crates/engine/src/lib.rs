@@ -22,6 +22,10 @@
 
 pub mod enginespec;
 pub mod extraction;
+/// Stage 6 — general `[field] type=extract` evaluator + `extract from email=`
+/// driver: resolves the register → e-mail-verify → login field graph that the
+/// 466 article/comment INIs need (activation link, emailed password, login url).
+pub mod extract;
 pub mod spin;
 pub mod splitmix64;
 pub mod driver;
@@ -105,6 +109,10 @@ pub use keyword::{expand as expand_keyword, normalize as normalize_keyword, reso
 pub use spin::{Context, SpintaxResolver, default_context, resolve};
 pub use enginespec::{Engine, EngineType, Step, parse_engine_file, parse_engine_str};
 pub use extraction::{extract_front_back, extract_front_back_variants};
+pub use extract::{
+    EmailExtractPlan, Extractor, ExtractRule, extract_from_email_body, glob_match,
+    must_have_passes, parse_extract_from_email,
+};
 pub use driver::{Driver, DriverResponse, MockDriver};
 pub use routing::{DriverKind, required_driver_kind, required_driver_kind_from_text};
 #[cfg(feature = "http")]
