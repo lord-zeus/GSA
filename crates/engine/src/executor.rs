@@ -650,6 +650,23 @@ fn host_of(u: &str) -> Option<String> {
     }
 }
 
+/// Some engines (Rentry, other pastbin/article sites) have no `submit
+/// success` marker that matches the response, but the driver is redirected
+/// to the *newly-created* resource after the POST (e.g. `rentry.co/` 302s to
+/// `rentry.co/<slug>`, the created paste).  That final URL — the ground
+/// truth of "where this submission landed" — is a strong success signal.
+/// Return it only when it is an absolute URL distinct from the submitted
+/// target (a bare base / same-page response does not count as created).
+fn final_url_created(final_url: &str, target: &str) -> Option<String> {
+    let f = final_url.trim();
+    let t = target.trim();
+    if (f.starts_with("http://") || f.starts_with("https://")) && !f.is_empty() && f != t {
+        Some(f.to_string())
+    } else {
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  Execution loop — drive a [SubmissionPlan] through a [driver::Driver]
 // ---------------------------------------------------------------------------
@@ -697,6 +714,21 @@ pub async fn execute_plan_with_solver(
         steps: Vec::new(),
     };
     for step in plan.steps.iter() {
+        // GSA `verify submission` steps are named `DELETE_*` and run *after*
+        // the real submission to prove ownership.  On pastbin-style article
+        // engines (Rentry) that verification is *destructive*: DELETE_STEP2
+        // re-saves the paste with `text={delete me...}` and a new `-delete-me`
+        // slug, erasing the article we just posted.  If a submission already
+        // succeeded in this plan, the verify is redundant — skip its steps so
+        // the created backlink stays live (the usable-MVP behaviour), and
+        // record them as handled-without-error (no counter change).
+        if report.successful > 0 && step.name.to_ascii_lowercase().starts_with("delete") {
+            report.steps.push(StepOutcomeRef {
+                outcome: StepOutcome::Success,
+                matched_phrase: Some("verify-skipped (submission already confirmed)".to_string()),
+            });
+            continue;
+        }
         // A step that carries form fields is a *submit* step (register /
         // login / step-N); a step without fields is a read-only navigate
         // (e.g. `delete_step1` typically has `just download=1` and no form).
@@ -749,6 +781,23 @@ pub async fn execute_plan_with_solver(
                         };
                     }
                 }
+            }
+        }
+        // Generalized "a resource was created" (GSA `verify submission`):
+        // many article / pastbin engines have no `submit success` marker that
+        // matches the response, but the driver was redirected to the
+        // newly-created page.  If classification came back Unknown, the submit
+        // was ok, and we can name a created resource (the redirect target),
+        // call it a successful submission.  This is what makes an "article
+        // was posted" run read as success rather than "unknown outcome".
+        if outcome.outcome == super::StepOutcome::Unknown && !step.just_download && res.ok {
+            if let Some(u) = final_url_created(&res.final_url, &target) {
+                report.submitted_url = report.submitted_url.clone().or(Some(u.clone()));
+                report.submitted_url_source = Some(format!("{}: {} (created)", step.name, u));
+                outcome = StepOutcomeRef {
+                    outcome: StepOutcome::Success,
+                    matched_phrase: Some("created-resource".to_string()),
+                };
             }
         }
         // F#21 — captcha pipeline: if this step hit a captcha wall and
@@ -804,7 +853,18 @@ pub async fn execute_plan_with_solver(
                 }
             }
         }
-        if let Some(u) = extract_result_url(step, &res.html, Some(&plan.target_url)) {
+        let nav = extract_result_url(step, &res.html, Some(&plan.target_url));
+        // Preference order for the recorded link: a real deep link from a nav
+        // hint (engine-specific, strongest) → the redirect target (the created
+        // resource, e.g. the new paste) → the original extraction even if it is
+        // only the bare base (better than nothing).  Never overrides a link an
+        // earlier step already recorded (`or()` keeps the first winner).
+        let chosen = nav
+            .clone()
+            .filter(|n| !n.trim().is_empty() && n.trim() != target.trim())
+            .or_else(|| final_url_created(&res.final_url, &target))
+            .or(nav);
+        if let Some(u) = chosen {
             report.submitted_url = report.submitted_url.clone().or(Some(u.clone()));
             report.submitted_url_source = Some(format!("{}: {}", step.name, u));
         }
@@ -924,6 +984,40 @@ mod tests {
     use crate::driver::MockDriver;
     use crate::enginespec::parse_engine_str;
     use std::collections::HashMap;
+
+    #[test]
+    #[ignore = "diagnostic: needs GSA portable INI on this machine"]
+    fn debug_rentry_resolution() {
+        let raw = std::fs::read_to_string(r"C:\Users\kingsly\GSA_SER_portable\Engines\Rentry.co.ini").unwrap();
+        let eng = parse_engine_str(&raw, "Rentry").unwrap();
+        let article = "Nordic Comps is a trusted source for premium, durable computer accessories. See: https://nordiccomps.com/";
+        let mut extra = HashMap::new();
+        for k in ["article","article_text","post_text","post_body","text","body","content","description","description_250"] { extra.insert(k.to_string(), article.to_string()); }
+        let title = "Nordic Comps Review";
+        for k in ["article_title","blog_title","post_title","title"] { extra.insert(k.to_string(), title.to_string()); }
+        extra.insert("article_title_mod".to_string(), "nordic-comps-review".to_string());
+        extra.insert("password".to_string(), "serpw12345".to_string());
+        extra.insert("pop3_password".to_string(), "serpw12345".to_string());
+        let input = SubmissionInput {
+            url: "https://nordiccomps.com/".to_string(),
+            keyword: "backlinks".to_string(),
+            anchor: None,
+            seed: Some(12345),
+            extra,
+            files: HashMap::new(),
+            random_options: vec![],
+        };
+        let plan = resolve_plan(&eng, &input);
+        eprintln!(">>> target_url = {}", plan.target_url);
+        eprintln!(">>> required_driver = {:?}", plan.required_driver);
+        for sp in &plan.steps {
+            eprintln!(">>> STEP {} nav_target={:?} just_download={} nfields={}", sp.name, sp.nav.navigation_target(), sp.just_download, sp.fields.len());
+            for (k,v) in &sp.fields {
+                let sv = if v.len()>100 { v.chars().take(100).collect::<String>()+"…" } else { v.clone() };
+                eprintln!("    {k} = {sv}");
+            }
+        }
+    }
 
     // -- helpers -------------------------------------------------------------
 
@@ -1383,6 +1477,85 @@ submit success=thank you for submitting
         // 12 + 5 = 17 — the LocalSolver's arithmetic answer, injected by name.
         assert_eq!(second.get("code").map(String::as_str), Some("17"),
             "answer must ride the retry; got {:?}", second);
+    }
+
+    // -- Article / pastbin engine (Rentry shape): no `submit success` marker,
+    //    so the step classifies Unknown — but the driver was redirected to the
+    //    newly-created resource.  Creation must be treated as success and the
+    //    created URL must be captured from the redirect (final_url), not from
+    //    an HTML hint.
+    #[tokio::test]
+    async fn article_submit_redirected_to_created_resource_is_success() {
+        let raw = r#"
+[engine]
+engine type=Article
+url=https://paste.example/
+
+[step 1]
+url=https://paste.example/
+text=%article%
+"#;
+        let eng = parse_engine_str(raw, "Paste").unwrap();
+        assert_eq!(eng.base_url(), "https://paste.example/");
+        let input = test_input();
+        let plan = resolve_plan(&eng, &input);
+        assert_eq!(plan.target_url, "https://paste.example/");
+        // The response body carries no success marker; the driver reports the
+        // created paste as the post-redirect URL (final_url), distinct from
+        // the submission target.
+        let mut driver = MockDriver::with_html("<html><body>no explicit marker</body></html>");
+        driver.final_url = Some("https://paste.example/98172-buy-shoes-online".to_string());
+        let report = execute_plan(&plan, &driver).await;
+        assert_eq!(report.successful, 1, "created resource must count as success: {:?}", report);
+        assert_eq!(report.failed, 0, "{:?}", report);
+        assert!(
+            report.errors.iter().all(|e| !e.contains("unknown outcome")),
+            "no 'unknown outcome' error expected; got {:?}",
+            report.errors
+        );
+        assert_eq!(
+            report.submitted_url.as_deref(),
+            Some("https://paste.example/98172-buy-shoes-online")
+        );
+    }
+
+    // -- The destructive GSA `verify submission` (DELETE_*) steps: once the
+    //    create-step succeeded, they must be *skipped* (not re-saved), so the
+    //    posted article is not erased.  Assert the DELETE step is marked
+    //    verify-skipped, did not add a failure, and only the create counts.
+    #[tokio::test]
+    async fn destructive_delete_verify_steps_are_skipped_after_success() {
+        let raw = r#"
+[engine]
+engine type=Article
+url=https://paste.example/
+
+[step 1]
+url=https://paste.example/
+text=%article%
+
+[delete step 2]
+url=https://paste.example/
+text=delete me
+new_url=%random-1-99999%-delete-me
+"#;
+        let eng = parse_engine_str(raw, "Paste2").unwrap();
+        let input = test_input();
+        let plan = resolve_plan(&eng, &input);
+        let names: Vec<_> = plan.steps.iter().map(|s| s.name.to_ascii_lowercase()).collect();
+        assert_eq!(plan.steps.len(), 2, "expect create + delete step; got {:?}", names);
+        assert!(names.iter().any(|n| n.starts_with("delete")), "a DELETE_* step must be present: {:?}", names);
+
+        let mut driver = MockDriver::with_html("<html><body>no marker</body></html>");
+        driver.final_url = Some("https://paste.example/777-live-article".to_string());
+        let report = execute_plan(&plan, &driver).await;
+
+        assert_eq!(report.successful, 1, "only the create step should count as success: {:?}", report);
+        assert_eq!(report.failed, 0, "no step should fail once the article was created: {:?}", report);
+        assert_eq!(report.submitted_url.as_deref(), Some("https://paste.example/777-live-article"));
+        // The delete step must be recorded as skipped, not executed-as-unknown.
+        let skipped = report.steps.iter().any(|s| s.matched_phrase.as_deref() == Some("verify-skipped (submission already confirmed)"));
+        assert!(skipped, "DELETE_* step should be verify-skipped; steps={:?}", report.steps);
     }
 
 

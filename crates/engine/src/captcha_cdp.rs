@@ -448,20 +448,27 @@ impl CaptchaSolver for CdpVisionSolver {
     }
 
     async fn solve(&self, ctx: &CaptchaContext) -> Result<String, CaptchaError> {
-        // 0) This solver only helps when the page actually carries a v2 widget.
-        let sitekey = ctx
+        // 0) The sitekey is an *informational* input for API-based solvers
+        //    (2Captcha / Anti-Captcha), NOT a functional requirement for
+        //    this CDP+oracle path.  `drive()` (below) locates the checkbox
+        //    by probing the live DOM via `PROBE_WIDGET_JS`, which finds the
+        //    anchor iframe regardless of how the site injected the widget.
+        //    So: extract the sitekey opportunistically for logging, but
+        //    don't hard-fail when the caller couldn't provide one (common
+        //    for JS-API-injected widgets on SPAs like Localendar, where the
+        //    sitekey only exists in the anchor iframe URL — not in the
+        //    page's static HTML).
+        let sitekey: Option<String> = ctx
             .sitekey
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
-            .or_else(|| {
-                crate::captcha::extract_sitekey(&ctx.html)
-            });
+            .or_else(|| crate::captcha::extract_sitekey(&ctx.html));
         if sitekey.is_none() {
-            return Err(CaptchaError::Unsolvable {
-                reason: "no reCAPTCHA v2 widget on this page (cdp-vision only handles v2)".into(),
-            });
+            eprintln!(
+                "[captcha_cdp] caller provided no sitekey; relying on live-DOM discovery (drive)"
+            );
         }
         let page = ctx.url.as_deref().filter(|u| u.starts_with("http")).ok_or_else(|| {
             CaptchaError::Unsolvable { reason: "cdp-vision needs the page URL to drive the widget".into() }

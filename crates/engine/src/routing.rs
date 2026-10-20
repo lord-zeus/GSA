@@ -71,6 +71,24 @@ fn marker_in(text: &str) -> bool {
     BROWSER_MARKERS.iter().any(|m| t.contains(m))
 }
 
+/// A `set unknown variable` value only forces a browser when it is a genuine
+/// JavaScript expression (needs `Runtime.evaluate`). A spin token like
+/// `%leave%` or `%random-1-99999%` is a plain form value the [`HttpDriver`]
+/// resolves via `spin.rs`, so those stay HTTP-routable (they match GSA's own
+/// "browser only when the value lives in a real `Runtime`" split).
+fn set_unknown_is_js(value: &str) -> bool {
+    let v = value.to_ascii_lowercase();
+    v.contains(';')
+        || v.contains("var ")
+        || v.contains("function")
+        || v.contains("document.")
+        || v.contains("window.")
+        || v.contains("=>")
+        || v.contains("addevent")
+        || v.contains("jquery")
+        || v.starts_with('$')
+}
+
 /// Decide the [`DriverKind`] for a parsed engine.
 ///
 /// Inspects **every step's field keys and values** for the JS markers above.
@@ -84,6 +102,18 @@ pub fn required_driver_kind(engine: &super::enginespec::Engine) -> DriverKind {
     }
     for step in &engine.steps {
         for (key, field) in step.fields.iter() {
+            let k = key.to_ascii_lowercase();
+            // Special case: `set unknown variable` only needs a browser when
+            // its value is a real JS expression. GSA's `%leave%` / spin-token
+            // forms are plain form values the HttpDriver resolves, so keep
+            // them on the HTTP path (this is what lets Rentry-style no-login
+            // pastbin forms run without a live CDP browser).
+            if k.contains("set unknown variable") {
+                if set_unknown_is_js(&field.value) {
+                    return DriverKind::Browser;
+                }
+                continue;
+            }
             if marker_in(key) || marker_in(&field.value) {
                 return DriverKind::Browser;
             }
@@ -176,6 +206,42 @@ register_step1 page must have = Your link was added
     #[test]
     fn set_unknown_variable_routes_to_browser() {
         let eng = parse_engine_str(JSHEAVY, "JS Directory").unwrap();
+        assert_eq!(required_driver_kind(&eng), DriverKind::Browser);
+    }
+
+    // Rentry-style: `set unknown variable=%leave%` is a spin token, not JS —
+    // a no-login pastbin form must stay on the Http path (F#30 routing fix).
+    #[test]
+    fn set_unknown_variable_spin_token_stays_http() {
+        const RENTRYLIKE: &str = r#"
+[engine]
+name = Rentry.co
+engine type = directory
+url = https://rentry.co/
+
+[url]
+global form id = entry-form
+global form name - text = %article%
+global set unknown variable = %leave%
+"#;
+        let eng = parse_engine_str(RENTRYLIKE, "Rentry.co").unwrap();
+        assert_eq!(required_driver_kind(&eng), DriverKind::Http,
+            "spin-token `set unknown variable` must not force a browser");
+    }
+
+    // A genuine JS expression still forces the browser.
+    #[test]
+    fn set_unknown_variable_js_expression_routes_to_browser() {
+        const JSVAL: &str = r#"
+[engine]
+name = JSval
+engine type = directory
+url = http://x/
+
+[url]
+global set unknown variable = window.__link = document.querySelector('a').href;
+"#;
+        let eng = parse_engine_str(JSVAL, "JSval").unwrap();
         assert_eq!(required_driver_kind(&eng), DriverKind::Browser);
     }
 

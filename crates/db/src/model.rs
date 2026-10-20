@@ -45,6 +45,11 @@ pub struct Project {
     /// and F#24-lite linkwheel (upstream verified URLs) to it per job.
     #[serde(default)]
     pub url: String,
+    /// F#30 — GSA "Article content": project-level article body used by
+    /// article-family engines as `%article%`. Spintax allowed. Empty = the
+    /// runner auto-generates a short article from the keyword + target URL.
+    #[serde(default)]
+    pub article_text: String,
     /// F#26 — GSA "Notes" free text (shown on the project card / export header).
     #[serde(default)]
     pub notes: String,

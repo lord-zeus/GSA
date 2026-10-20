@@ -104,8 +104,22 @@ impl Driver for HttpDriver {
     /// confirmation page — this is what the executor drives for every
     /// register/login/submit step.
     async fn submit(&self, url: String, fields: HashMap<String, String>, _timeout: Duration) -> DriverResponse {
+        // Browser-faithful form submit (GSA parity). GSA loads the form page
+        // first (warming the session cookie jar and exposing hidden inputs
+        // such as Django's `csrfmiddlewaretoken`), then POSTs that page back
+        // with a matching `Referer` + `Origin`. Several engines (Rentry and
+        // other CSRF / "Referer checking failed" forms) reject a bare POST.
+        let mut merged = fields;
+        if let Ok(page) = self.client.get(&url).send().await {
+            if let Ok(b) = page.bytes().await {
+                let html = String::from_utf8_lossy(&b);
+                for (k, v) in parse_hidden_fields(&html) {
+                    merged.entry(k).or_insert(v);
+                }
+            }
+        }
         let mut body = String::with_capacity(256);
-        for (k, v) in fields.iter() {
+        for (k, v) in merged.iter() {
             body.push_str(&form_urlencode(k));
             body.push('=');
             body.push_str(&form_urlencode(v));
@@ -115,6 +129,8 @@ impl Driver for HttpDriver {
             .client
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(reqwest::header::REFERER, url.clone())
+            .header(reqwest::header::ORIGIN, origin_of(&url))
             .body(body)
             .send()
             .await
@@ -156,6 +172,62 @@ impl Driver for HttpDriver {
             .ok()?;
         Some(std::sync::Arc::new(Self { client, user_agent: self.user_agent.clone() }) as std::sync::Arc<dyn Driver>)
     }
+}
+
+/// Parse `<input type="hidden" name="X" value="Y">` (quoted, either
+/// attribute order, either quote style) out of an HTML form page. The
+/// driver merges these into a form submit so pages with hidden session
+/// tokens (Django CSRF, etc.) are filled the way a real browser would.
+fn parse_hidden_fields(html: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let bytes = html.as_bytes();
+    let mut start = 0;
+    while let Some(begin) = find_byte_sub(bytes, start, b"<input") {
+        let end_abs = begin + html[begin..].find('>').map(|p| p).unwrap_or(0);
+        let tag = &html[begin..end_abs];
+        if tag.to_lowercase().contains("hidden") {
+            if let (Some(n), Some(v)) = (attr_value(tag, "name"), attr_value(tag, "value")) {
+                out.insert(n, v);
+            }
+        }
+        start = end_abs;
+    }
+    out
+}
+
+/// Extract a double- or single-quoted attribute value from a tag string,
+/// case-insensitively.
+fn attr_value(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_lowercase();
+    for quote in ['"', '\''] {
+        let needle = format!("{name}={quote}");
+        let mut pos = 0;
+        while let Some(rel) = lower[pos..].find(&needle) {
+            let start = pos + rel + name.len() + 2; // skip `name=` + quote
+            if let Some(end) = tag[start..].find(quote) {
+                return Some(tag[start..start + end].to_string());
+            }
+            pos = pos + rel + 1;
+        }
+    }
+    None
+}
+
+/// `memmem` — first occurrence of `needle` at or after `from`.
+fn find_byte_sub(hay: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    let last = hay.len().checked_sub(needle.len())?;
+    (from.min(hay.len())..=last).find(|&p| &hay[p..p + needle.len()] == needle)
+}
+
+/// `https://host/path` -> `https://host` (the `Origin` header value).
+fn origin_of(url: &str) -> String {
+    let scheme = url.split("://").next().unwrap_or("https");
+    let host = url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("");
+    format!("{scheme}://{host}")
 }
 
 /// GSA's default desktop User-Agent (Chromium on Windows 10).

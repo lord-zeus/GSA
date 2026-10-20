@@ -91,17 +91,21 @@ pub struct MockDriver {
     pub html: String,
     /// When `Some`, the response is `ok = false` and `error` is `Some(msg)`.
     pub error: Option<String>,
+    /// When `Some`, overrides the `final_url` of every success response
+    /// (default `"mock"`).  Lets tests simulate a driver redirected to a
+    /// created resource (e.g. a new paste URL) distinct from the target.
+    pub final_url: Option<String>,
 }
 
 impl MockDriver {
     /// Build a mock that returns the given HTML on success.
     pub fn with_html(html: impl Into<String>) -> Self {
-        Self { html: html.into(), error: None }
+        Self { html: html.into(), error: None, final_url: None }
     }
 
     /// Build a mock that always fails with the given error message.
     pub fn fail_with(err: impl Into<String>) -> Self {
-        Self { html: String::new(), error: Some(err.into()) }
+        Self { html: String::new(), error: Some(err.into()), final_url: None }
     }
 
     fn response(&self) -> DriverResponse {
@@ -115,7 +119,7 @@ impl MockDriver {
         } else {
             DriverResponse {
                 ok: true,
-                final_url: "mock".into(),
+                final_url: self.final_url.clone().unwrap_or_else(|| "mock".into()),
                 html: self.html.clone(),
                 error: None,
             }

@@ -25,6 +25,10 @@ use crate::specprovider::SpecSource;
 pub struct SubmissionContext {
     /// The project's target URL (where the backlink should point).
     pub project_url: String,
+    /// F#30 — GSA "Article content": the project's article body for the
+    /// article-family engines (`%article%`). Spintax allowed; empty = the
+    /// runner auto-generates a short article from the keyword + target URL.
+    pub article_text: String,
     /// The project id — used only for GSA-style auto-export file naming
     /// (`<data>/verified/<project_id>.csv`); does not affect submission.
     pub project_id: Uuid,
@@ -311,12 +315,63 @@ impl JobRunner {
             url
         };
 
+        // F#30 — article-family runtime variables (GSA corpus parity). The
+        // article engines (Rentry, web2.0, blog, forum-post-body…) reference
+        // `%article%`, `%article_title%`, `%article_title_mod%`, `%password%`
+        // and friends in their step fields. None of those exist in the
+        // spin context by default — the project has to carry them:
+        //
+        //   %article%            — the project's "Article content"
+        //                          (spintax allowed; the executor renders the
+        //                          inner variables when the field resolves).
+        //                          Empty ⇒ auto-generated: GSA-style title +
+        //                          up to two human comment lines + an anchor
+        //                          sentence pointing at the target URL.
+        //   %article_title_mod%  — the title, slug-ified (GSA's
+        //                          `[article_title_mod] type=extract` section:
+        //                          strip non-alnum, collapse to dashes).
+        //   %password%           — static per project (GSA `[Password]`
+        //                          `static=1`): one deterministic 12-char
+        //                          string derived from the project id, so
+        //                          every job / retry on this project uses the
+        //                          same "account password".
+        // Common corpus aliases get the same values (description, text,
+        // post_text, blog_title, title) so a variety of live article INIs
+        // resolve without engine-specific hacks.
+        let job_seed = self.seed_for_job(job).unwrap_or(0xA11CE_5EED | 1);
+        let (article_body, article_title, article_title_mod) =
+            build_article_text(
+                self.ctx.article_text.trim(),
+                &keyword,
+                &effective_url,
+                job_seed,
+            );
+        let password = password_for_project(self.ctx.project_id);
+        let mut extra: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for k in ["article", "article_text", "post_text", "post_body", "text", "body", "content", "description", "description_250"] {
+            extra.insert(k.into(), article_body.clone());
+        }
+        for k in ["article_title", "blog_title", "post_title", "title"] {
+            extra.insert(k.into(), article_title.clone());
+        }
+        extra.insert("article_title_mod".into(), article_title_mod);
+        // GSA's documented pop3-password fallback: the operator's explicit
+        // mailbox password wins; otherwise reuse the project-static string
+        // so `pop3 password=%pop3_password%` INIs can still log in.
+        let pop3_pw = if self.ctx.email_password.is_empty() {
+            password.clone()
+        } else {
+            self.ctx.email_password.clone()
+        };
+        extra.insert("password".into(), password);
+        extra.insert("pop3_password".into(), pop3_pw);
         let input = SubmissionInput {
             url: effective_url,
             keyword: keyword.clone(),
             anchor: input_anchor,
             seed: self.ctx.seed,
-            extra: Default::default(),
+            extra,
             files: self.ctx.files.clone(),
             random_options: vec![],
         };
@@ -972,6 +1027,105 @@ impl JobRunner {
             });
         base.join("verified").join(format!("{}.csv", self.ctx.project_id))
     }
+}
+
+// ===========================================================================
+//  F#30 — article + password synthesis for article/mail-family engines
+// ===========================================================================
+
+/// Pull the bare `host` (with port) out of an `http(s)://host[/path]` URL.
+/// Falls back to `None` for anything that isn't a scheme-prefixed URL.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let host = rest.split('/').next()?.trim().to_string();
+    (!host.is_empty()).then(|| host)
+}
+
+/// GSA-style `[article_title_mod] type=extract` — lowercase the title,
+/// collapse non-alphanumerics into single dashes, trim both ends.
+/// Deterministic; no rng.
+fn slugify_title(title: &str) -> String {
+    let mut out = String::with_capacity(title.len());
+    let mut last_dash = false;
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_dash = false;
+        } else if !out.is_empty() && !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') { out.pop(); }
+    out
+}
+
+/// GSA `[Password] static=1` — a deterministic 12-char password derived
+/// from the project id. `as_u64_pair()` mixes the two halves with a
+/// rotate, so all 128 bits of the UUID feed the LCG; each output char is
+/// from a 60-char alphabet (all letters + digits 2-9).
+fn password_for_project(project_id: Uuid) -> String {
+    const ALPHA: &[u8; 60] =
+        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ23456789";
+    let (hi, lo) = project_id.as_u64_pair();
+    let mut state = hi ^ lo.rotate_left(17) | 1;
+    let mut out = String::with_capacity(12);
+    for _ in 0..12 {
+        state = state
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(0x1234_5678_9ABC_DEF0);
+        state ^= state >> 32;
+        out.push(ALPHA[(state >> 32) as usize % ALPHA.len()] as char);
+    }
+    out
+}
+
+/// F#30 — build (body, title, title_mod) for spin-context injection.
+///
+/// * `article` non-empty → use verbatim as body. Title still comes from
+///   the keyword pool (or the bare host if no keyword) so `url=...%article_title_mod%`
+///   INIs still get a usable slug.
+/// * `article` empty → synthesize a GSA-style short article: title + one
+///   random forum comment line from the `comments.dat` pool + an anchor
+///   sentence that ends with the bare target host (that is what the
+///   "verify by=url" INIs match against).
+/// * `title_mod` = `slugify_title(title)` — used in Rentry's
+///   `url=%random-1-99999%-%article_title_mod%` and the equivalent on any
+///   other pastebin-style article engine.
+fn build_article_text(
+    article: &str,
+    keyword: &str,
+    url: &str,
+    seed: u64,
+) -> (String, String, String) {
+    let mut rng = engine::splitmix64::SplitMix64::new(seed);
+    let target_url = url.trim();
+    let host = url_host(target_url).unwrap_or_else(|| target_url.to_string());
+    let anchor = if keyword.trim().is_empty() { host.clone() } else { keyword.trim().to_string() };
+    let title = engine::humanize::generate_title(keyword, &mut rng)
+        .unwrap_or_else(|| host.clone());
+    let title_mod = slugify_title(&title);
+    let body = if article.is_empty() {
+        let comment = engine::humanize::random_comment("forum", &mut rng)
+            .unwrap_or_else(|| "Useful and practical reference — I plan to come back.".into());
+        format!(
+            "{title}\n\n{comment}\n\n{anchor} — a working reference at {host} you can reuse.\n\n{target_url}"
+        )
+    } else {
+        let mut b = article.to_string();
+        // GSA "[Article] auto add anchor url" — always embed the target so the
+        // post carries the backlink and "verify by=url" / submit-success INIs
+        // (`href="%url%"`) can find it. Skip if the user already linked it.
+        let lower = b.to_lowercase();
+        if !target_url.is_empty()
+            && !lower.contains(&target_url.to_lowercase())
+            && !lower.contains(&host.to_lowercase())
+        {
+            b.push_str(&format!("\n\n{anchor}\n\n{target_url}"));
+        }
+        b
+    };
+    (body, title, title_mod)
 }
 
 fn empty_report() -> ExecutionReport {

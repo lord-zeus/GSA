@@ -633,6 +633,30 @@ async fn set_project_url_api(
 
 
 
+/// F#30 — PUT /api/projects/{id}/article — set the project's Article body
+/// (the GSA "Article content" block). An empty body clears it, so the
+/// runner auto-generates a short article from the keyword + target URL.
+#[derive(Deserialize)]
+pub struct SetProjectArticleBody {
+    #[serde(default)]
+    article: String,
+}
+
+async fn set_project_article_api(
+    Path(id): Path<Uuid>,
+    state: State<Arc<AppState>>,
+    body: Json<SetProjectArticleBody>,
+) -> Response {
+    let article = body.article.clone();
+    match Repo::new(state.pool.clone())
+        .set_project_article(id, article)
+        .await
+    {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
 /// PUT /api/projects/{id}/anchor-options — the GSA "Anchor Text (below the
 /// keyword)" tab: anchor mix JSON, URL randomization/variation, root-URL
 /// percentage, linkwheel (upstream project ids), and auto-export.  Every
@@ -1740,6 +1764,13 @@ pub async fn run_project_pool(project_id: Uuid, state: &Arc<AppState>) -> anyhow
 
         project_id,
         project_url: project_row.as_ref().map(|p| p.url.clone()).unwrap_or_default(),
+        // F#30 — the project's own Article body (GSA "Article content");
+        // empty → the runner auto-generates a short article from the
+        // keyword + target URL.
+        article_text: project_row
+            .as_ref()
+            .map(|p| p.article_text.clone())
+            .unwrap_or_default(),
         anchor: project_row
             .as_ref()
             .and_then(|p| p.anchor_mix.as_deref())
@@ -2179,6 +2210,13 @@ async fn test_engine_pool(
         settings: std::sync::Arc::new(global_settings.clamped_ref()),
         project_id,
         project_url: project_row.as_ref().map(|p| p.url.clone()).unwrap_or_default(),
+        // F#30 — the project's own Article body (GSA "Article content");
+        // empty → the runner auto-generates a short article from the
+        // keyword + target URL.
+        article_text: project_row
+            .as_ref()
+            .map(|p| p.article_text.clone())
+            .unwrap_or_default(),
         anchor: project_row
             .as_ref()
             .and_then(|p| p.anchor_mix.as_deref())
@@ -2799,6 +2837,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         // linkwheel + auto-export.  Separate PUTs so the UI can save them
         // independently (each is `None`-tolerant in the repo).
         .route("/api/projects/{id}/url", put(set_project_url_api))
+        // F#30 — set the project's Article body (the GSA "Article content"
+        // block). Empty body clears it → the runner auto-generates from
+        // the project's keyword + target URL.
+        .route("/api/projects/{id}/article", put(set_project_article_api))
         .route(
             "/api/projects/{id}/anchor-options",
             put(set_project_anchor_options_api),
