@@ -80,7 +80,7 @@ TEMPLATE_HEAD = """<!doctype html>
   </div>
   <div id="list">no clicks yet</div>
 </div>
-<img id="img" alt="captcha screenshot">
+<img id="img" alt="captcha screenshot" src="/img/__SID__">
 <div id="done"><div id="donetext">Sending...</div></div>
 """
 
@@ -182,6 +182,21 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(html)))
             self.end_headers()
             self.wfile.write(html)
+            return
+        im = re.match(r"^/img/([0-9a-f-]+)", self.path)
+        if im:
+            with sessions_lock:
+                rec = sessions.get(im.group(1))
+                b64 = rec["image"] if rec else None
+            if not b64:
+                self._json(404, {"error": "no image for that session"})
+                return
+            data = b64.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
             return
         self._json(404, {"error": "not found"})
 

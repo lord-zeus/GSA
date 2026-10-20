@@ -81,13 +81,21 @@ fn env_nonempty(var: &str) -> Option<String> {
 }
 
 /// Minimal request/response CDP client bound to ONE page target.
-struct Cdp {
+pub struct Cdp {
     ws: Box<dyn Transport>,
     next_id: u64,
 }
 
 impl Cdp {
-    async fn send(&mut self, method: &str, params: Value) -> Result<Value, CaptchaError> {
+    /// F#29 probe helper: build a Cdp client from a target websocket URL.
+    pub async fn connect_ws(ws_url: &str) -> Result<Self, CaptchaError> {
+        let t = WsTransport::connect(ws_url.to_string())
+            .await
+            .map_err(|e| CaptchaError::Network { message: format!("ws connect: {e}") })?;
+        Ok(Self { ws: Box::new(t), next_id: 1 })
+    }
+
+    pub async fn send(&mut self, method: &str, params: Value) -> Result<Value, CaptchaError> {
         let id = self.next_id;
         self.next_id += 1;
         let frame = json!({ "id": id, "method": method, "params": params }).to_string();
@@ -127,7 +135,7 @@ impl Cdp {
     }
 
     /// Evaluate JS in the top page; returns Null on error (best-effort).
-    async fn eval(&mut self, expr: &str) -> Result<Value, CaptchaError> {
+    pub async fn eval(&mut self, expr: &str) -> Result<Value, CaptchaError> {
         let res = self
             .send(
                 "Runtime.evaluate",
@@ -142,7 +150,7 @@ impl Cdp {
     }
 }
 
-async fn click(cdp: &mut Cdp, x: f64, y: f64) -> Result<(), CaptchaError> {
+pub async fn click(cdp: &mut Cdp, x: f64, y: f64) -> Result<(), CaptchaError> {
     for typ in ["mousePressed", "mouseReleased"] {
         cdp
             .send(
@@ -160,13 +168,16 @@ async fn click(cdp: &mut Cdp, x: f64, y: f64) -> Result<(), CaptchaError> {
     Ok(())
 }
 
-/// Poll the hidden `g-recaptcha-response` input until it carries a token.
+/// Poll for a reCAPTCHA v2 token: the hidden `g-recaptcha-response`
+/// field, or — on pages (like Localendar) that render only
+/// `<div class="g-recaptcha">` with no input field — the
+/// `grecaptcha.getResponse()` API.
 async fn wait_token(cdp: &mut Cdp, timeout: Duration) -> Option<String> {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         if let Ok(v) = cdp
             .eval(
-                "(() => { const el = document.querySelector('textarea[name=\"g-recaptcha-response\"], input[name=\"g-recaptcha-response\"]'); const v = el ? el.value : ''; return (v && v.length > 20) ? v : ''; })()",
+                "(() => { const el = document.querySelector('textarea[name=g-recaptcha-response], input[name=g-recaptcha-response]'); if (el && el.value && el.value.length > 20) return el.value; try { if (window.grecaptcha && grecaptcha.getResponse) { const v2 = grecaptcha.getResponse(); if (v2 && v2.length > 20) return v2; } } catch (e) {} return ''; })()",
             )
             .await
         {
@@ -184,7 +195,7 @@ const PROBE_WIDGET_JS: &str = r#"(() => {
   let el = null;
   for (const s of sel) { const f = document.querySelector(s); if (f) { el = f; break; } }
   if (!el) return { found: false };
-  el.scrollIntoView({ block: 'center', inline: 'center' });
+  el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
   const b = el.getBoundingClientRect();
   // v2 checkbox sits ~14px inside the left edge, vertically centred.
   return { found: true, x: b.x, y: b.y, w: b.width, h: b.height,
@@ -225,7 +236,7 @@ fn ws_url(http_url: &str) -> String {
 }
 
 /// Open a fresh page target pointed at `url` under CDP endpoint `ep`.
-async fn new_tab(ep: &str, url: &str) -> Result<(String, String), CaptchaError> {
+pub async fn new_tab(ep: &str, url: &str) -> Result<(String, String), CaptchaError> {
     let base = ep.trim_end_matches('/');
     let new_url = format!("{base}/json/new?{}", esc(url));
     let resp = reqwest::Client::new()
@@ -246,7 +257,7 @@ async fn new_tab(ep: &str, url: &str) -> Result<(String, String), CaptchaError> 
     Ok((id.to_string(), ws.to_string()))
 }
 
-async fn close_tab(ep: &str, id: &str) {
+pub async fn close_tab(ep: &str, id: &str) {
     let base = ep.trim_end_matches('/');
     let _ = reqwest::Client::new().delete(format!("{base}/json/close/{id}")).send().await;
 }
@@ -457,11 +468,28 @@ impl CdpVisionSolver {
         }
         let cx = info.get("cx").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let cy = info.get("cy").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        // let the (instant) scroll fully settle so the measured
+        // coordinates still match the painted layout at click time
+        tokio::time::sleep(Duration::from_millis(250)).await;
         click(&mut cdp, cx, cy).await?;
 
         // 3) Some widgets pass straight to a token (good reputation / invisible).
         if let Some(tok) = wait_token(&mut cdp, Duration::from_secs(8)).await {
             return Ok(tok);
+        }
+
+        // 3b) Nothing happened — the click may have been dropped (layout
+        // shift). Re-measure and click once more before calling it unsolvable.
+        if let Ok(info2) = cdp.eval(PROBE_WIDGET_JS).await {
+            if info2.get("found").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let cx2 = info2.get("cx").and_then(|v| v.as_f64()).unwrap_or(cx);
+                let cy2 = info2.get("cy").and_then(|v| v.as_f64()).unwrap_or(cy);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let _ = click(&mut cdp, cx2, cy2).await;
+                if let Some(tok) = wait_token(&mut cdp, Duration::from_secs(8)).await {
+                    return Ok(tok);
+                }
+            }
         }
 
         // 4) Image grid rounds.
