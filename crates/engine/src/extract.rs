@@ -776,6 +776,61 @@ pub fn extract_from_email_body(
     out
 }
 
+/// Outcome of running an `extract from email=` plan against an activation
+/// e-mail body: the URL to visit to complete verification plus the named
+/// fields (passwords, tokens) to inject into the subsequent login/submit step.
+///
+/// This is the runner-facing driver for the article/comment family: the
+/// generic executor does the register `[setup]` form, then this function
+/// turns the confirmation e-mail into (a) an activation hop and (b) the
+/// credential map, so a later `login` step can substitute `%email_pw%` and the
+/// flow reaches the actual submission step.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EmailVerifyResult {
+    /// URL to visit to complete activation (a URL-valued item, failing that a
+    /// `first_login`/`email_link`/`*link`-named item), if one was resolved.
+    pub activation_url: Option<String>,
+    /// Every named field the engine declared, name → value (e.g. `password`
+    /// → the emailed password).  Includes the activation item itself.
+    pub fields: BTreeMap<String, String>,
+}
+
+/// Keys GSA INIs use to name the activation/confirmation link.
+fn is_link_name(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k == "first_login"
+        || k == "email_link"
+        || k == "confirmation_link"
+        || k == "validation_link"
+        || k == "verification_link"
+        || k.ends_with("link")
+        || k == "first_login_url"
+}
+
+fn is_url(v: &str) -> bool {
+    v.starts_with("http://") || v.starts_with("https://")
+}
+
+/// Classify the raw `extract from email=` resolution into an activation URL
+/// + the remaining named fields.  URL-valued items win as the activation hop;
+/// if none are absolute URLs, the link-named item is used (some INIs emit
+/// relative links the executor resolves against the host).
+pub fn resolve_email_verify(
+    engine: &Engine,
+    body: &str,
+    ctx: &Context,
+) -> EmailVerifyResult {
+    let fields = extract_from_email_body(engine, body, ctx);
+    let mut activation_url = fields.iter().find(|(_, v)| is_url(v)).map(|(_, v)| v.clone());
+    if activation_url.is_none() {
+        activation_url = fields
+            .iter()
+            .find(|(k, v)| is_link_name(k) && !v.trim().is_empty())
+            .map(|(_, v)| v.clone());
+    }
+    EmailVerifyResult { activation_url, fields }
+}
+
 // -----------------------------------------------------------------------------
 //  Tests — anchored on the real INI rule text GSA ships.
 // -----------------------------------------------------------------------------
@@ -999,5 +1054,53 @@ mod tests {
         if let Some(pw) = ex.resolve_field("pw") {
             assert!(!pw.is_empty(), "ladder fallback produced a value");
         }
+    }
+
+    #[test]
+    fn resolve_email_verify_splits_url_and_password() {
+        // Mirrors the proven WP password/link extraction, through the
+        // runner-facing `resolve_email_verify` driver.
+        let eng = parse_engine_str(
+            "[engine]\nengine type=Article\nurl=https://blog.example/\n\
+             extract from email=password=email_pw,first_login\n\n\
+             [email_pw]\ntype=extract\nfront1=: %login%|%login%|password\nfront2=:\n\
+             back1=\\n\nback2=<\nremove html=1\nmust have=!http://\n\
+             [first_login]\ntype=extract\nfind url=*key=*\ndefault=%login_url%\n\
+             [login_url]\ntype=extract\nfind url=*/wp-login.php\ndefault=/wp-login.php\n",
+            "wp",
+        )
+        .unwrap();
+        let body = "Your login: bob\nYour password: hunter2\n\nTo activate: <a href=\"https://blog.example/?key=k9\">go</a>";
+        let c = ctx(&[("login", "bob")]);
+        let res = resolve_email_verify(&eng, body, &c);
+        assert_eq!(res.activation_url.as_deref(), Some("https://blog.example/?key=k9"));
+        assert_eq!(res.fields.get("password").map(|s| s.as_str()), Some("hunter2"));
+    }
+
+    #[test]
+    fn resolve_email_verify_prefers_absolute_url_over_name() {
+        // A URL-valued item wins as the activation hop even when the link name
+        // is not in the known set; the non-URL field is preserved.
+        let eng = parse_engine_str(
+            "[engine]\nengine type=Article\nurl=http://x/\n\
+             extract from email=activation,token\n\n\
+             [activation]\ntype=extract\nstatic=1\nfind url=*activate/42\n\n\
+             [token]\ntype=extract\nfront1=Token: \nback1=,\n",
+            "x",
+        )
+        .unwrap();
+        let body = "Activate: <a href=\"https://x/activate/42\">go</a>\nToken: ABCD, proceed now";
+        let c = ctx(&[]);
+        let res = resolve_email_verify(&eng, body, &c);
+        assert_eq!(res.activation_url.as_deref(), Some("https://x/activate/42"));
+        assert_eq!(res.fields.get("token").map(|s| s.as_str()), Some("ABCD"));
+    }
+
+    #[test]
+    fn resolve_email_verify_no_plan_is_empty() {
+        let eng = parse_engine_str("[engine]\nengine type=Article\nurl=http://x/\n", "x").unwrap();
+        let res = resolve_email_verify(&eng, "any body", &ctx(&[]));
+        assert!(res.activation_url.is_none());
+        assert!(res.fields.is_empty());
     }
 }
