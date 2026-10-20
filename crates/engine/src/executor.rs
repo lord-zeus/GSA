@@ -769,10 +769,16 @@ pub async fn execute_plan_with_solver(
         if should_solve {
             let solver_ref = solver.expect("checked above");
             if let Some(answer) = solve_captcha(step, &res.html, solver_ref).await {
-                // Inject into the first non-hidden input; the engine's INI
-                // names the field but we don't re-parse it here — the
-                // first text input is the common-case captcha field.
-                let field_name = infer_captcha_field(&res.html);
+                // Inject into the captcha answer field. reCAPTCHA widgets use
+                // a fixed hidden field name (`g-recaptcha-response`, the
+                // standard v2 field — GSA SerLib's `insertSitekeyInText` does
+                // the same); other walls fall back to the first non-hidden
+                // input on the page (the common-case field).
+                let field_name = if super::captcha::extract_sitekey(&res.html).is_some() {
+                    "g-recaptcha-response".to_string()
+                } else {
+                    infer_captcha_field(&res.html)
+                };
                 if !fields.contains_key(&field_name) {
                     fields.entry(field_name).or_insert_with(|| answer.clone());
                 }
@@ -830,6 +836,7 @@ fn page_has_captcha_artifact(html: &str) -> bool {
     super::captcha::scan_arithmetic(html).is_some()
         || super::captcha::extract_text_challenge(html).is_some()
         || super::captcha::extract_image_url(html).is_some()
+        || super::captcha::extract_sitekey(html).is_some()
 }
 
 /// Ask a solver for the captcha answer on the given page body.
@@ -845,6 +852,7 @@ async fn solve_captcha(
         engine_name: None,
         url: step.nav.navigation_target(),
         page_title: None,
+        sitekey: super::captcha::extract_sitekey(html),
     };
     solver.solve(&ctx).await.ok()
 }

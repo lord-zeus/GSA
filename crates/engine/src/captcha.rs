@@ -7,7 +7,13 @@
 //!    in-memory. GSA's `text_captcha_extract.dat` is a table of rules we
 //!    re-implement here (built-in rules + optional dat-file overlay).
 //! 2. **2Captcha** — the binary hard-codes the public 2Captcha HTTP API
-//!    (text / image / reCAPTCHA / hCaptcha / Turnstile).
+//!    (text / image / reCAPTCHA / hCaptcha / Turnstile). This replica
+//!    implements reCAPTCHA-v2 directly: `extract_sitekey` (SerLib
+//!    `extractSitekey.js` parity) → 2Captcha `userrecaptcha` task (GSA
+//!    CPB `2Captcha (json).ini` `recaptcha_solve`: `googlekey`/`pageurl`)
+//!    → token into `g-recaptcha-response`. Made better than GSA: no local
+//!    GSA Captcha Breaker app needed — the solver speaks the provider
+//!    protocols (2Captcha classic + anti-captcha JSON) natively.
 //! 3. **Anti-Captcha** — secondary HTTP provider GSA supports (JS-based).
 //!
 //! This module ships the trait + the offline solver; HTTP providers live in
@@ -41,6 +47,13 @@ pub struct CaptchaContext {
     /// Page title (if known).
     #[serde(default)]
     pub page_title: Option<String>,
+    /// Google reCAPTCHA `sitekey` — when present, solvers submit a
+    /// reCAPTCHA-v2 task (2Captcha `userrecaptcha`, Anti-Captcha
+    /// `ReCaptchaV2Task`) and the answer is the response token, which the
+    /// executor injects into the `g-recaptcha-response` field. GSA SerLib
+    /// parity: `extractSitekey.js` → `userrecaptcha` → `insertSitekeyInText`.
+    #[serde(default)]
+    pub sitekey: Option<String>,
 }
 
 /// A captcha solve failure. Carries a short human-readable reason so the
@@ -92,6 +105,59 @@ pub trait CaptchaSolver: Send + Sync {
     fn name(&self) -> &'static str {
         "solver"
     }
+}
+
+// ============================================================================
+//  reCAPTCHA v2 — detect + task shapes (GSA SerLib parity)
+// ============================================================================
+
+/// Extract a Google reCAPTCHA `sitekey` from a page. Mirrors GSA SerLib's
+/// `extractSitekey.js`: looks for `data-sitekey="..."` on the widget, then
+/// for a `sitekey=<key>` query param on a `grecaptcha.../api.js` script.
+/// Returns `None` when the page carries no reCAPTCHA widget.
+pub fn extract_sitekey(html: &str) -> Option<String> {
+    let lower = html.to_lowercase();
+    // 1. data-sitekey="KEY" / data-sitekey='KEY' / data-sitekey=KEY
+    if let Some(p) = lower.find("data-sitekey") {
+        let rest = &html[p..];
+        let eq = rest.find('=')?;
+        let tail = &rest[eq + 1..];
+        let val = if tail.starts_with('\"') || tail.starts_with('\'') {
+            let q = tail.chars().next().unwrap();
+            let end = tail[1..].find(q)? + 2;
+            &tail[1..end - 1]
+        } else {
+            let end = tail
+                .find(|c: char| c.is_whitespace() || c == '>' || c == '\"' || c == '\'')
+                .unwrap_or(tail.len());
+            &tail[..end]
+        };
+        let key = val.trim();
+        if !key.is_empty() && !key.contains(char::is_whitespace) {
+            return Some(key.to_string());
+        }
+    }
+    // 2. script ... src="...recaptcha/api.js?anchor=...&hl=...&k=KEY" (the
+    //    `google.com/recaptcha` and `grecaptcha.*` hosts both load this way).
+    //    Indices are computed on the lowercased copy (safe — `to_lowercase`
+    //    preserves offsets for the ASCII markup we scan), but the KEY slice
+    //    comes from the original `html` so the result is case-exact.
+    if let Some(s) = lower.find("recaptcha") {
+        let region = &lower[s..(s + 400).min(lower.len())];
+        for token in ["sitekey=", "&k=", "k="] {
+            if let Some(kidx) = region.find(token) {
+                let rest = &region[kidx + token.len()..];
+                let end = rest
+                    .find(|c: char| c == '&' || c == '"' || c == '\'' || c.is_whitespace())
+                    .unwrap_or(rest.len());
+                let key = &html[s + kidx + token.len()..s + kidx + token.len() + end];
+                if key.len() >= 20 {
+                    return Some(key.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 // ============================================================================
@@ -388,6 +454,72 @@ pub struct TwoCaptchaSolver {
 }
 
 impl TwoCaptchaSolver {
+    /// Which task shape this context demands (test hook + solver path):
+    /// reCAPTCHA-v2 when a `sitekey` is present (or extractable from the
+    /// page HTML), plain image otherwise.
+    pub fn task_kind(ctx: &CaptchaContext) -> &'static str {
+        if ctx.sitekey.as_deref().is_some_and(|s| !s.trim().is_empty())
+            || extract_sitekey(&ctx.html).is_some()
+        {
+            "userrecaptcha"
+        } else {
+            "base64"
+        }
+    }
+
+    /// Submit a reCAPTCHA-v2 task (SerLib parity): `method=userrecaptcha`,
+    /// `googlekey={sitekey}`, `pageurl={url}`. Returns the task id.
+    async fn submit_recaptcha(&self, sitekey: &str, page_url: Option<&str>) -> Result<String, CaptchaError> {
+        let url = format!("{}/in.php", self.base_url);
+        let pageurl = page_url.unwrap_or("").trim().to_string();
+        let form: Vec<(&'static str, String)> = vec![
+            ("key", self.api_key.clone()),
+            ("method", "userrecaptcha".into()),
+            ("googlekey", sitekey.to_string()),
+            ("pageurl", pageurl),
+            ("json", "1".into()),
+            ("invisible", "0".into()),
+            ("soft_id", "135".into()),
+        ];
+        let resp = self
+            .client
+            .post(&url)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| CaptchaError::Network { message: e.to_string() })?;
+        Ok(self.parse_task_id(resp).await?)
+    }
+
+    async fn parse_task_id(&self, resp: reqwest::Response) -> Result<String, CaptchaError> {
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| CaptchaError::Network { message: e.to_string() })?;
+        match body.get("status").and_then(|v| v.as_str()) {
+            Some("1") | Some("true") => body
+                .get("request")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .ok_or(CaptchaError::Provider {
+                    code: "no-task-id".into(),
+                    message: body.to_string(),
+                }),
+            Some(s) => Err(CaptchaError::Provider {
+                code: s.to_string(),
+                message: body
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error")
+                    .to_string(),
+            }),
+            None => Err(CaptchaError::Provider {
+                code: "no-status".into(),
+                message: body.to_string(),
+            }),
+        }
+    }
+
     /// Build a 2Captcha solver (base `api.2captcha.com`).
     pub fn new(api_key: &str, timeout_secs: u32) -> Self {
         Self::with_base(api_key, timeout_secs, "https://api.2captcha.com")
@@ -516,6 +648,23 @@ impl TwoCaptchaSolver {
 #[async_trait::async_trait]
 impl CaptchaSolver for TwoCaptchaSolver {
     async fn solve(&self, ctx: &CaptchaContext) -> Result<String, CaptchaError> {
+        if TwoCaptchaSolver::task_kind(ctx) == "userrecaptcha" {
+            let sitekey = match &ctx.sitekey {
+                Some(s) if !s.trim().is_empty() => s.clone(),
+                _ => extract_sitekey(&ctx.html)
+                    .ok_or(CaptchaError::Unsolvable {
+                        reason: "2Captcha/reCAPTCHA path needs a sitekey".into(),
+                    })?,
+            };
+            let task = self
+                .submit_recaptcha(&sitekey, ctx.url.as_deref())
+                .await?;
+            let answer = self.poll(&task).await?;
+            if answer.trim().is_empty() {
+                return Err(CaptchaError::EmptyAnswer);
+            }
+            return Ok(answer);
+        }
         let image = match &ctx.image_url {
             Some(u) if !u.trim().is_empty() => u.clone(),
             _ => match extract_image_url(&ctx.html) {
@@ -571,28 +720,49 @@ impl AntiCaptchaSolver {
 #[async_trait::async_trait]
 impl CaptchaSolver for AntiCaptchaSolver {
     async fn solve(&self, ctx: &CaptchaContext) -> Result<String, CaptchaError> {
-        let image = match &ctx.image_url {
-            Some(u) if !u.trim().is_empty() => u.clone(),
-            _ => match extract_image_url(&ctx.html) {
-                Some(u) => u,
-                None => {
-                    return Err(CaptchaError::Unsolvable {
-                        reason: "Anti-Captcha/image solver needs an <img> captcha".into(),
-                    })
-                }
-            },
-        };
-
-        let submit = self
-            .client
-            .post("https://api.anti-captcha.com/createTask")
-            .json(&serde_json::json!({
+        // reCAPTCHA-v2 task (SerLib parity) when a sitekey is present.
+        let sitekey = ctx
+            .sitekey
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| extract_sitekey(&ctx.html));
+        let task: serde_json::Value = if let Some(sk) = sitekey {
+            // GSA CapMonster Cloud.ini parity: NoCaptchaTaskProxyless is the
+            // anti-captcha.com name for a reCAPTCHA-v2 solve.
+            serde_json::json!({
+                "clientKey": self.api_key,
+                "task": {
+                    "type": "NoCaptchaTaskProxyless",
+                    "websiteKey": sk,
+                    "websiteURL": ctx.url.as_deref().unwrap_or(""),
+                    "isInvisible": false,
+                },
+            })
+        } else {
+            let image = match &ctx.image_url {
+                Some(u) if !u.trim().is_empty() => u.clone(),
+                _ => match extract_image_url(&ctx.html) {
+                    Some(u) => u,
+                    None => {
+                        return Err(CaptchaError::Unsolvable {
+                            reason: "Anti-Captcha solver needs a sitekey (reCAPTCHA) or an <img> captcha".into(),
+                        })
+                    }
+                },
+            };
+            serde_json::json!({
                 "clientKey": self.api_key,
                 "task": {
                     "type": "ImageToTextTask",
                     "body": image,
                 },
-            }))
+            })
+        };
+
+        let submit = self
+            .client
+            .post("https://api.anti-captcha.com/createTask")
+            .json(&task)
             .send()
             .await
             .map_err(|e| CaptchaError::Network { message: e.to_string() })?;
@@ -1106,6 +1276,7 @@ mod tests {
             engine_name: None,
             url: None,
             page_title: None,
+            sitekey: None,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1193,9 +1364,65 @@ mod tests {
     #[test]
     fn arithmetic_handles_html_around_expression() {
         let html = "<td>What is <b>3</b> + <b>7</b> ?</td>\
-                   <input type=\"text\" name=\"code2\" />\n\
+                   <input type=\"text\" name=\"code2\" />\
                    <p>some other text without numbers</p>";
         let s = LocalSolver::default();
         assert_eq!(s.try_solve_arithmetic(html), Some("10".into()));
+    }
+
+    // -- F#28 reCAPTCHA-v2 bridge (SerLib parity) ------------------------------
+
+    #[test]
+    fn extract_sitekey_from_data_attribute() {
+        let html = r#"<div class="g-recaptcha" data-sitekey="6Ldb5_MeAAAAAN4B_pLBT3CdxV5X_ONzX7CpyZ11"></div>"#;
+        assert_eq!(extract_sitekey(html), Some("6Ldb5_MeAAAAAN4B_pLBT3CdxV5X_ONzX7CpyZ11".into()));
+    }
+
+    #[test]
+    fn extract_sitekey_from_data_attribute_unquoted() {
+        let html = r#"<div class="g-recaptcha" data-sitekey=6Ld_b5MeAAAA_AN4BP></div>"#;
+        assert_eq!(extract_sitekey(html), Some("6Ld_b5MeAAAA_AN4BP".into()));
+    }
+
+    #[test]
+    fn extract_sitekey_from_api_js_script() {
+        let key = "ABCdef1234567890ABCdEFG";
+        let html = format!(
+            r#"<script src="https://www.google.com/recaptcha/api.js?anchor=140&co=a.example.com&hl=en&v=xyz&k={key}" async defer></script>"#
+        );
+        assert_eq!(extract_sitekey(&html).as_deref(), Some(key));
+    }
+
+    #[test]
+    fn extract_sitekey_absent_returns_none() {
+        let html = "<form><input name='code'><img src='/captcha.jpg'></form>";
+        assert_eq!(extract_sitekey(html), None);
+    }
+
+    #[test]
+    fn task_kind_recaptcha_when_sitekey_present() {
+        let ctx = CaptchaContext {
+            sitekey: Some("6Ldb5_MeAAAAAN4B".into()),
+            ..Default::default()
+        };
+        assert_eq!(TwoCaptchaSolver::task_kind(&ctx), "userrecaptcha");
+    }
+
+    #[test]
+    fn task_kind_recaptcha_when_sitekey_in_html() {
+        let ctx = CaptchaContext {
+            html: r#"<div class="g-recaptcha" data-sitekey="6LDB5_MEAAAAAN4BP"></div>"#.into(),
+            ..Default::default()
+        };
+        assert_eq!(TwoCaptchaSolver::task_kind(&ctx), "userrecaptcha");
+    }
+
+    #[test]
+    fn task_kind_image_when_no_sitekey() {
+        let ctx = CaptchaContext {
+            html: "<img src='https://cdn.example/captcha.png?id=123'>".into(),
+            ..Default::default()
+        };
+        assert_eq!(TwoCaptchaSolver::task_kind(&ctx), "base64");
     }
 }
