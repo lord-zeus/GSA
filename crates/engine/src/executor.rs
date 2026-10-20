@@ -753,8 +753,19 @@ pub async fn execute_plan_with_solver(
         }
         // F#21 — captcha pipeline: if this step hit a captcha wall and
         // we have a solver, solve it + re-submit once with the answer.
-        let should_solve = outcome.outcome == super::StepOutcome::CaptchaFailed
-            && solver.is_some();
+        //
+        // GSA parity (`adcopy_response=%captcha%`): many 2015-era engines
+        // answer the challenge *page itself* — e.g. InsaneJournal returns
+        // a challenge form (mode/ssl/code) in place of a success/failure
+        // marker, i.e. the step classifies as `Unknown`.  When the page
+        // carries a locally solvable artifact (inline arithmetic or a
+        // captcha image), treat Unknown as a wall too and take the same
+        // solve-and-resubmit path.  Pages with no artifact keep the
+        // previous behaviour (no solver round-trip, clean Unknown).
+        let should_solve = solver.is_some()
+            && (outcome.outcome == super::StepOutcome::CaptchaFailed
+                || (outcome.outcome == StepOutcome::Unknown
+                    && page_has_captcha_artifact(&res.html)));
         if should_solve {
             let solver_ref = solver.expect("checked above");
             if let Some(answer) = solve_captcha(step, &res.html, solver_ref).await {
@@ -804,6 +815,20 @@ pub async fn execute_plan_with_solver(
         report.steps.push(outcome);
     }
     report
+}
+
+/// GSA parity helper: does this page expose a challenge artifact the local
+/// solver (or a keyed remote one) could act on — inline arithmetic
+/// (`scan_arithmetic`) or a captcha image (`extract_image_url`)?  Used as a
+/// cheap *gate* before dispatching a solver on an `Unknown`-classified step,
+/// so plain 404s / missing-markers pages never cost a solver round-trip.
+///
+/// Deliberately top-document only: cross-origin challenge iframes (IJ's
+/// `kr-frame`) are invisible here and report `false` — correct, since the
+/// local solver cannot reach into them either.
+fn page_has_captcha_artifact(html: &str) -> bool {
+    super::captcha::scan_arithmetic(html).is_some()
+        || super::captcha::extract_image_url(html).is_some()
 }
 
 /// Ask a solver for the captcha answer on the given page body.
@@ -1269,6 +1294,88 @@ captcha failed=captcha does not match
         let second = driver.second_fields.lock().unwrap();
         assert!(second.contains_key("code"), "answer field missing in retry: {:?}", second);
     }
+
+    /// GSA parity (`adcopy_response=%captcha%`): a register step whose first
+    /// response is a *challenge page with no success/failure marker* — the
+    /// step classifies as `Unknown`, not `CaptchaFailed`.  If that page
+    /// exposes inline arithmetic (the classic `code` wall) the solver must
+    /// still fire, the answer land in the field, and the re-submit succeed.
+    /// `page_has_captcha_artifact` is the gate that makes this branch live.
+    struct FirstChallengeUnknownThenOk {
+        second_fields: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl FirstChallengeUnknownThenOk {
+        fn new() -> Self {
+            Self {
+                second_fields: std::sync::Mutex::new(HashMap::new()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn submit_fields(&self, fields: HashMap<String, String>) -> DriverResponse {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let html = if n == 0 {
+                // No success/failure marker — just an arithmetic challenge.
+                "<html><body>What is 12 + 5?\n\
+                 <form><input type=\"text\" name=\"code\"></form></body></html>"
+                    .to_string()
+            } else {
+                if fields.get("code").map(String::as_str) != Some("17") {
+                    "<html><body>challenge did not match</body></html>".to_string()
+                } else {
+                    "<html><body>thank you for submitting</body></html>".to_string()
+                }
+            };
+            if n > 0 {
+                *self.second_fields.lock().unwrap() = fields;
+            }
+            DriverResponse {
+                ok: true,
+                final_url: "mock".into(),
+                html,
+                error: None,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl Driver for FirstChallengeUnknownThenOk {
+        async fn navigate(&self, _url: String) -> DriverResponse {
+            self.submit_fields(HashMap::new())
+        }
+        async fn submit(
+            &self,
+            _url: String,
+            fields: HashMap<String, String>,
+            _timeout: std::time::Duration,
+        ) -> DriverResponse {
+            self.submit_fields(fields)
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_outcome_with_arithmetic_challenge_is_solved_and_retried() {
+        let solver = crate::captcha::LocalSolver::default();
+        // NOTE: no `captcha failed=` marker — this is what makes the wall
+        // classify as Unknown (the IJ / sharecg shape), exercising the
+        // `page_has_captcha_artifact` gate, not the old CaptchaFailed path.
+        let raw = r#"
+[step 1]
+url=http://s.example/
+submit success=thank you for submitting
+"#;
+        let eng = parse_engine_str(raw, "E").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        let driver = FirstChallengeUnknownThenOk::new();
+        let report = execute_plan_with_solver(&plan, &driver, Some(&solver)).await;
+        assert_eq!(report.successful, 1, "expected 1 success, got {:?}", report);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.retried, 1, "solver should have re-submitted once");
+        let second = driver.second_fields.lock().unwrap();
+        // 12 + 5 = 17 — the LocalSolver's arithmetic answer, injected by name.
+        assert_eq!(second.get("code").map(String::as_str), Some("17"),
+            "answer must ride the retry; got {:?}", second);
+    }
+
 
     // -- F#27 (Stage A) — GSA `just download=1` URL-shortener family ---------
 
