@@ -84,6 +84,9 @@ fn env_nonempty(var: &str) -> Option<String> {
 pub struct Cdp {
     ws: Box<dyn Transport>,
     next_id: u64,
+    /// When set (attached out-of-process iframe), every frame is tagged
+    /// with this `sessionId` so CDP routes it to the attached target.
+    session: Option<String>,
 }
 
 impl Cdp {
@@ -92,13 +95,30 @@ impl Cdp {
         let t = WsTransport::connect(ws_url.to_string())
             .await
             .map_err(|e| CaptchaError::Network { message: format!("ws connect: {e}") })?;
-        Ok(Self { ws: Box::new(t), next_id: 1 })
+        Ok(Self { ws: Box::new(t), next_id: 1, session: None })
+    }
+
+    /// Route every message through an attached session (flatten: true
+    /// attach target). The ws itself stays on the browser/page endpoint.
+    pub fn with_session(mut self, session: String) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Switch the session routing (None = this connection's own target).
+    /// Sessions are bound to the connection that created them, so flip
+    /// this when driving attached iframes on the same ws.
+    pub fn set_session(&mut self, session: Option<String>) {
+        self.session = session;
     }
 
     pub async fn send(&mut self, method: &str, params: Value) -> Result<Value, CaptchaError> {
         let id = self.next_id;
         self.next_id += 1;
-        let frame = json!({ "id": id, "method": method, "params": params }).to_string();
+        let frame = match &self.session {
+            Some(s) => json!({ "id": id, "method": method, "params": params, "sessionId": s }).to_string(),
+            None => json!({ "id": id, "method": method, "params": params }).to_string(),
+        };
         self.ws
             .send_frame(&frame)
             .await
@@ -151,6 +171,16 @@ impl Cdp {
 }
 
 pub async fn click(cdp: &mut Cdp, x: f64, y: f64) -> Result<(), CaptchaError> {
+    // Human-ish trajectory: approach, press, short hold, release. Verified
+    // to pass localendar's reCAPTCHA v2 where a raw pressed/released pair
+    // is sometimes dropped as synthetic.
+    let _ = cdp
+        .send(
+            "Input.dispatchMouseEvent",
+            json!({ "type": "mouseMoved", "x": x - 24.0, "y": y - 24.0, "button": "none" }),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
     for typ in ["mousePressed", "mouseReleased"] {
         cdp
             .send(
@@ -163,7 +193,7 @@ pub async fn click(cdp: &mut Cdp, x: f64, y: f64) -> Result<(), CaptchaError> {
                 }),
             )
             .await?;
-        tokio::time::sleep(Duration::from_millis(60)).await;
+        tokio::time::sleep(Duration::from_millis(70)).await;
     }
     Ok(())
 }
@@ -191,15 +221,24 @@ async fn wait_token(cdp: &mut Cdp, timeout: Duration) -> Option<String> {
 }
 
 const PROBE_WIDGET_JS: &str = r#"(() => {
-  const sel = ['.g-recaptcha', '[data-sitekey]', 'iframe[src*="recaptcha/api2/anchor"]', 'iframe[src*="recaptcha"]'];
-  let el = null;
-  for (const s of sel) { const f = document.querySelector(s); if (f) { el = f; break; } }
+  // Pick the LARGEST visible .g-recaptcha: pages can carry hidden
+  // duplicates (modals), and DOM order is not a reliable pick.
+  let el = null, best = 1;
+  for (const e of document.querySelectorAll('.g-recaptcha, [data-sitekey]')) {
+    const r = e.getBoundingClientRect();
+    if (r.width > 10 && r.height > 10 && r.width * r.height > best) { best = r.width * r.height; el = e; }
+  }
+  if (!el) { for (const s of ['iframe[src*="recaptcha/api2/anchor"]', 'iframe[src*="recaptcha"]']) { const f = document.querySelector(s); if (f) { el = f; break; } } }
   if (!el) return { found: false };
-  el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
+  el.scrollIntoView({block: 'center', behavior: 'instant'});
   const b = el.getBoundingClientRect();
-  // v2 checkbox sits ~14px inside the left edge, vertically centred.
+  // v2 checkbox sits ~28px inside the left edge, vertically centred.
+  // (verified working against localendar: +28/+h*0.5 lands the checkbox;
+  //  +14 misses to the frame edge and the click is dropped.)
+  // NOTE: DOMRect exposes .width/.height — .w/.h are undefined and make
+  // cy NaN→null→0, sending the click to the top-left corner.
   return { found: true, x: b.x, y: b.y, w: b.width, h: b.height,
-           cx: b.x + 14, cy: b.y + Math.min(40, Math.max(10, b.h / 2 - 5)) };
+           cx: b.x + 28, cy: b.y + b.height / 2 };
 })()"#;
 
 const CHALLENGE_JS: &str = r#"(() => {
@@ -357,7 +396,7 @@ async fn read_question(ep: &str) -> Option<String> {
 }
 
 /// Hand-rolled base64 decode (png is base64 standard with padding, no deps).
-fn b64_decode(s: &str) -> Option<Vec<u8>> {
+pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let mut acc: u32 = 0;
     let mut bits = 0;
@@ -444,7 +483,7 @@ impl CdpVisionSolver {
                 .await
                 .map_err(|e| CaptchaError::Network { message: format!("cdp ws connect: {e}") })?,
         );
-        let mut cdp = Cdp { ws: box_transport, next_id: 1 };
+        let mut cdp = Cdp { ws: box_transport, next_id: 1, session: None };
         let _ = cdp.send("Page.enable", json!({})).await;
         let _ = cdp.send("Runtime.enable", json!({})).await;
         let _ = cdp.send("Page.navigate", json!({ "url": page })).await;
@@ -459,13 +498,21 @@ impl CdpVisionSolver {
         tokio::time::sleep(Duration::from_millis(1500)).await;
 
         // 2) Find + click the checkbox.
-        let info = cdp.eval(PROBE_WIDGET_JS).await?;
-        let found = info.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
-        if !found {
-            return Err(CaptchaError::Unsolvable {
-                reason: "reCAPTCHA widget not found in the DOM after load".into(),
-            });
+        // JS-rendered pages can inject the widget seconds after
+        // readyState=complete — poll for it instead of failing on one shot.
+        let mut info_opt: Option<Value> = None;
+        for _ in 0..30 {
+            if let Ok(v) = cdp.eval(PROBE_WIDGET_JS).await {
+                if v.get("found").and_then(|f| f.as_bool()).unwrap_or(false) {
+                    info_opt = Some(v);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
+        let info = info_opt.ok_or_else(|| CaptchaError::Unsolvable {
+            reason: "reCAPTCHA widget not found in the DOM after load".into(),
+        })?;
         let cx = info.get("cx").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let cy = info.get("cy").and_then(|v| v.as_f64()).unwrap_or(0.0);
         // let the (instant) scroll fully settle so the measured
