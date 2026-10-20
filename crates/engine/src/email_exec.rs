@@ -529,9 +529,26 @@ pub fn execute_email_engine(
         return done(&mut report, &messages, &candidates);
     }
     report.successful = 1;
-    report.submitted_url = Some(target);
+    report.submitted_url = Some(candidates[0].url.clone());
     report.submitted_url_source = Some(resp.final_url);
     report.steps.push(StepOutcomeRef { outcome: StepOutcome::Success, matched_phrase: None });
+    // F#12-ext (copy GSA `delurl`, 22/27 INIs): best-effort DELETE of the
+    // consumed message. The verify already succeeded above — a delete
+    // failure is logged but must not turn a successful verify into a failure.
+    // GET (not DELETE) because all shipped delurl targets (mailinator,
+    // mailcatch, dispostable, spamfree24, trash-mail) are href-style
+    // GET links; a POST-based inbox would just ignore the verb.
+    if let Some(del) = &candidates[0].delete_url {
+        let del_url = del.trim().to_string();
+        if !del_url.is_empty() {
+            let dresp = block_on_driver(driver, del_url.clone(), HashMap::new());
+            if !dresp.ok {
+                report
+                    .errors
+                    .push(format!("delete message {del_url}: {}", dresp.error.unwrap_or_default()));
+            }
+        }
+    }
     done(&mut report, &messages, &candidates)
 }
 
@@ -555,7 +572,7 @@ fn extract_candidates(engine: &EmailEngine, body: &str) -> Vec<EmailSubmission> 
         .find(|t| t.starts_with("http://") || t.starts_with("https://"))
         .map(|t| t.trim_end_matches(|c: char| !c.is_ascii_alphanumeric()).to_string())
         .filter(|u: &String| !u.is_empty())
-        .map(|u| vec![EmailSubmission { url: u, email_line: None, subject_line: None }])
+        .map(|u| vec![EmailSubmission { url: u, email_line: None, subject_line: None, delete_url: None, code: None }])
         .unwrap_or_default()
 }
 

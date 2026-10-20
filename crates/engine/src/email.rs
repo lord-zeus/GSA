@@ -59,6 +59,9 @@ pub struct EmailEngine {
     /// `url_add front` — prefix the extracted fragment to build a full link
     /// (1secmail: `…&id=` + fragment; mailmenot: route prefix + key). 2 files.
     pub url_add_front: Option<String>,
+    /// `url_must have` — keep only candidate links containing this substring
+    /// (1secmail: `url_must have=stees.online`).
+    pub url_must_have: Option<String>,
     /// `web parse url post data` — form body for the inbox fetch (POST) — 127 files.
     pub web_parse_post: Option<String>,
     /// `enabled` flag from the spec (216 of 217 shipped specs set it).
@@ -148,6 +151,7 @@ impl Engine {
             cut_top: fields.get("cut top").filter(|s| !s.trim().is_empty()).cloned(),
             cut_bottom: fields.get("cut bottom").filter(|s| !s.trim().is_empty()).cloned(),
             url_add_front: fields.get("url_add front").filter(|s| !s.trim().is_empty()).cloned(),
+            url_must_have: fields.get("url_must have").filter(|s| !s.trim().is_empty()).cloned(),
             web_parse_post: fields.get("web parse url post data").filter(|s| !s.trim().is_empty()).cloned(),
             enabled: fields
                 .get("enabled")
@@ -255,6 +259,16 @@ pub struct EmailSubmission {
     pub url: String,
     pub email_line: Option<String>,
     pub subject_line: Option<String>,
+    /// `delurl_front*` / `delurl_back*` — the per-message "delete this
+    /// message" link (22/27 shipped INIs). After the verify visit, GSA
+    /// fetches this to remove the consumed inbox mail (dedup / stop re-reading
+    /// the same verification row).
+    pub delete_url: Option<String>,
+    /// Numeric verification code (6–8 digits typical) extracted from the
+    /// message body. Better than GSA's link-only extractors: 42 of the 959
+    /// shipped target INIs gate registration on a `%your e-mail%` +
+    /// "code is…" / "check your email…" numeric code, not a link.
+    pub code: Option<String>,
 }
 
 /// Extract submission candidates from a raw inbox/message body using the
@@ -398,10 +412,20 @@ pub fn extract_from_message(engine: &EmailEngine, body: &str) -> Vec<EmailSubmis
             if let Some(pref) = &engine.url_add_front {
                 url = format!("{}{}", pref, url);
             }
+            // `url_must have` — drop the candidate unless its URL contains the
+            // required substring (1secmail: `url_must have=stees.online`).
+            if let Some(needle) = engine.url_must_have.as_deref() {
+                let n = needle.trim();
+                if !n.is_empty() && !url.to_ascii_lowercase().contains(&n.to_ascii_lowercase()) {
+                    continue;
+                }
+            }
             out.push(EmailSubmission {
                 url,
                 email_line: companion(piece, &engine.email_fb),
                 subject_line: companion(piece, &engine.subject_fb),
+                delete_url: companion(piece, &engine.delurl_fb),
+                code: extract_verification_code(piece),
             });
             // One rung-per-piece yield matches GSA's shipped 1secmail
             // behaviour (separator=id" -> one candidate per row).
@@ -422,6 +446,94 @@ fn cut_bottom(engine: &EmailEngine) -> String {
 /// Trim + normalize an extracted URL fragment (wraps whitespace). Empty → empty string.
 fn extract_url(fragment: &str) -> String {
     fragment.trim().to_string()
+}
+
+/// Extract a numeric verification code from a message body.
+///
+/// Better-than-GSA: GSA's shipped INI extractors are link-only
+/// (`url_front*` → `url_back*`). But 42 of the 959 target INIs say
+/// "code is…", 42 say "check your email…", and 61 mention "confirmation"
+/// — meaning many target sites gate their register→verify→login flow on a
+/// *numeric code*, not a link. GSA has no site-agnostic code extractor, so
+/// we add one: pull the code out of the registration email and surface it
+/// alongside the (possible) link, letting the caller submit whichever the
+/// site expects.
+///
+/// Deterministic, std-only. Two tiers:
+/// 1. **Explicit marker** — find a code keyword ("code is", "code:", "your
+///    code", "confirmation code", "verification code", "pin code", …), then
+///    scan the next ~24 chars for a standalone 4–8 digit run.
+/// 2. **Fallback** — the first standalone 6–8 digit token whose neighbours
+///    are non-alphanumeric and not `.` (rules out decimals, paths, phones).
+pub fn extract_verification_code(body: &str) -> Option<String> {
+    const MARKERS: &[&str] = &[
+        "code is", "code:", "code ", "your code", "confirmation code",
+        "verification code", "verify code", "pin code", "pin is",
+        "code number", "code de verification", "code verifi",
+    ];
+    let lower = body.to_ascii_lowercase();
+    for marker in MARKERS {
+        let mut start = 0;
+        while let Some(rel) = lower[start..].find(marker) {
+            let abs = start + rel;
+            let end = (abs + marker.len() + 24).min(body.len());
+            if let Some(code) = find_digit_run(body, abs + marker.len(), end) {
+                return Some(code);
+            }
+            start = abs + marker.len();
+        }
+    }
+    scan_standalone_digits(body, 6..=8)
+}
+
+/// Scan `text[start..end]` for a digit-run of 4–8 digits.
+fn find_digit_run(text: &str, start: usize, end: usize) -> Option<String> {
+    let b = text.as_bytes();
+    let mut i = start.min(b.len());
+    let hi = end.min(b.len());
+    while i < hi {
+        if b[i].is_ascii_digit() {
+            let mut j = i;
+            while j < hi && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if (4..=8).contains(&j.wrapping_sub(i)) {
+                return Some(text[i..j].to_string());
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Fallback: first standalone digit-run of `len` digits with a clean boundary.
+fn scan_standalone_digits(text: &str, len: std::ops::RangeInclusive<usize>) -> Option<String> {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() {
+            let mut j = i;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            let run_len = j - i;
+            if len.contains(&run_len) {
+                let before = if i > 0 { b[i - 1] } else { b' ' };
+                let after = if j < b.len() { b[j] } else { b' ' };
+                if !before.is_ascii_alphanumeric() && before != b'.'
+                    && !after.is_ascii_alphanumeric() && after != b'.'
+                {
+                    return Some(text[i..j].to_string());
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -793,6 +905,64 @@ enabled=1
         let e = parse_email_engine_str(SAMPLE, "s").unwrap();
         // body without the "my link" marker is discarded entirely
         assert!(extract_from_message(&e, "<a href=\"https://x.co\">.verify</a>").is_empty());
+    }
+
+    // F#12-ext — copy GSA `delurl` + `url_must have` + code extraction.
+    const DELURL_INI: &str = r#"
+[setup]
+emails match=*@mailinator.com
+pop3 server=WEB
+url_front=[verify]
+url_back=[/verify]
+url_must have=stees
+delurl_front=[del]
+delurl_back=[/del]
+"#;
+
+    #[test]
+    fn delurl_delete_link_and_url_must_have_are_parsed() {
+        let e = parse_email_engine_str(DELURL_INI, "d").unwrap();
+        assert_eq!(e.url_must_have.as_deref(), Some("stees"));
+        assert_eq!(e.delurl_fb[0].0.as_deref(), Some("[del]"));
+        assert_eq!(e.delurl_fb[0].1.as_deref(), Some("[/del]"));
+    }
+
+    #[test]
+    fn url_must_have_drops_nonmatching_link() {
+        let e = parse_email_engine_str(DELURL_INI, "d").unwrap();
+        // verify URL without the required substring is dropped
+        assert!(extract_from_message(&e, "junk [verify]https://other.com/x[/verify] tail").is_empty());
+        // verify URL containing the substring survives
+        let ok = extract_from_message(&e, "junk [verify]https://stees.online/x[/verify] tail");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].url, "https://stees.online/x");
+    }
+
+    #[test]
+    fn delurl_yields_delete_link_per_row() {
+        let e = parse_email_engine_str(DELURL_INI, "d").unwrap();
+        let body = "x [verify]https://stees.online/v/z[/verify] ... [del]https://stees.online/del/z[/del]";
+        let out = extract_from_message(&e, body);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].delete_url.as_deref(), Some("https://stees.online/del/z"));
+    }
+
+    #[test]
+    fn extract_verification_code_markers_and_fallback() {
+        assert_eq!(
+            extract_verification_code("Dear user, your code is 987654. Click to verify."),
+            Some("987654".to_string())
+        );
+        assert_eq!(
+            extract_verification_code("confirmation code: 123456"),
+            Some("123456".to_string())
+        );
+        assert_eq!(
+            extract_verification_code("please verify 482913 within 10 minutes"),
+            Some("482913".to_string())
+        );
+        assert_eq!(extract_verification_code("nothing here today"), None);
+        assert_eq!(extract_verification_code("no digits in this sentence"), None);
     }
 
     /// Parse every real GSA email engine in a local catalog dir (if present)
