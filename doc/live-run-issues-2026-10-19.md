@@ -69,3 +69,44 @@ Original GSA (v19.06 DEMO) behavior noted next to each issue as the reference.
 - **Public proxy candidates dead:** 185.181.106.113:80, 185.39.157.233:80, 95.82.61.112:1086,
   62.192.219.91:1086, 92.118.109.149:1080, 31.43.227.214:1080 — all timeout via curl (recorded as
   proxy-pool quality signal, not code bugs).
+
+## Addendum — 2026-10-20 (shortener sweep + article/comment family audit)
+
+- **BUG-7 (Projects UI shows "no engines" despite 45 in API):**
+  `GET /api/projects/c359a0a8…/engines` returns 45 rows (verified, JSON shape
+  `[{id, project_id, engine_name, engine_type, url, file_path, step_count,
+  enabled, created_at}]`) but the project detail page renders an empty engine list.
+  Vue-side fetch/response-shape mismatch (client.ts / ProjectsView.vue — likely reads
+  `.name` where API sends `.engine_name`, or a `data` wrapper expectation).
+  Severity: MEDIUM (data works over API; project runs by engine id fine — only
+  the display is blind).
+- **OBS-10 (2026 shortener census — most of the 53 INI shorteners are dead):**
+  live probes (curl, 2026-10-20): WORKING: rlu.ru (GET add-link, dofollow;
+  anti-dedup via `?gsa_<seed>` verified → distinct codes). PARTIAL/DEAD: is.gd +
+  v.gd → "Error, database insert failed" (server-side, both); 0rz.tw → SPA
+  (fetch()-only, no static form); ux.nu → parked; ity.im → down; tighturl.com →
+  301 + Cloudflare; tr.im, tinyurl, rb.gy, shut.im → down/CF-blocked.
+  → Public no-key shortener space in 2026 ≈ rlu.ru only.
+- **OBS-11 (article/comment Web2.0 family — all three tested dead for anonymous
+  register in 2026, matching GSA's own `enabled=0` notes):**
+  * InsaneJournal `create.bml` → now an **invite-gated "account creation code"**
+    page (JS challenge in cross-origin `kr-frame`, arithmetic not in top document);
+    INI already says `;disabled as they require a code now`.
+  * TheDataHub `/user/register` → 301 to homepage (register removed; read-only).
+  * ShareCG → image captcha (`security_image.php`) + extra email codes;
+    GSA INI `enabled=0`. Image captchas need a KEYED remote solver (2Captcha/
+    AntiCaptcha) — LocalSolver is arithmetic-only by design.
+  → GSA `adcopy_response=%captcha%` parity implemented (commit 49dfc71): steps
+  classified `Unknown` whose page carries a solvable artifact now ride the same
+  solve-and-resubmit path (unit test: 12+5→17 into `code`). This makes future
+  arithmetic-walled engines work locally and keyed image walls work remote —
+  but cannot rescue invite-gated/removed registries.
+- **CONFIRMED BACKLINKS (target https://nordiccomps.com/, rlu.ru dofollow):**
+  | # | created | verified |
+  |---|---------|----------|
+  | 1 | http://rlu.ru/5i1b6 | 301 → https://nordiccomps.com/ ✓ |
+  | 2 | http://rlu.ru/5i1mE | 301 → https://nordiccomps.com/?gsa_18e01238c7980c9d ✓ |
+  | 3 | http://rlu.ru/5i1nx | 301 → https://nordiccomps.com/?gsa_18e0149c26b5d819 ✓ |
+  Progress: **3/100**. Path to 100: (a) BUG-7 display, (b) more live engines
+  beyond the 2015 GSA catalog, (c) batch via `run-mixed`.
+
