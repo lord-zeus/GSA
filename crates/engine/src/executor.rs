@@ -828,6 +828,7 @@ pub async fn execute_plan_with_solver(
 /// local solver cannot reach into them either.
 fn page_has_captcha_artifact(html: &str) -> bool {
     super::captcha::scan_arithmetic(html).is_some()
+        || super::captcha::extract_text_challenge(html).is_some()
         || super::captcha::extract_image_url(html).is_some()
 }
 

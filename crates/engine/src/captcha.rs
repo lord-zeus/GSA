@@ -349,9 +349,15 @@ impl CaptchaSolver for LocalSolver {
         if let Some(ans) = self.try_solve_arithmetic(&ctx.html) {
             return Ok(ans);
         }
+        // GSA parity: the data-driven text-challenge table (word-echo,
+        // multilingual arithmetic-glue walls) — copied from GSA's
+        // text_captcha_extract.dat.
+        if let Some(ans) = extract_text_challenge(&ctx.html) {
+            return Ok(ans);
+        }
         Err(CaptchaError::Unsolvable {
-            reason: "no inline arithmetic found — use an image solver (2Captcha/Anti-Captcha) \
-                     for graphical captchas"
+            reason: "no inline arithmetic or GSA-table text challenge found — use an \
+                     image solver (2Captcha/Anti-Captcha) for graphical captchas"
                 .into(),
         })
     }
@@ -662,6 +668,101 @@ impl CaptchaSolver for AntiCaptchaSolver {
 }
 
 // ============================================================================
+//  GSA text-challenge extractor — a copy of GSA's `text_captcha_extract.dat`
+// ============================================================================
+
+/// GSA's own data-driven text-captcha table (914 multilingual rules, copied
+/// verbatim from the original install: "word echo" walls — `Please write
+/// the word "|"` — arithmetic-glue walls — `What is|? * <` — and dozens of
+/// localized variants). Each rule is `left|glue|right`: the live page
+/// contains `<left> <ANSWER> <glue> <right>` (2-pipe) or
+/// `<left> <ANSWER> <right>` (1-pipe), and the answer is what sits between
+/// them. Data-driven like in GSA: new challenge markup only needs a new
+/// table line, never a recompile of solver logic (the table itself is
+/// embedded at build time, as here).
+fn gsa_text_rules() -> &'static Vec<(String, String, String)> {
+    static RULES: std::sync::OnceLock<Vec<(String, String, String)>> = std::sync::OnceLock::new();
+    RULES.get_or_init(|| {
+        let raw: &[u8] = include_bytes!("../assets/text_captcha_extract.dat");
+        let text = String::from_utf8_lossy(raw);
+        text.lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| l.contains('|'))
+            .filter_map(|l| {
+                let parts: Vec<&str> = l.split('|').collect();
+                match parts.len() {
+                    2 => Some((parts[0].to_string(), String::new(), parts[1].to_string())),
+                    3 => Some((parts[0].to_string(), parts[1].to_string(), parts[2].to_string())),
+                    _ => None,
+                }
+            })
+            .collect()
+    })
+}
+
+fn find_ci(hay: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let hay_l = hay.to_lowercase();
+    let needle_l = needle.to_lowercase();
+    hay_l.find(&needle_l)
+}
+
+/// Try every GSA text-challenge rule against a page and return the first
+/// valid extracted answer. Rule shapes: 2-pipe `L|M|R` — the page reads
+/// `L M <ANSWER> R` (the answer sits between the middle marker and the
+/// right marker, as in `Human Test<|<strong>Please write the word "|""…`
+/// or `<!-- Visual Confirmation -->|<span class="gen">Hoeveel is | * </span>`);
+/// 1-pipe `L|R` — the answer sits directly between them. Each candidate
+/// span is validated (2–40 chars, alphanumerics + space/hyphen/dot/quote);
+/// a candidate that is itself an arithmetic question is solved and the
+/// numeric answer returned.
+pub fn extract_text_challenge(page: &str) -> Option<String> {
+    let lower = page.to_lowercase();
+    let clean = |s: &str| {
+        let t = s.trim();
+        let t = t.trim_matches(['"', '\'', '\u{201c}', '\u{201d}']).trim();
+        t.to_string()
+    };
+    let valid = |s: &str| (2..=40).contains(&s.chars().count())
+        && s.chars().all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '.' | '\'' | ','));
+    for (left, glue, right) in gsa_text_rules() {
+        let Some(start) = find_ci(&lower, left) else {
+            continue;
+        };
+        let mut candidates: Vec<String> = Vec::new();
+        if !glue.is_empty() {
+            if let Some(g) = find_ci(&lower[start..], glue) {
+                let glow = start + g;
+                let after_glue = glow + glue.len();
+                // dominant GSA pattern: answer between glue and right
+                if let Some(e) = find_ci(&lower[after_glue..], right) {
+                    candidates.push(lower[after_glue..after_glue + e].to_string());
+                }
+                // fallback: answer between left and glue
+                candidates.push(lower[start..glow].to_string());
+            }
+        } else if let Some(e) = find_ci(&lower[start..], right) {
+            candidates.push(lower[start..start + e].to_string());
+        }
+        for raw in candidates {
+            let cand = clean(&raw);
+            if cand.is_empty() {
+                continue;
+            }
+            if let Some(ans) = scan_arithmetic(&cand) {
+                return Some(ans);
+            }
+            if valid(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+// ============================================================================
 //  Arithmetic scanner — pure, synchronous, no deps
 // ============================================================================
 
@@ -956,6 +1057,61 @@ mod tests {
     fn arithmetic_addition() {
         let s = LocalSolver::default();
         assert_eq!(s.try_solve_arithmetic(&html_arith()), Some("10".into()));
+    }
+
+    #[test]
+    fn gsa_text_rules_table_loads_from_embedded_dat() {
+        let rules = gsa_text_rules();
+        assert!(rules.len() >= 800, "table should have ~914 rules, got {}", rules.len());
+        // spot-check a known rule pair from the shipped .dat
+        assert!(rules.iter().any(|(l, _, _)| l.contains("Please write the word")));
+    }
+
+    #[test]
+    fn extract_text_challenge_word_echo_us() {
+        // GSA rule (2-pipe): `Human Test<|<strong>Please write the word "|""`… —
+        // L=`Human Test<`, M=`<strong>Please write the word "`, R=`" without quotes…`
+        let page = "<form>Human Test<strong>Please write the word \"h3rm3s\" without \
+                    quotes into the field below</strong> <input name='code'></form>";
+        assert_eq!(extract_text_challenge(page).as_deref(), Some("h3rm3s"));
+    }
+
+    #[test]
+    fn extract_text_challenge_gsa_style_arithmetic_glue() {
+        // GSA rule: `<!-- Visual Confirmation -->|<span class="gen">Hoeveel is | * </span>`
+        let page = "<td><!-- Visual Confirmation --><span class=\"gen\">Hoeveel is 7 + 9 * </span>\
+                    <input name=\"code\"></td>";
+        assert_eq!(extract_text_challenge(page).as_deref(), Some("16"));
+    }
+
+    #[test]
+    fn extract_text_challenge_skips_html_junk_candidates() {
+        // Anchors present, but the candidate span is HTML/over-length — the
+        // extractor must reject it and end on None.
+        let page = "Human Test<strong>Please write the word \"<b>tot &</b> all the junk here \
+                    and many many more characters well past forty chars in total length\" \
+                    without quotes into the field below</strong>";
+        assert_eq!(extract_text_challenge(page), None);
+    }
+
+    #[test]
+    fn local_solver_word_echo_via_gsa_table() {
+        let s = LocalSolver::default();
+        let ctx = CaptchaContext {
+            html: "<form>Human Test<strong>Please write the word \"xyz123\" without quotes \
+                   into the field below</strong> <input name='code'></form>"
+                .into(),
+            image_url: None,
+            field_name: "code".into(),
+            engine_name: None,
+            url: None,
+            page_title: None,
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(rt.block_on(s.solve(&ctx)).ok().as_deref(), Some("xyz123"));
     }
 
     #[test]
