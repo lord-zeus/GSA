@@ -45,6 +45,16 @@ pub enum SpecSource {
 }
 
 impl SpecSource {
+    /// F#27 — the on-disk GSA roots (empty for the inline/fixture source).
+    /// The runner uses these to load the `Email_Engines/*.ini` provider specs
+    /// for the register → activate → login family.
+    pub fn gsa_roots(&self) -> Vec<std::path::PathBuf> {
+        match self {
+            Self::FromDisk(src) => src.roots.clone(),
+            Self::Inline(_) => Vec::new(),
+        }
+    }
+
     /// Resolve a job's `engine_id` to a parsed `Engine`. The `file_path`
     /// hint is used by the disk backend; the inline backend keys by id.
     pub fn resolve(&self, engine_id: Uuid, file_path: &str) -> Option<Engine> {

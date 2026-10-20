@@ -110,8 +110,9 @@ pub use spin::{Context, SpintaxResolver, default_context, resolve};
 pub use enginespec::{Engine, EngineType, Step, parse_engine_file, parse_engine_str};
 pub use extraction::{extract_front_back, extract_front_back_variants};
 pub use extract::{
-    EmailExtractPlan, EmailVerifyResult, Extractor, ExtractRule, extract_from_email_body,
-    glob_match, must_have_passes, parse_extract_from_email, resolve_email_verify,
+    EmailExtractPlan, EmailVerifyResult, Extractor, ExtractRule, engine_uses_email_verify,
+    extract_from_email_body, glob_match, must_have_passes, parse_extract_from_email,
+    resolve_email_verify,
 };
 pub use driver::{Driver, DriverResponse, MockDriver};
 pub use routing::{DriverKind, required_driver_kind, required_driver_kind_from_text};

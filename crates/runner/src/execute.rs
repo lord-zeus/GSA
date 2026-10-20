@@ -7,9 +7,12 @@ use std::io::Write;
 use std::path::Path;
 
 use engine::driver::Driver;
-use engine::email_exec::{EmailContext, run_email_engine};
-use engine::executor::{resolve_plan, ExecutionReport, SubmissionInput};
+use engine::email::{matches_address};
+use engine::email_create::load_email_engines;
+use engine::email_exec::{build_source, EmailContext, run_email_engine};
+use engine::executor::{resolve_plan, ExecutionReport, StepPhase, SubmissionInput};
 use engine::proxy::ProxySpec;
+use engine::{engine_uses_email_verify, resolve_email_verify};
 use engine::routing::DriverKind;
 use serde::Serialize;
 use uuid::Uuid;
@@ -477,47 +480,102 @@ impl JobRunner {
             let timeout_secs = s.captcha_timeout_secs.unwrap_or(60);
             engine::captcha::make_solver(provider, api_key.as_deref(), timeout_secs)
         };
-        let mut report = loop {
-            let drv: std::sync::Arc<dyn Driver> = match attempt_idx {
-                Some(i) => {
-                    let spec = &self.ctx.proxies[i];
-                    driver
-                        .proxy_driver(spec)
-                        .unwrap_or_else(|| std::sync::Arc::clone(&driver))
-                }
-                None => std::sync::Arc::clone(&driver),
+        // F#27 (GSA parity: register → activate → login → submit).
+        //
+        // These article/comment specs carry `extract from email=`: the account
+        // is registered, then an activation e-mail supplies the login password
+        // and/or the first-login URL that the later steps consume. A single
+        // linear pass no-ops after the register POST — it never reads that
+        // mail, so the login / submit steps hit a dead 404. We split the plan
+        // at the phase boundary: drive the register phase, fetch + parse the
+        // activation mail via the operator's `Email_Engines` provider (the F#12
+        // `emails match` + `extract from email=` pair), hop the activation URL
+        // in the SAME browser session, then re-drive the login / submit phase
+        // against a context that now carries the emailed values.
+        let has_register = plan.steps.iter().any(|s| s.phase == StepPhase::Register);
+        let report = if engine_uses_email_verify(&engine) && has_register {
+            let reg = {
+                let mut p = plan.clone();
+                p.steps = plan
+                    .steps
+                    .iter()
+                    .filter(|s| s.phase == StepPhase::Register)
+                    .cloned()
+                    .collect();
+                p
             };
-            let used_idx = attempt_idx;
-            let r: engine::executor::ExecutionReport =
-                match tokio::time::timeout(
+            let reg_report = self
+                .run_plan_retry(
+                    &reg,
+                    &driver,
+                    solver.as_deref(),
                     timeout,
-                    engine::executor::execute_plan_with_solver(
-                        &plan,
-                        drv.as_ref(),
-                        solver.as_deref(),
-                    ),
+                    n,
+                    &mut attempt_idx,
+                    &mut retried_down_proxy,
                 )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => {
-                        // Transport-level: the proxy/socket is what broke —
-                        // a timeout is the same "proxy seems down" class of
-                        // failure as a connection reset.
-                        empty_report_with_err(format!("job timed out after {timeout:?}"))
-                    }
-                };
-            let down_proxy_retriable = used_idx.is_some()
-                && n > 1
-                && !retried_down_proxy
-                && r.successful == 0
-                && looks_transport_failure(&r);
-            if down_proxy_retriable {
-                retried_down_proxy = true;
-                attempt_idx = Some((used_idx.unwrap() + 1) % n);
-                continue; // next loop iteration runs on the next proxy
+                .await;
+            // 2) read the activation mail → (activation URL, emailed credential).
+            let (verify, note) = self.email_verify_bridge(&engine, &input, &driver).await;
+            // 3) hop the activation link in the SAME browser session.
+            if let Some(u) = verify.activation_url.clone() {
+                let _ = driver.navigate(u).await;
             }
-            break r;
+            // 4) login + the real submission, now that %emailpw% / %first_login%
+            //    resolve to the emailed values (not the register step's spintax).
+            let mut input2 = input.clone();
+            for (k, v) in verify.fields.iter() {
+                input2
+                    .extra
+                    .entry(k.to_ascii_lowercase())
+                    .or_insert_with(|| v.clone());
+            }
+            let login = {
+                let mut p = resolve_plan(&engine, &input2);
+                p.steps = p
+                    .steps
+                    .iter()
+                    .filter(|s| s.phase != StepPhase::Register)
+                    .cloned()
+                    .collect();
+                p
+            };
+            let login_report = self
+                .run_plan_retry(
+                    &login,
+                    &driver,
+                    solver.as_deref(),
+                    timeout,
+                    n,
+                    &mut attempt_idx,
+                    &mut retried_down_proxy,
+                )
+                .await;
+            // 5) fold both phases; surface the bridge note as a diagnostic.
+            let mut merged = login_report;
+            merged.failed += reg_report.failed;
+            merged.retried += reg_report.retried;
+            merged.captcha_failed += reg_report.captcha_failed;
+            merged.errors.extend(reg_report.errors);
+            if merged.submitted_url.is_none() {
+                merged.submitted_url = reg_report.submitted_url;
+            }
+            if !note.is_empty() {
+                merged.errors.push(format!("[email-verify] {note}"));
+            }
+            merged
+        } else {
+            // No `extract from email=` — the classic linear pass.
+            self.run_plan_retry(
+                &plan,
+                &driver,
+                solver.as_deref(),
+                timeout,
+                n,
+                &mut attempt_idx,
+                &mut retried_down_proxy,
+            )
+            .await
         };
         let proxy_used = attempt_idx.map(|i| self.ctx.proxies[i].url());
 
@@ -531,6 +589,109 @@ impl JobRunner {
             Some(report.errors.join("; "))
         };
         self.finish(repo, job.id, done, err, report, keyword.clone(), proxy_used.as_deref()).await
+    }
+
+    /// F#27 — the proxy/transport retry loop over a [SubmissionPlan], factored
+    /// out so the register → activate → login family can drive it once per
+    /// phase against a sub-plan. This is the exact loop the classic (non-email)
+    /// path runs on the whole plan.
+    async fn run_plan_retry(
+        &self,
+        plan: &engine::executor::SubmissionPlan,
+        driver: &std::sync::Arc<dyn Driver>,
+        solver: Option<&dyn engine::captcha::CaptchaSolver>,
+        timeout: std::time::Duration,
+        n: usize,
+        attempt_idx: &mut Option<usize>,
+        retried_down_proxy: &mut bool,
+    ) -> ExecutionReport {
+        loop {
+            let drv: std::sync::Arc<dyn Driver> = match *attempt_idx {
+                Some(i) => {
+                    let spec = &self.ctx.proxies[i];
+                    driver
+                        .proxy_driver(spec)
+                        .unwrap_or_else(|| std::sync::Arc::clone(driver))
+                }
+                None => std::sync::Arc::clone(driver),
+            };
+            let used_idx = *attempt_idx;
+            let r: ExecutionReport = match tokio::time::timeout(
+                timeout,
+                engine::executor::execute_plan_with_solver(plan, drv.as_ref(), solver),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => empty_report_with_err(format!("job timed out after {timeout:?}")),
+            };
+            let down = used_idx.is_some()
+                && n > 1
+                && !*retried_down_proxy
+                && r.successful == 0
+                && looks_transport_failure(&r);
+            if down {
+                *retried_down_proxy = true;
+                *attempt_idx = Some((used_idx.unwrap() + 1) % n);
+                continue;
+            }
+            return r;
+        }
+    }
+
+    /// F#27 — fetch the operator's activation mail for a
+    /// register → activate → login → submit engine and resolve the emailed
+    /// credential (password / token) + any activation URL the login steps need.
+    /// Mirrors GSA's `emails match` + `extract from email=` pair, driven by the
+    /// operator's receiving mailbox. Returns `(resolution, note)`: an empty
+    /// `note` means success; a non-empty `note` is why the mail was unavailable
+    /// (no mailbox / no matching provider / fetch failed / no activation mail
+    /// yet) and is surfaced to the UI as a diagnostic error.
+    async fn email_verify_bridge(
+        &self,
+        engine: &engine::enginespec::Engine,
+        input: &SubmissionInput,
+        driver: &std::sync::Arc<dyn Driver>,
+    ) -> (engine::EmailVerifyResult, String) {
+        let (addr, pw, roots, drv) = (
+            self.ctx.email_address.clone(),
+            self.ctx.email_password.clone(),
+            self.spec.gsa_roots(),
+            std::sync::Arc::clone(driver),
+        );
+        let body = match tokio::task::spawn_blocking(move || {
+            if addr.trim().is_empty() {
+                return Err("no operator mailbox configured (set the email pool)".to_string());
+            }
+            let provider = roots.iter().find_map(|root| {
+                let engines = load_email_engines(root);
+                engines.into_iter().find(|e| matches_address(e, &addr))
+            });
+            let provider =
+                provider.ok_or_else(|| format!("no Email_Engines provider matches {addr}"))?;
+            let mail = EmailContext {
+                email_address: addr,
+                password: pw,
+            };
+            let inbox = build_source(&provider, &mail, drv);
+            let messages = inbox.fetch()?;
+            let body = messages
+                .iter()
+                .rev()
+                .map(|m| m.body.clone())
+                .find(|b| !b.trim().is_empty())
+                .ok_or_else(|| "activation mail not found in inbox (register pending or wrong inbox)".to_string())?;
+            Ok::<String, String>(body)
+        })
+        .await
+        {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => return (engine::EmailVerifyResult::default(), e),
+            Err(je) => return (engine::EmailVerifyResult::default(), format!("inbox worker panicked: {je}")),
+        };
+        let ctx = input.into_context();
+        let res = resolve_email_verify(engine, &body, &ctx);
+        (res, String::new())
     }
 
     /// Resolve the effective keyword for this job.

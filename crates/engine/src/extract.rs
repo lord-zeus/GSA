@@ -831,6 +831,17 @@ pub fn resolve_email_verify(
     EmailVerifyResult { activation_url, fields }
 }
 
+/// F#27 bridge predicate (runner-facing): true when this engine declares an
+/// `extract from email=` directive, i.e. it belongs to the
+/// register → activate → login → submit family where the confirmation e-mail
+/// supplies the login credential and/or the activation URL.  The runner uses
+/// this to decide whether the plain linear pass is enough or whether it must
+/// split the plan and read the operator's activation mail between phases.
+pub fn engine_uses_email_verify(engine: &Engine) -> bool {
+    let setup = engine.step("setup").or_else(|| engine.step("engine"));
+    !parse_extract_from_email(setup).items.is_empty()
+}
+
 // -----------------------------------------------------------------------------
 //  Tests — anchored on the real INI rule text GSA ships.
 // -----------------------------------------------------------------------------
