@@ -56,6 +56,9 @@ pub mod email_create;
 pub mod proxy;
 pub mod anchor;
 pub mod captcha;
+/// F#29 — free reCAPTCHA v2 (browser CDP + local vision oracle).
+#[cfg(feature = "browser")]
+pub mod captcha_cdp;
 /// F#22 — data-driven text generators cloned from GSA's shipped `.dat` pools
 /// (titlegen / comments / user_agents / charspin / typos / stop-words) — the
 /// "humanize" layer.  Wired into the spin resolver's `%...%` dispatch.

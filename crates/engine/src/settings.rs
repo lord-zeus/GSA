@@ -73,7 +73,9 @@ pub struct Settings {
     pub pop3_delete_days: Option<u32>,
     // ---- F#21 — captcha solver settings -------------------------------------
     /// Which captcha solver to use. `local` (free, offline, arithmetic only),
-    /// `2captcha`, `anticaptcha`, `capmonster`.
+    /// `2captcha`, `anticaptcha`, `capmonster`, and F#29's free-first
+    /// additions: `cdp-vision` (headless browser + local vision oracle) and
+    /// `auto` — the "totally free" chain `local → cdp-vision → paid-if-keyed`.
     #[serde(default)]
     pub captcha_provider: Option<String>,
     /// API key for 2Captcha / Anti-Captcha / CAPMonster. `local` ignores this.
@@ -108,7 +110,9 @@ impl Settings {
             verify_links: Some(true),
             pop3_delete_messages: Some(false),
             pop3_delete_days: Some(7),
-            captcha_provider: Some("local".into()),
+            // F#29 — free-first default: local arithmetic → free CDP+vision
+            // reCAPTCHA chain → paid providers only if a key exists.
+            captcha_provider: Some("auto".into()),
             captcha_api_key: None,
             captcha_timeout_secs: Some(60),
             captcha_poll_secs: Some(2),
@@ -524,7 +528,8 @@ mod tests {
         assert_eq!(f.get("user_agent"), Some(&"".to_string()));
         assert_eq!(f.len(), 15);
         // F#21 — captcha fields present with GSA defaults.
-        assert_eq!(f.get("captcha_provider"), Some(&"local".to_string()));
+        // F#29 — default provider is now "auto" (free chain: Local → CdpVision → paid-if-keyed).
+        assert_eq!(f.get("captcha_provider"), Some(&"auto".to_string()));
         assert_eq!(f.get("captcha_api_key"), Some(&"".to_string()));
     }
 

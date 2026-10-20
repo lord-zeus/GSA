@@ -168,6 +168,13 @@ pub fn extract_sitekey(html: &str) -> Option<String> {
 /// offline (arithmetic only). `TwoCaptcha` / `AntiCaptcha` are paid HTTP
 /// providers covering image, audio, reCAPTCHA, hCaptcha and Turnstile.
 /// `CapMonster` reuses the 2Captcha API (alias; CAPMonster is a reseller).
+///
+/// F#29 (free-first) additions:
+/// * `CdpVision` — drives a local headless browser over CDP and solves the
+///   reCAPTCHA v2 image grid via a local "vision oracle" (human click or any
+///   model service). No API key, no credits.
+/// * `Auto` — the "totally free" chain: `local` (arithmetic/text) → `CdpVision`
+///   → the paid providers, but only if the user actually has a key for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptchaProvider {
@@ -175,6 +182,8 @@ pub enum CaptchaProvider {
     TwoCaptcha,
     AntiCaptcha,
     CapMonster,
+    CdpVision,
+    Auto,
 }
 
 impl CaptchaProvider {
@@ -186,17 +195,77 @@ impl CaptchaProvider {
             Self::TwoCaptcha => "2captcha",
             Self::AntiCaptcha => "anticaptcha",
             Self::CapMonster => "capmonster",
+            Self::CdpVision => "cdp-vision",
+            Self::Auto => "auto",
         }
     }
 
     /// Parse a stored string. Unknown / empty → `Local` (GSA default).
+    /// F#29 aliases: `cdp-vision`/`cdp`/`vision` → [CaptchaProvider::CdpVision];
+    /// `auto`/`chain`/`best` → [CaptchaProvider::Auto].
     pub fn parse(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "local" | "" => Self::Local,
             "2captcha" | "twocaptcha" => Self::TwoCaptcha,
             "anticaptcha" => Self::AntiCaptcha,
             "capmonster" => Self::CapMonster,
+            "cdp-vision" | "cdpv" | "cdp" | "vision" | "vision-cdp" | "free-vision" => Self::CdpVision,
+            "auto" | "chain" | "best" | "free" => Self::Auto,
             _ => Self::Local,
+        }
+    }
+}
+
+/// Try each solver in order; first success wins. Built by
+/// [CaptchaProvider::Auto] ("totally free" mode).
+///
+/// Failure reporting: if every step was "unsolvable", the combined reason
+/// lists each step and why (UI can show it without guessing); if a step hit a
+/// real provider/network error that one is surfaced (it is the actionable
+/// one — e.g. "oracle unreachable" or "2captcha: bad key").
+pub struct ChainedSolver {
+    steps: Vec<std::sync::Arc<dyn CaptchaSolver>>,
+}
+
+impl ChainedSolver {
+    pub fn new(steps: Vec<std::sync::Arc<dyn CaptchaSolver>>) -> Self {
+        Self { steps }
+    }
+
+    pub fn steps(&self) -> &[std::sync::Arc<dyn CaptchaSolver>] {
+        &self.steps
+    }
+}
+
+#[async_trait::async_trait]
+impl CaptchaSolver for ChainedSolver {
+    fn name(&self) -> &'static str {
+        "auto"
+    }
+
+    async fn solve(&self, ctx: &CaptchaContext) -> Result<String, CaptchaError> {
+        if self.steps.is_empty() {
+            return Err(CaptchaError::Unsolvable { reason: "auto chain has no steps".into() });
+        }
+        let mut failures: Vec<String> = Vec::new();
+        let mut last_actionable: Option<CaptchaError> = None;
+        for step in &self.steps {
+            match step.solve(ctx).await {
+                Ok(answer) => return Ok(answer),
+                Err(e) => {
+                    failures.push(format!("{} → {}", step.name(), e));
+                    match e {
+                        CaptchaError::Unsolvable { .. } => {}
+                        other => last_actionable = Some(other),
+                    }
+                }
+            }
+        }
+        match last_actionable {
+            Some(e) => Err(e),
+            None => Err(CaptchaError::Unsolvable {
+                reason: format!("auto chain: {} failures: {}", self.steps.len(), failures.join(" | ")),
+            }),
         }
     }
 }
@@ -233,6 +302,30 @@ pub fn make_solver(
             }
             _ => return None,
         },
+        // F#29 — free vision+CDP reCAPTCHA v2 solver (headless browser +
+        // local vision oracle). Needs the `browser` feature for the CDP
+        // transport; without it the chain simply skips it.
+        CaptchaProvider::CdpVision => {
+            #[cfg(feature = "browser")]
+            {
+                std::sync::Arc::new(crate::captcha_cdp::CdpVisionSolver::new())
+                    as std::sync::Arc<dyn CaptchaSolver>
+            }
+            #[cfg(not(feature = "browser"))]
+            { return None; }
+        }
+        // F#29 — "totally free" chain: local (instant, offline) → cdp-vision
+        // (free reCAPTCHA grid) → paid providers, only if the user has keys.
+        CaptchaProvider::Auto => {
+            let mut steps: Vec<std::sync::Arc<dyn CaptchaSolver>> = vec![local];
+            #[cfg(feature = "browser")]
+            steps.push(std::sync::Arc::new(crate::captcha_cdp::CdpVisionSolver::new()));
+            if let Some(k) = api_key.filter(|k| !k.trim().is_empty()) {
+                steps.push(std::sync::Arc::new(TwoCaptchaSolver::new(k, timeout_secs)));
+                steps.push(std::sync::Arc::new(AntiCaptchaSolver::new(k, timeout_secs)));
+            }
+            std::sync::Arc::new(ChainedSolver::new(steps)) as std::sync::Arc<dyn CaptchaSolver>
+        }
     })
 }
 
@@ -1211,6 +1304,7 @@ fn named_entity(entity: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn html_arith() -> String {
         String::from(
@@ -1424,5 +1518,84 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(TwoCaptchaSolver::task_kind(&ctx), "base64");
+    }
+
+    // ----------------------------------------------------------------
+    //  F#29 — chain + provider parsing
+    // ----------------------------------------------------------------
+
+    struct Stub(Option<String>, &'static str);
+    #[async_trait::async_trait]
+    impl CaptchaSolver for Stub {
+        async fn solve(&self, _ctx: &CaptchaContext) -> Result<String, CaptchaError> {
+            match self.0.as_ref() {
+                Some(a) => Ok(a.clone()),
+                None => Err(CaptchaError::Unsolvable { reason: "stub-no".into() }),
+            }
+        }
+        fn name(&self) -> &'static str {
+            self.1
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_chain_returns_second_solver_answer() {
+        let chain: Arc<dyn CaptchaSolver> = Arc::new(ChainedSolver::new(vec![
+            Arc::new(Stub(None, "a")),
+            Arc::new(Stub(Some("TOK2".into()), "b")),
+        ]));
+        let ctx = CaptchaContext::default();
+        assert_eq!(chain.solve(&ctx).await.unwrap(), "TOK2");
+    }
+
+    #[tokio::test]
+    async fn auto_chain_first_success_short_circuits() {
+        let chain: Arc<dyn CaptchaSolver> = Arc::new(ChainedSolver::new(vec![
+            Arc::new(Stub(Some("TOK1".into()), "a")),
+            Arc::new(Stub(None, "b")),
+        ]));
+        assert_eq!(chain.solve(&CaptchaContext::default()).await.unwrap(), "TOK1");
+    }
+
+    #[tokio::test]
+    async fn auto_chain_all_unsolvable_lists_each_step() {
+        let chain: Arc<dyn CaptchaSolver> = Arc::new(ChainedSolver::new(vec![
+            Arc::new(Stub(None, "step-a")),
+            Arc::new(Stub(None, "step-b")),
+        ]));
+        let err = chain.solve(&CaptchaContext::default()).await.unwrap_err();
+        match err {
+            CaptchaError::Unsolvable { reason } => {
+                assert!(reason.contains("step-a"), "reason={reason}");
+                assert!(reason.contains("step-b"), "reason={reason}");
+            }
+            other => panic!("expected Unsolvable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cdp_vision_aliases() {
+        for s in ["cdp-vision", "cdpv", "cdp", "vision", "vision-cdp", "free-vision"] {
+            assert_eq!(CaptchaProvider::parse(s), CaptchaProvider::CdpVision, "s={s}");
+        }
+    }
+
+    #[test]
+    fn parse_auto_aliases() {
+        for s in ["auto", "chain", "best", "free"] {
+            assert_eq!(CaptchaProvider::parse(s), CaptchaProvider::Auto, "s={s}");
+        }
+    }
+
+    #[test]
+    fn provider_as_str_roundtrip() {
+        for (s, want) in [
+            ("cdp-vision", CaptchaProvider::CdpVision),
+            ("auto", CaptchaProvider::Auto),
+            ("local", CaptchaProvider::Local),
+        ] {
+            assert_eq!(CaptchaProvider::parse(s).as_str(), CaptchaProvider::parse(s).as_str());
+            assert_eq!(CaptchaProvider::parse(s), want, "s={s}");
+        }
     }
 }

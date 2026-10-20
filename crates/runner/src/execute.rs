@@ -473,8 +473,11 @@ impl JobRunner {
         // captcha_failed, matching GSA's "blocked by captcha wall" bucket).
         let solver: Option<std::sync::Arc<dyn engine::captcha::CaptchaSolver>> = {
             let s = self.ctx.settings.as_ref();
+            // F#29 — default is the "totally free" chain (local → cdp-vision →
+            // paid-if-keyed) instead of local-only, so reCAPTCHA v2 walls are
+            // attempted for free before any job gives up.
             let provider = engine::captcha::CaptchaProvider::parse(
-                s.captcha_provider.as_deref().unwrap_or("local"),
+                s.captcha_provider.as_deref().unwrap_or("auto"),
             );
             let api_key = s.captcha_api_key.clone().filter(|k| !k.trim().is_empty());
             let timeout_secs = s.captcha_timeout_secs.unwrap_or(60);
