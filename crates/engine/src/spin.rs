@@ -435,6 +435,14 @@ fn lookup_builtin(
         return Some(String::new());
     }
     if n == "blog_comment" || n == "guestbook_comment" || n == "image_comment" || n == "random_comment" || n == "comment" {
+        // F#31 — the project's explicit "Comment text" (injected by the
+        // runner as `comment` in the context) wins over the auto-generated
+        // pool comment. Only an empty project comment falls through.
+        if let Some(user_comment) = ctx.get("comment") {
+            if !user_comment.trim().is_empty() {
+                return Some(render_with_rng(user_comment, ctx, rng, visited));
+            }
+        }
         let n = n.as_str();
         let category = match n {
             "guestbook_comment" => "guestbook",
@@ -665,6 +673,28 @@ mod tests {
     #[test]
     fn unknown_variable_is_preserved_verbatim() {
         assert_eq!(resolve("%no_such_var_x%", &ctx()), "%no_such_var_x%");
+    }
+
+    #[test]
+    fn project_comment_text_overrides_pool_comment() {
+        // F#31 — the project's explicit comment (injected by the runner as
+        // `comment` in the context) wins over the auto-generated pool comment
+        // for every comment-family token.
+        let mut c = Context::new();
+        c.set("comment", "My custom guestbook note about nordiccomps!");
+        assert_eq!(resolve("%blog_comment%", &c), "My custom guestbook note about nordiccomps!");
+        assert_eq!(resolve("%guestbook_comment%", &c), "My custom guestbook note about nordiccomps!");
+        assert_eq!(resolve("%comment%", &c), "My custom guestbook note about nordiccomps!");
+        assert_eq!(resolve("%random_comment%", &c), "My custom guestbook note about nordiccomps!");
+    }
+
+    #[test]
+    fn whitespace_comment_falls_through_to_pool() {
+        // F#31 — a comment that is empty / whitespace-only must NOT suppress
+        // the generated fallback (only a real user comment overrides).
+        let mut c = Context::new();
+        c.set("comment", "   ");
+        resolve("%blog_comment%", &c); // just must not panic; pool path taken
     }
 
     #[test]

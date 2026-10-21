@@ -50,6 +50,12 @@ pub struct Project {
     /// runner auto-generates a short article from the keyword + target URL.
     #[serde(default)]
     pub article_text: String,
+    /// F#31 — GSA "Comment text": the project-level comment body used by
+    /// comment / guestbook / blog-comment engines as `%blog_comment%` /
+    /// `%guestbook_comment%` / `%comment%`. Spintax allowed. Empty = the
+    /// runner auto-generates a comment from the `comments.dat` pool.
+    #[serde(default)]
+    pub comment_text: String,
     /// F#26 — GSA "Notes" free text (shown on the project card / export header).
     #[serde(default)]
     pub notes: String,

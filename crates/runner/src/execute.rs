@@ -29,6 +29,11 @@ pub struct SubmissionContext {
     /// article-family engines (`%article%`). Spintax allowed; empty = the
     /// runner auto-generates a short article from the keyword + target URL.
     pub article_text: String,
+    /// F#31 — GSA "Comment text": the project's comment body for the
+    /// comment / guestbook / blog-comment family (`%blog_comment%`,
+    /// `%guestbook_comment%`, `%comment%`). Spintax allowed; empty = the
+    /// runner auto-generates a comment from the `comments.dat` pool.
+    pub comment_text: String,
     /// The project id — used only for GSA-style auto-export file naming
     /// (`<data>/verified/<project_id>.csv`); does not affect submission.
     pub project_id: Uuid,
@@ -356,6 +361,14 @@ impl JobRunner {
             extra.insert(k.into(), article_title.clone());
         }
         extra.insert("article_title_mod".into(), article_title_mod);
+        // F#31 — GSA "Comment text": comment / guestbook / blog-comment
+        // engines fill their message field with %blog_comment% /
+        // %guestbook_comment% / %comment%. A non-empty project comment wins;
+        // an empty one lets the runner fall through to the generated pool
+        // comment (F#22).
+        if !self.ctx.comment_text.trim().is_empty() {
+            extra.insert("comment".into(), self.ctx.comment_text.trim().to_string());
+        }
         // GSA's documented pop3-password fallback: the operator's explicit
         // mailbox password wins; otherwise reuse the project-static string
         // so `pop3 password=%pop3_password%` INIs can still log in.

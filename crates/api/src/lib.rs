@@ -657,6 +657,30 @@ async fn set_project_article_api(
     }
 }
 
+/// PUT /api/projects/{id}/comment — the GSA "Comment text": the project's
+/// comment body for the comment / guestbook / blog-comment engines
+/// (`%blog_comment%` / `%guestbook_comment%` / `%comment%`).
+#[derive(Deserialize)]
+pub struct SetProjectCommentBody {
+    #[serde(default)]
+    comment: String,
+}
+
+async fn set_project_comment_api(
+    Path(id): Path<Uuid>,
+    state: State<Arc<AppState>>,
+    body: Json<SetProjectCommentBody>,
+) -> Response {
+    let comment = body.comment.clone();
+    match Repo::new(state.pool.clone())
+        .set_project_comment(id, comment)
+        .await
+    {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
 /// PUT /api/projects/{id}/anchor-options — the GSA "Anchor Text (below the
 /// keyword)" tab: anchor mix JSON, URL randomization/variation, root-URL
 /// percentage, linkwheel (upstream project ids), and auto-export.  Every
@@ -1771,6 +1795,12 @@ pub async fn run_project_pool(project_id: Uuid, state: &Arc<AppState>) -> anyhow
             .as_ref()
             .map(|p| p.article_text.clone())
             .unwrap_or_default(),
+        // F#31 — the project's own Comment body (GSA "Comment text");
+        // empty → the runner auto-generates a comment from the comments.dat pool.
+        comment_text: project_row
+            .as_ref()
+            .map(|p| p.comment_text.clone())
+            .unwrap_or_default(),
         anchor: project_row
             .as_ref()
             .and_then(|p| p.anchor_mix.as_deref())
@@ -2216,6 +2246,12 @@ async fn test_engine_pool(
         article_text: project_row
             .as_ref()
             .map(|p| p.article_text.clone())
+            .unwrap_or_default(),
+        // F#31 — the project's own Comment body (GSA "Comment text");
+        // empty → the runner auto-generates a comment from the comments.dat pool.
+        comment_text: project_row
+            .as_ref()
+            .map(|p| p.comment_text.clone())
             .unwrap_or_default(),
         anchor: project_row
             .as_ref()
@@ -2841,6 +2877,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // block). Empty body clears it → the runner auto-generates from
         // the project's keyword + target URL.
         .route("/api/projects/{id}/article", put(set_project_article_api))
+        .route("/api/projects/{id}/comment", put(set_project_comment_api))
         .route(
             "/api/projects/{id}/anchor-options",
             put(set_project_anchor_options_api),

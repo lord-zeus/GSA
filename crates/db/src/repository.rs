@@ -194,7 +194,7 @@ impl Repo {
         let row = sqlx::query(
             "INSERT INTO projects (name, description) VALUES ($1, $2)
              RETURNING id, name, description, created_at, updated_at, use_proxies,
-                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, pause_after, paused_at",
+                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, comment_text, pause_after, paused_at",
         )
         .bind(name)
         .bind(description)
@@ -213,7 +213,7 @@ impl Repo {
         let row = sqlx::query(
             "UPDATE projects SET name = $1, description = $2 WHERE id = $3
              RETURNING id, name, description, created_at, updated_at, use_proxies,
-                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, pause_after, paused_at",
+                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, comment_text, pause_after, paused_at",
         )
         .bind(name)
         .bind(description)
@@ -236,7 +236,7 @@ impl Repo {
     pub async fn list_projects(&self) -> anyhow::Result<Vec<Project>> {
         let rows = sqlx::query(
             "SELECT id, name, description, created_at, updated_at, use_proxies,
-             anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, pause_after, paused_at
+             anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, comment_text, pause_after, paused_at
              FROM projects ORDER BY created_at",
         )
         .fetch_all(&self.pool)
@@ -247,7 +247,7 @@ impl Repo {
     pub async fn project_by_name(&self, name: &str) -> anyhow::Result<Option<Project>> {
         let row = sqlx::query(
             "SELECT id, name, description, created_at, updated_at, use_proxies,
-             anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, pause_after, paused_at
+             anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, comment_text, pause_after, paused_at
              FROM projects WHERE name = $1",
         )
         .bind(name)
@@ -260,7 +260,7 @@ impl Repo {
     pub async fn project_by_id(&self, id: Uuid) -> anyhow::Result<Option<Project>> {
         let row = sqlx::query(
             "SELECT id, name, description, created_at, updated_at, use_proxies,
-             anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, pause_after, paused_at
+             anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, comment_text, pause_after, paused_at
              FROM projects WHERE id = $1",
         )
         .bind(id)
@@ -276,7 +276,7 @@ impl Repo {
         let row = sqlx::query(
             "UPDATE projects SET url = $2, updated_at = now() WHERE id = $1
              RETURNING id, name, description, created_at, updated_at, use_proxies,
-                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, pause_after, paused_at",
+                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, comment_text, pause_after, paused_at",
         )
         .bind(id)
         .bind(url)
@@ -1022,7 +1022,7 @@ impl Repo {
         let row = sqlx::query(
             "UPDATE projects SET use_proxies = $1, updated_at = now() WHERE id = $2
              RETURNING id, name, description, created_at, updated_at, use_proxies,
-                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, pause_after, paused_at",
+                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, comment_text, pause_after, paused_at",
         )
         .bind(use_proxies)
         .bind(id)
@@ -1064,7 +1064,7 @@ impl Repo {
                WHERE p.id = $7
                RETURNING p.id, p.name, p.description, p.created_at, p.updated_at, p.use_proxies,
                          p.anchor_mix, p.use_random_url, p.url_variations, p.root_url,
-                         p.linkwheel, p.auto_export, p.url, p.notes, p.color, p.article_text, p.pause_after, p.paused_at",
+                         p.linkwheel, p.auto_export, p.url, p.notes, p.color, p.article_text, p.comment_text, p.pause_after, p.paused_at",
         )
         .bind(anchor_mix.map(|s| s.to_string()))
         .bind(use_random_url)
@@ -1099,7 +1099,7 @@ impl Repo {
                RETURNING p.id, p.name, p.description, p.created_at, p.updated_at, p.use_proxies,
                          p.anchor_mix, p.use_random_url, p.url_variations, p.root_url,
                          p.linkwheel, p.auto_export, p.url,
-                         p.notes, p.color, p.article_text, p.pause_after, p.paused_at",
+                         p.notes, p.color, p.article_text, p.comment_text, p.pause_after, p.paused_at",
         )
         .bind(notes)
         .bind(color)
@@ -1127,10 +1127,35 @@ impl Repo {
                RETURNING p.id, p.name, p.description, p.created_at, p.updated_at, p.use_proxies,
                          p.anchor_mix, p.use_random_url, p.url_variations, p.root_url,
                          p.linkwheel, p.auto_export, p.url,
-                         p.notes, p.color, p.article_text, p.pause_after, p.paused_at",
+                         p.notes, p.color, p.article_text, p.comment_text, p.pause_after, p.paused_at",
         )
         .bind(id)
         .bind(article_text)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("project {id} not found"))?;
+        Ok(FromRow::from_row(&row)?)
+    }
+
+    /// F#31 — persist the project-level comment body (GSA "Comment text")
+    /// used by comment / guestbook engines as `%blog_comment%` and friends.
+    pub async fn set_project_comment(
+        &self,
+        id: Uuid,
+        comment_text: String,
+    ) -> anyhow::Result<Project> {
+        let row = sqlx::query(
+            "UPDATE projects p SET
+                 comment_text = $2,
+                 updated_at   = now()
+               WHERE p.id = $1
+               RETURNING p.id, p.name, p.description, p.created_at, p.updated_at, p.use_proxies,
+                         p.anchor_mix, p.use_random_url, p.url_variations, p.root_url,
+                         p.linkwheel, p.auto_export, p.url,
+                         p.notes, p.color, p.article_text, p.comment_text, p.pause_after, p.paused_at",
+        )
+        .bind(id)
+        .bind(comment_text)
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| anyhow::anyhow!("project {id} not found"))?;
@@ -1144,7 +1169,7 @@ impl Repo {
         let row = sqlx::query(
             "UPDATE projects SET paused_at = $1, updated_at = now() WHERE id = $2
              RETURNING id, name, description, created_at, updated_at, use_proxies,
-                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, pause_after, paused_at",
+                       anchor_mix, use_random_url, url_variations, root_url, linkwheel, auto_export, url, notes, color, article_text, comment_text, pause_after, paused_at",
         )
         .bind(if paused { Some(sqlx::types::chrono::Utc::now()) } else { None })
         .bind(id)
