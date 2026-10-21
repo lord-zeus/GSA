@@ -57,6 +57,11 @@ pub struct SubmissionInput {
     pub files: HashMap<String, String>,
     /// Candidates for `%random_option%`.
     pub random_options: Vec<String>,
+    /// T5 — base page for DISCOVERY engines (engines with no own
+    /// `base_url()` — guestbooks / URL engines whose INI steps are relative
+    /// to the *found* site).  Usually one of the project's searched sites.
+    /// Ignored by engines that declare their own base URL (those win).
+    pub site_url: Option<String>,
 }
 
 impl SubmissionInput {
@@ -334,7 +339,20 @@ pub fn resolve_plan(engine: &Engine, input: &SubmissionInput) -> SubmissionPlan 
     SubmissionPlan {
         engine_name: engine.name.clone(),
         engine_type: engine.engine_type.to_string(),
-        target_url: engine.base_url(),
+        target_url: {
+            // T5 — discovery engines (no own base URL) run against the
+            // searched site that the runner passes in.
+            let base = engine.base_url();
+            if !base.is_empty() {
+                base
+            } else {
+                input
+                    .site_url
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_default()
+            }
+        },
         anchor: input.anchor.clone(),
         seed,
         steps: ordered,
@@ -1001,6 +1019,7 @@ mod tests {
         let input = SubmissionInput {
             url: "https://nordiccomps.com/".to_string(),
             keyword: "backlinks".to_string(),
+            site_url: None,
             anchor: None,
             seed: Some(12345),
             extra,
@@ -1025,6 +1044,7 @@ mod tests {
         SubmissionInput {
             url: "https://mysite.example/".to_string(),
             keyword: "buy shoes online".to_string(),
+            site_url: None,
             anchor: None,
             seed: Some(0xC0FFEE),
             extra: HashMap::from([
@@ -1586,6 +1606,7 @@ new_url=%random-1-99999%-delete-me
         let input = SubmissionInput {
             url: "https://nordiccomps.com/".to_string(),
             keyword: "nordiccomps".to_string(),
+            site_url: None,
             anchor: None,
             seed: Some(0xC0FFEE),
             extra: HashMap::new(),
@@ -1631,6 +1652,7 @@ new_url=%random-1-99999%-delete-me
         let input = SubmissionInput {
             url: "https://nordiccomps.com/".to_string(),
             keyword: "nordiccomps".to_string(),
+            site_url: None,
             anchor: None, seed: Some(1), extra: HashMap::new(),
             files: HashMap::new(), random_options: Vec::new(),
         };
@@ -1662,6 +1684,7 @@ new_url=%random-1-99999%-delete-me
         let input = SubmissionInput {
             url: "https://nordiccomps.com/".to_string(),
             keyword: "nordiccomps".to_string(),
+            site_url: None,
             anchor: None, seed: Some(7), extra: HashMap::new(),
             files: HashMap::new(), random_options: Vec::new(),
         };
@@ -1788,6 +1811,7 @@ url=%url%
         let eng = parse_engine_str(ini, "0rz").unwrap();
         let input = SubmissionInput {
             url: "https://nordiccomps.com/".to_string(),
+            site_url: None,
             ..Default::default()
         };
         let plan = resolve_plan(&eng, &input);
@@ -1857,4 +1881,56 @@ title=T
         assert_eq!(url, "https://nordiccomps.com/");
     }
 
+    // ── T5 — site_url (discovery engines run against the searched site) ──
+
+    #[test]
+    fn site_url_becomes_target_for_discovery_engine() {
+        // Discovery-style engine: no `url=` / `fixed url=` of its own, so
+        // base_url() is empty — GSA's guestbook / URL-engine shape.  The
+        // searched site must become the plan's base page.
+        let ini = "title=T\r\n\n[STEP1]\r\nlink type=Comment-URL\r\njust download=1\r\nmodify url=/sign?c=%blog_comment%\r\nsubmit success=OK\r\n";
+        let eng = parse_engine_str(ini, "disco").unwrap();
+        assert!(eng.base_url().is_empty(), "test premise: engine has no base url");
+        let input = SubmissionInput {
+            url: "https://backlink.example/".to_string(),
+            keyword: "kw".to_string(),
+            seed: Some(1),
+            site_url: Some("https://found-site.example/".to_string()),
+            ..Default::default()
+        };
+        let plan = resolve_plan(&eng, &input);
+        assert_eq!(plan.target_url, "https://found-site.example/");
+    }
+
+    #[test]
+    fn site_url_ignored_when_engine_has_own_base() {
+        // Fixed-URL engines (agentsnipe / rentry shape) keep their own base.
+        let ini = "title=T\r\n\r\n[setup]\r\nurl=https://fixed.example/\r\n\r\n[STEP1]\r\nlink type=Comment-URL\r\njust download=1\r\nmodify url=/sign\r\nsubmit success=OK\r\n";
+        let eng = parse_engine_str(ini, "fixed").unwrap();
+        assert_eq!(eng.base_url(), "https://fixed.example/");
+        let input = SubmissionInput {
+            url: "https://backlink.example/".to_string(),
+            keyword: "kw".to_string(),
+            seed: Some(1),
+            site_url: Some("https://found-site.example/".to_string()),
+            ..Default::default()
+        };
+        let plan = resolve_plan(&eng, &input);
+        assert_eq!(plan.target_url, "https://fixed.example/");
+    }
+
+    #[test]
+    fn empty_site_url_behaves_like_absent() {
+        let ini = "title=T\r\n\n[STEP1]\r\njust download=1\r\nmodify url=/sign\r\nsubmit success=OK\r\n";
+        let eng = parse_engine_str(ini, "disco2").unwrap();
+        let input = SubmissionInput {
+            url: "https://backlink.example/".to_string(),
+            seed: Some(1),
+            site_url: Some(String::new()),
+            ..Default::default()
+        };
+        let plan = resolve_plan(&eng, &input);
+        assert!(plan.target_url.is_empty(), "blank site_url must not leak in");
+    }
 }
+

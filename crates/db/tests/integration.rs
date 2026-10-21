@@ -452,3 +452,38 @@ async fn f11_project_crud_and_lifecycle() {
     let ghost = repo.delete_project(p.id).await.unwrap();
     assert!(!ghost, "second delete reports not-found");
 }
+
+#[tokio::test]
+async fn project_sites_upsert_list_clear() {
+    let Some(pool) = pool_or_skip().await else { return };
+    let repo = ser_db::Repo::new(pool.clone());
+    let name = format!("T5 sites {}", uuid::Uuid::new_v4());
+    let project = repo.create_project(&name, None).await.unwrap();
+
+    // upsert twice — the second must not duplicate
+    let first = repo
+        .add_project_sites(
+            project.id,
+            &["https://a.example/".to_string(), "".to_string(), "https://b.example/".to_string()],
+            "search",
+        )
+        .await
+        .unwrap();
+    assert_eq!(first, 2, "blank url skipped, two inserted");
+    let dup = repo
+        .add_project_sites(project.id, &["https://a.example/".to_string()], "manual")
+        .await
+        .unwrap();
+    assert_eq!(dup, 0, "unique (project_id, url) must upsert-do-nothing");
+
+    let rows = repo.list_project_sites(project.id).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.origin == "search"));
+
+    let removed = repo.clear_project_sites(project.id).await.unwrap();
+    assert_eq!(removed, 2);
+    assert!(repo.list_project_sites(project.id).await.unwrap().is_empty());
+
+    let _ = repo.delete_project(project.id).await; // keep the name unique for reruns
+}
+

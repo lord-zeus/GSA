@@ -28,3 +28,6 @@ _prefix.txt
 
 # windows nul artifact
 nul
+
+# JetBrains IDE
+.idea/

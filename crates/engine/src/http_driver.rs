@@ -250,6 +250,134 @@ pub fn form_urlencode(s: &str) -> String {
 }
 
 // ===========================================================================
+//  CurlDriver — a curl-backed driver for bot-checked endpoints.
+//
+//  Some search fronts (Brave, …) gate on the TLS fingerprint: reqwest on
+//  Windows speaks schannel and gets a 403 challenge page, while the
+//  OpenSSL-backed `curl` binary (shipped with git-for-windows) is served
+//  the real results. `CurlDriver` shells out to `curl` for the same
+//  [`Driver`] contract.  MVP scope: `navigate` (site discovery) is
+//  first-class; `submit`/`post` are basic form POSTs with a warm GET for
+//  hidden fields (CSRF-style forms) — the proven reqwest `HttpDriver`
+//  remains the driver for submissions in the runner.
+// ===========================================================================
+
+pub struct CurlDriver {
+    user_agent: String,
+}
+
+impl CurlDriver {
+    pub fn new() -> Self {
+        Self { user_agent: default_user_agent() }
+    }
+
+    /// Run `curl` with the standard browser-ish defaults plus `extra`
+    /// args, capturing body + status + effective URL.
+    async fn exec(&self, url: String, extra: Vec<String>) -> DriverResponse {
+        let ua = self.user_agent.clone();
+        let fail_url = url.clone();
+        let spawned = tokio::task::spawn_blocking(move || {
+            let mut cmd = std::process::Command::new("curl");
+            let mut args: Vec<String> = vec![
+                "-sS".into(),
+                "--max-time".into(),
+                "60".into(),
+                "--compressed".into(),
+                "-A".into(),
+                ua,
+            ];
+            args.extend(extra);
+            args.push("-w".into());
+            args.push("\n__HTTP__:%{http_code}\n__URL__:%{url_effective}".into());
+            cmd.args(&args).arg(&url);
+            cmd.output().map_err(|e| format!("spawn curl: {e}"))
+        }).await;
+        match spawned {
+            Ok(Ok(out)) => {
+                Self::parse(out)
+            }
+            Ok(Err(e)) => Self::err(fail_url, Some(e)),
+            Err(e) => Self::err(fail_url, Some(e.to_string())),
+        }
+    }
+
+    fn err(url: String, reason: Option<String>) -> DriverResponse {
+        DriverResponse { ok: false, final_url: url, html: String::new(), error: reason }
+    }
+
+    fn parse(out: std::process::Output) -> DriverResponse {
+        let mut body = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mut code: u16 = 0;
+        let mut final_url = String::new();
+        if let Some(i) = body.rfind("\n__HTTP__:") {
+            let rest = body[i + "\n__HTTP__:".len()..].to_string();
+            body.truncate(i);
+            let mut parts = rest.splitn(2, '\n');
+            code = parts.next().unwrap_or("").trim().parse().unwrap_or(0);
+            if let Some(suffix) = parts.next() {
+                if let Some(k) = suffix.find("\n__URL__:") {
+                    final_url = suffix[k + "\n__URL__:".len()..].trim().to_string();
+                }
+            }
+        }
+        if !out.status.success() || code == 0 || code >= 400 {
+            let mut msg = String::from_utf8_lossy(&out.stderr).into_owned();
+            if !msg.is_empty() { msg.push_str(" | "); }
+            msg.push_str(&format!("curl exit {:?} http {code}", out.status.code()));
+            DriverResponse { ok: false, final_url, html: body, error: Some(msg) }
+        } else {
+            DriverResponse { ok: true, final_url, html: body, error: None }
+        }
+    }
+}
+
+#[async_trait]
+impl Driver for CurlDriver {
+    /// GET a URL and return the settled page (curl follows up to the
+    /// default redirect chain with `-L`).
+    async fn navigate(&self, url: String) -> DriverResponse {
+        self.exec(url, vec!["-L".into()]).await
+    }
+
+    /// Form POST: warm GET (cookie jar + hidden fields, browser-faithful
+    /// like `HttpDriver::submit`), then POST the merged fields.
+    async fn submit(&self, url: String, fields: HashMap<String, String>, _timeout: Duration) -> DriverResponse {
+        use std::io::Write as _;
+        let jar = std::env::temp_dir().join(format!("ser_curl_jar_{}", std::process::id()));
+        let jar = jar.to_string_lossy().into_owned();
+        let _ = std::fs::File::create(&jar);
+        let warm = self.exec(url.clone(), vec!["-L".into(), "-c".into(), jar.clone()]).await;
+        let mut merged = fields;
+        for (k, v) in parse_hidden_fields(&warm.html) {
+            merged.entry(k).or_insert(v);
+        }
+        let mut body = String::with_capacity(256);
+        for (k, v) in merged.iter() {
+            body.push_str(&form_urlencode(k));
+            body.push('=');
+            body.push_str(&form_urlencode(v));
+            body.push('&');
+        }
+        if !body.is_empty() { body.pop(); }
+        let origin = origin_of(&url);
+        let extra = vec![
+            "-L".into(),
+            "-b".into(), jar.clone(),
+            "-c".into(), jar,
+            "-X".into(), "POST".into(),
+            "-H".into(), format!("Referer: {url}"),
+            "-H".into(), format!("Origin: {origin}"),
+            "-H".into(), "Content-Type: application/x-www-form-urlencoded".into(),
+            "--data".into(), body,
+        ];
+        let jar2 = std::env::temp_dir().join(format!("ser_curl_jar_{}", std::process::id()));
+        let resp = self.exec(url, extra).await;
+        let _ = std::fs::remove_file(jar2.to_string_lossy().into_owned());
+        resp
+    }
+}
+
+// ===========================================================================
 //  Tests — a minimal threaded HTTP server on a random localhost port, so
 //  the suite needs no external network and is deterministic.
 // ===========================================================================
@@ -415,6 +543,7 @@ mod tests {
         let input = SubmissionInput {
             url: "https://mysite.example/".into(),
             keyword: "buy shoes".into(),
+            site_url: None,
             anchor: None,
             seed: Some(42),
             extra: Default::default(),

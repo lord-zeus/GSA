@@ -19,6 +19,14 @@ pub struct Repo {
     pool: PgPool,
 }
 
+/// One site row as returned to the API (no id — the API doesn't need it).
+#[derive(Debug, Clone, FromRow, serde::Serialize)]
+pub struct ProjectSiteRow {
+    pub url: String,
+    pub origin: String,
+    pub first_found_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl Repo {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -523,6 +531,62 @@ impl Repo {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| Keyword::from_row(&r)).collect::<Result<_, _>>()?)
+    }
+
+    // ── project sites (T5 — search results the runner submits to) ──────
+    /// Upsert a batch of site URLs for a project (unique per project).
+    /// Returns the count of URLs that were actually inserted.
+    pub async fn add_project_sites(
+        &self,
+        project_id: Uuid,
+        urls: &[String],
+        origin: &str,
+    ) -> anyhow::Result<u64> {
+        let mut inserted = 0u64;
+        for u in urls {
+            let trimmed = u.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let res = sqlx::query(
+                "INSERT INTO project_sites (project_id, url, origin)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (project_id, url) DO NOTHING",
+            )
+            .bind(project_id)
+            .bind(trimmed)
+            .bind(origin)
+            .execute(&self.pool)
+            .await?;
+            inserted += res.rows_affected();
+        }
+        Ok(inserted)
+    }
+
+    /// All sites for a project, oldest discovery first.
+    pub async fn list_project_sites(&self, project_id: Uuid) -> anyhow::Result<Vec<ProjectSiteRow>> {
+        let rows = sqlx::query(
+            "SELECT url, origin, first_found_at
+             FROM project_sites
+             WHERE project_id = $1
+             ORDER BY first_found_at, url",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ProjectSiteRow::from_row(&r))
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Drop every site for a project (start the search fresh).
+    pub async fn clear_project_sites(&self, project_id: Uuid) -> anyhow::Result<u64> {
+        let res = sqlx::query("DELETE FROM project_sites WHERE project_id = $1")
+            .bind(project_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
     }
 
     // ── jobs ──────────────────────────────────────────────────────────────

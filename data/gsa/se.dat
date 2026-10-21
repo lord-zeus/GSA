@@ -22354,7 +22354,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22375,7 +22375,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22397,7 +22397,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22419,7 +22419,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22441,7 +22441,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22463,7 +22463,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22485,7 +22485,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22507,7 +22507,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22529,7 +22529,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22550,7 +22550,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22572,7 +22572,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22594,7 +22594,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22616,7 +22616,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22638,7 +22638,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22660,7 +22660,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22682,7 +22682,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22704,7 +22704,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22726,7 +22726,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22748,7 +22748,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22770,7 +22770,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;--------------------------------------------------------------------------
@@ -22792,7 +22792,7 @@ wait between search=5
 wait between special search=10
 user agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36
 add header=sec-fetch-dest: document|sec-fetch-mode: navigate|sec-fetch-site: none|sec-fetch-user: ?1
-extract by tag=div:class=fdb
+extract by tag=div:class=snippet
 ignore mask=brave.com
 
 ;**************************************************************************

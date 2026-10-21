@@ -14,6 +14,7 @@ fn probe_3le_stage_a() {
     let input = engine::executor::SubmissionInput {
         url: "https://nordiccomps.com/".to_string(),
         keyword: "nordiccomps shop".to_string(),
+        site_url: None,
         anchor: None,
         seed: Some(0x5EED_5EED),
         extra: Default::default(),

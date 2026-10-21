@@ -58,6 +58,11 @@ pub struct SubmissionContext {
     /// behavior). Driver kinds without a `proxy_driver` impl fall back
     /// to a direct connection transparently.
     pub proxies: Vec<ProxySpec>,
+    /// T5 — the project's searched site list (GSA "Site list / Found sites").
+    /// For DISCOVERY engines (no own base URL) the runner picks one as the
+    /// engine's base page; fixed-URL engines ignore it.  Empty = previous
+    /// behavior.  Rotates deterministically per job (job id hash).
+    pub project_sites: Vec<String>,
     /// F#15 — the effective (clamped) settings for this project's engines.
     /// The pool reads `threads` and `max_submit_seconds` from here; the
     /// API layer fills it from `Repo::global_settings()` + engine override
@@ -379,6 +384,17 @@ impl JobRunner {
         };
         extra.insert("password".into(), password);
         extra.insert("pop3_password".into(), pop3_pw);
+        // T5 — discovery engines (no own base URL) run against one of the
+        // project's searched sites; fixed-URL engines keep their own base.
+        // Job-id hash rotates the site across jobs so a multi-job run
+        // spreads over the site list (retries of the same job keep hitting
+        // the same site).
+        let site_url = if engine.base_url().is_empty() && !self.ctx.project_sites.is_empty() {
+            let n = self.ctx.project_sites.len();
+            Some(self.ctx.project_sites[(job.id.as_u64_pair().0 as usize) % n].clone())
+        } else {
+            None
+        };
         let input = SubmissionInput {
             url: effective_url,
             keyword: keyword.clone(),
@@ -387,6 +403,7 @@ impl JobRunner {
             extra,
             files: self.ctx.files.clone(),
             random_options: vec![],
+            site_url,
         };
         let plan = resolve_plan(&engine, &input);
 

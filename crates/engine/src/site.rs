@@ -57,6 +57,7 @@ use serde::Deserialize;
 /// actually uses into first-class struct fields, and keep the rest in
 /// `extras` (raw `key -> value`) so future features (F#24 linkwheel, F#25
 /// v19 catalog) can reach in without a schema migration.
+#[derive(Debug, Clone)]
 pub struct SiteSpec {
     /// `[Name]` — GSA's display name ("Google", "Bing", "iZito", ...).
     pub name: String,
@@ -398,6 +399,29 @@ pub fn load_site_catalog() -> Result<Vec<SiteSpec>, String> {
     Ok(parse_se_dat(&text))
 }
 
+/// T5 — narrow the catalog to the search engines the operator named (e.g.
+/// `["Bing"]`, `["Bing", "Google"]`).  Match is case-insensitive substring
+/// on the engine name; order of the catalog is preserved.  An empty name
+/// list keeps everything (original behaviour).
+pub fn filter_engines<'a>(sites: &'a [SiteSpec], names: &[String]) -> Vec<&'a SiteSpec> {
+    if names.is_empty() {
+        return sites.iter().collect();
+    }
+    let needles: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+    let mut out: Vec<&SiteSpec> = sites.iter().filter(|s| {
+        let name = s.name.to_lowercase();
+        needles.iter().any(|n| !n.is_empty() && name.contains(n))
+    }).collect();
+    // Rank exact-name matches first (stable): asking for "Brave" should try
+    // the real [Brave] engine before the forty "Brave via 4get" mirrors —
+    // the walk cap (max_sites) would otherwise prune the canonical engine.
+    out.sort_by_key(|s| {
+        let name = s.name.to_lowercase();
+        if needles.iter().any(|n| !n.is_empty() && name == *n) { 0 } else { 1 }
+    });
+    out
+}
+
 // ===========================================================================
 //  2. Search-query builder  (Gap 16: "Add stop words to query with 20%")
 // ===========================================================================
@@ -546,6 +570,47 @@ pub fn sample_stop_words(stop_words: &[String], pct: u32, rng: &mut SplitMix64) 
 /// Anything else passes through verbatim (GSA uses `%secret1%`,
 /// `%secret2%` in some entries — we don't generate those, callers pass
 /// in the value via `extra`).
+/// Percent-encode a string for safe insertion into a URL query string
+/// (RFC 3986 unreserved set kept as-is; space → %20).
+fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push_str("%20"),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// GSA `se.dat` encodes alternate hosts as `url={host1|host2|host3}/...` —
+/// "pick one at random" in the original.  We resolve deterministically to the
+/// FIRST listed candidate (keeps the pipeline reproducible per the project
+/// rules; GSA's randomness is not an MVP requirement).  Braces anywhere in
+/// the template are resolved, not just the host.
+pub fn resolve_host_alternates(url: &str) -> String {
+    let bytes = url.as_bytes();
+    let mut out = String::with_capacity(url.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(close) = url[i + 1..].find('}') {
+                let inner = &url[i + 1..i + 1 + close];
+                let first = inner.split('|').next().unwrap_or(inner).trim();
+                out.push_str(first);
+                i += close + 2;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 pub fn substitute_url(
     template: &str,
     search: &str,
@@ -553,19 +618,31 @@ pub fn substitute_url(
     domain: &str,
     extra: &HashMap<String, String>,
 ) -> String {
+    // Resolve `{a|b}` alternates BEFORE token substitution (tokens inside
+    // alternates are unlikely, but the choice of host must be clean).
+    let tmpl: String = if template.contains('{') {
+        resolve_host_alternates(template)
+    } else {
+        template.to_string()
+    };
     let page = page.to_string();
-    let mut out = String::with_capacity(template.len() + 64);
+    let mut out = String::with_capacity(tmpl.len() + 64);
     let mut i = 0;
-    let bytes = template.as_bytes();
+    let bytes = tmpl.as_bytes();
     while i < bytes.len() {
         if bytes[i] == b'%' {
             // Look for the closing `%`.
-            if let Some(off) = template[i + 1..].find('%') {
-                let name = &template[i + 1..i + 1 + off];
+            if let Some(off) = tmpl[i + 1..].find('%') {
+                let name = &tmpl[i + 1..i + 1 + off];
                 let lower = name.to_ascii_lowercase();
                 match lower.as_str() {
                     "search" => {
-                        out.push_str(search);
+                        // T5 — multi-word queries must be percent-encoded or
+                        // reqwest rejects the URL (raw space) and EVERY engine
+                        // fails instantly (observed: 2525 engines in 13 ms, 0
+                        // results).  Spaces become %20 (not +) so `site:` style
+                        // queries stay unambiguous for engines that care.
+                        out.push_str(&pct_encode(search));
                         i += off + 2;
                         continue;
                     }
@@ -575,7 +652,7 @@ pub fn substitute_url(
                         continue;
                     }
                     "domain" => {
-                        out.push_str(domain);
+                        out.push_str(&pct_encode(domain));
                         i += off + 2;
                         continue;
                     }
@@ -741,6 +818,21 @@ pub fn extract_results(html: &str, site: &SiteSpec) -> Vec<FoundSite> {
             out.push(fs);
         }
     };
+
+    // 0. GSA `extract by tag` (e.g. `div:class=fdb`) — the mode used by
+    //    most of the se.dat catalog (Brave, …).  Each matching element is
+    //    one result; collect the first href inside it (a bare `a` selector
+    //    uses its own href).
+    if !site.extract_by_tag.is_empty() {
+        for u in extract_tag_links(html, &site.extract_by_tag, 200) {
+            if looks_like_url(&u) {
+                push(&mut out, &mut seen, u, site.name.clone(), 0);
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
 
     // 1. Seperator chain.
     if !site.seperator.is_empty() {
@@ -982,6 +1074,155 @@ fn looks_like_url(s: &str) -> bool {
 // ===========================================================================
 
 /// Pull the host + port out of a URL (lowercased).  `None` on parse fail.
+/// T5 — search engines' wall pages (e.g. Google's consent redirect) carry
+/// protocol-relative junk links (`//g`, `//M0MRzq...`) that must never be
+/// stored as found sites.  Normalize `//host/...` to an absolute `https` URL
+/// and reject URLs whose host is not a real web domain (needs a dot;
+/// `localhost` excepted for local targets).
+/// GSA `extract by tag=TAG[:class=NAME]` — return the first href inside
+/// each matching element (a bare `a` selector takes its own href).
+/// Wildcard classes (`?`, `*`, `?*`) match any class.
+pub fn extract_tag_links(html: &str, selector: &str, limit: usize) -> Vec<String> {
+    let (tag, want_class) = {
+        let (tag, rest) = match selector.split_once(':') {
+            Some((t, r)) => (t.trim(), Some(r.trim())),
+            None => (selector.trim(), None),
+        };
+        let tag = tag.to_lowercase();
+        let cls = rest
+            .and_then(|r| r.strip_prefix("class="))
+            .map(|c| c.trim().to_string());
+        let cls = cls.filter(|c| !c.is_empty());
+        (tag, cls)
+    };
+    if tag.is_empty() {
+        return Vec::new();
+    }
+    let open_lc = format!("<{}", tag);
+    let close_lc = format!("</{}", tag);
+    let lower = html.to_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    let mut from = 0usize;
+    let mut iterations = 0usize;
+    while out.len() < limit && iterations < 10_000 {
+        iterations += 1;
+        let Some(rel) = lower[from..].find(&open_lc) else { break };
+        let tag_start = from + rel;
+        let Some(gt) = html[tag_start..].find('>') else { break };
+        let opening = &html[tag_start..tag_start + gt];
+        if class_matches(opening, want_class.as_deref()) {
+            if tag == "a" {
+                if let Some(h) = first_href(opening) {
+                    out.push(h);
+                }
+            } else {
+                // Non-anchor result element: the result URL is its FIRST
+                // real link (the title `<a href=...>`).  Two traps:
+                //  * inline SVG icons carry namespace `href`s that must not
+                //    win — scan inside anchor tags only;
+                //  * result blocks are deeply nested (result-body,
+                //    result-wrapper, …) so a first-`</div>` boundary ends
+                //    too early — use a bounded window (the title link always
+                //    precedes the snippet body, well inside 2 KB).
+                let body_start = tag_start + gt;
+                let body_end = (body_start + 2048).min(html.len());
+                // NB: never `continue` here — the loop cursor `from` only
+                // advances at the loop tail, so a skip path must fall
+                // through (infinite loop otherwise).
+                let rel = html[body_start..body_end].find("<a");
+                if let Some(rel) = rel {
+                    let a_start = body_start + rel;
+                    let a_scan = &html[a_start..a_start + a_scan_len(html, a_start)];
+                    if let Some(gt2) = a_scan.find('>') {
+                        if let Some(h) = first_href(&a_scan[..gt2 + 1]) {
+                            out.push(h);
+                        }
+                    }
+                }
+            }
+        }
+        from = tag_start + gt + 1;
+    }
+    out
+}
+
+/// Bounded length of one opening tag starting at `pos` (to the first `>`).
+fn a_scan_len(html: &str, pos: usize) -> usize {
+    let lim = (pos + 512).min(html.len());
+    match html[pos..lim].find('>') {
+        Some(i) => i + 1,
+        None => lim - pos,
+    }
+}
+
+/// True when `opening_tag` (an `<a ...>` / `<div ...>` head) carries a
+/// `class=` value containing `want` as a whole class token.  `want=None`
+/// matches any class-less / classed element; wildcard wilds match anything.
+fn class_matches(opening_tag: &str, want: Option<&str>) -> bool {
+    let want = match want {
+        None => return true,
+        Some(w) => w.trim(),
+    };
+    if want.is_empty() || want == "?" || want == "*" || want == "?*" || want == "*?" {
+        return true;
+    }
+    let lc = opening_tag.to_lowercase();
+    let Some(ci) = lc.find("class=") else {
+        return false;
+    };
+    let rest = &lc[ci + "class=".len()..];
+    let rest = rest.trim_start();
+    let rest = rest
+        .strip_prefix('"')
+        .or_else(|| rest.strip_prefix('\''))
+        .unwrap_or(rest);
+    let classes: Vec<&str> = rest
+        .split(['"', '\'', '>', ' '])
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect();
+    classes.iter().any(|c| *c == want)
+}
+
+/// First quoted `href="..."` in a chunk of HTML.
+fn first_href(chunk: &str) -> Option<String> {
+    let lc = chunk.to_lowercase();
+    let ci = lc.find("href=")?;
+    let rest = &chunk[ci + "href=".len()..];
+    let rest = rest.trim_start();
+    let q = rest.as_bytes()[0];
+    if q != b'"' && q != b'\'' {
+        return None;
+    }
+    let end = rest[1..].find(q as char)?;
+    Some(rest[1..1 + end].to_string())
+}
+
+/// T5 — search engines' wall pages (e.g. Google's consent redirect) carry
+/// protocol-relative junk links (`//g`, `//M0MRzq...`) that must never be
+/// stored as found sites.  Normalize `//host/...` to an absolute `https` URL
+/// and reject URLs whose host is not a real web domain (needs a dot;
+/// `localhost` excepted for local targets).
+pub fn clean_found_url(url: &str) -> Option<String> {
+    let u = if url.starts_with("//") {
+        format!("https:{}", url)
+    } else {
+        url.to_string()
+    };
+    match domain_of(&u) {
+        Some(host) if host == "localhost" => Some(u),
+        Some(host) if META_HOSTS.iter().any(|m| host == *m || host.ends_with(&format!(".{m}"))) => None,
+        Some(host) if host.contains('.') => Some(u),
+        _ => None,
+    }
+}
+
+/// Hosts that can never be a submission target: markup standards bodies,
+/// CDNs, and other infrastructure that search engines link to inside
+/// their own pages (observed: `w3.org/TR/html4/strict.dtd` from a 4get
+/// mirror `<a>` in the result area).
+const META_HOSTS: [&str; 5] = ["w3.org", "wix.com", "schema.org", "cloudflare.com", "sentry.io"];
+
 pub fn domain_of(url: &str) -> Option<String> {
     let u = url.trim();
     let after_scheme = u.split_once("://").map(|(_, h)| h).unwrap_or(u);
@@ -1141,7 +1382,6 @@ pub async fn find_sites_on_site(
         let url = substitute_url(&site.url, &query, offset, &cfg.domain, &HashMap::new());
 
         let resp: DriverResponse = driver.navigate(url).await;
-        if !resp.ok {
             // GSA's `banned=` patterns mean "this response is a ban page;
             // stop searching this site now".
             if site.banned.iter().any(|b| b.starts_with('!').then(|| resp
@@ -1154,12 +1394,17 @@ pub async fn find_sites_on_site(
             if resp.html.is_empty() {
                 continue; // hard fail — no HTML, try next page
             }
-        }
 
         // 3. Extract + filter.
         let hits = extract_results(&resp.html, site);
         for mut h in hits {
             h.source_page = p;
+            // T5 — drop protocol-relative junk from the search engine's own
+            // consent/redirect furniture; keep absolute URLs, real hosts only.
+            match clean_found_url(&h.url) {
+                Some(c) => h.url = c,
+                None => continue,
+            }
             // Country skip (catalog + TLD fallback).
             if country_skipped(site, &h, &cfg.skip_countries) {
                 continue;
@@ -1241,6 +1486,49 @@ mod tests {
 
     fn mock_driver_with(html: &str) -> Arc<dyn Driver> {
         Arc::new(MockDriver::with_html(html.to_string()))
+    }
+
+    /// Test fixture: a SiteSpec with only `name` set (all defaults).
+    fn site_named(name: &str) -> SiteSpec {
+        SiteSpec {
+            name: name.to_string(),
+            desc: String::new(),
+            enabled: true,
+            country: String::new(),
+            countries: Vec::new(),
+            languages: Vec::new(),
+            language_default: String::new(),
+            url: String::new(),
+            site_prefix: String::new(),
+            intitle_prefix: String::new(),
+            inurl_prefix: String::new(),
+            start_page: 1,
+            inc_page: 1,
+            max_page: 1,
+            more_results_param: String::new(),
+            more_results_values: Vec::new(),
+            wait_between_search: 0,
+            wait_special_search: 0,
+            extract_by_tag: String::new(),
+            url_fronts: Vec::new(),
+            url_backs: Vec::new(),
+            seperator: String::new(),
+            title_fronts: Vec::new(),
+            title_backs: Vec::new(),
+            banned: Vec::new(),
+            ignore_mask: Vec::new(),
+            follow_redirect: String::new(),
+            user_agent: String::new(),
+            referrer: String::new(),
+            download_referrer: false,
+            submit_form_url: String::new(),
+            submit_form_data: String::new(),
+            secret_fronts: Vec::new(),
+            secret_backs: Vec::new(),
+            set_cookies: String::new(),
+            is_default: false,
+            extras: HashMap::new(),
+        }
     }
 
     // --- parse_se_dat ------------------------------------------------------
@@ -1438,10 +1726,25 @@ decode2=extract_parameter q *google.com/url?q=*
             "ex.com",
             &HashMap::new(),
         );
-        assert_eq!(out, "https://x.com/?q=coffee house&p=40");
+        assert_eq!(out, "https://x.com/?q=coffee%20house&p=40");
     }
 
     #[test]
+    fn resolve_host_alternates_picks_first_candidate() {
+        let u = resolve_host_alternates(
+            "{https://4.nboeck.de|https://4get.sijh.net}/web?s=%search%&country=ar");
+        assert!(u.starts_with("https://4.nboeck.de/web?s="), "got {u}");
+        // No alternates -> unchanged.
+        assert_eq!(
+            resolve_host_alternates("https://a.com/x?y=1"),
+            "https://a.com/x?y=1");
+        // Substitute also resolves them.
+        let s = substitute_url(
+            "{https://a.com|https://b.com}/search?q=%search%",
+            "nuke guestbook", 1, "", &HashMap::new());
+        assert_eq!(s, "https://a.com/search?q=nuke%20guestbook");
+    }
+
     fn substitute_url_leaves_unknown_tokens() {
         let out = substitute_url("https://x.com/?t=%secret1%", "kw", 0, "", &HashMap::new());
         assert_eq!(out, "https://x.com/?t=%secret1%");
@@ -1456,6 +1759,77 @@ decode2=extract_parameter q *google.com/url?q=*
     }
 
     // --- domain_of + filters -----------------------------------------------
+
+    #[test]
+    fn clean_found_url_normalizes_proto_relative_and_drops_junk() {
+        assert_eq!(
+            clean_found_url("//example.com/page"),
+            Some("https://example.com/page".to_string())
+        );
+        assert_eq!(
+            clean_found_url("https://x.com/"),
+            Some("https://x.com/".to_string())
+        );
+        assert_eq!(clean_found_url("//g"), None);
+        assert_eq!(clean_found_url("//M0MRzq7kIy17WgL9"), None);
+        assert_eq!(clean_found_url("relative/path"), None);
+        assert_eq!(
+            clean_found_url("https://localhost:8080/x"),
+            Some("https://localhost:8080/x".to_string())
+        );
+        // Infrastructure hosts that search engines link to in-page are not
+        // submission targets (observed w3.org DTD from a 4get mirror).
+        assert_eq!(
+            clean_found_url("http://www.w3.org/TR/html4/strict.dtd"),
+            None
+        );
+        assert_eq!(clean_found_url("https://sub.wix.com/s"), None);
+        assert_eq!(clean_found_url("https://example.com/w3.org"), Some("https://example.com/w3.org".to_string()));
+    }
+
+    #[test]
+    fn extract_tag_links_finds_first_href_in_matching_div() {
+        let html = r#"<html><body>
+<div class="header">junk <a href="https://self.example/h"></div>
+<div class="fdb"><h3>Result A</h3><a href="https://result-a.example/">A</a><span>x</span></div>
+<div class="fdb">Result B - <a href="https://result-b.example/page">B</a></div>
+<div class="other"><a href="https://nope.example/">skip</a></div>
+</body></html>"#;
+        let urls = extract_tag_links(html, "div:class=fdb", 20);
+        assert_eq!(
+            urls,
+            vec!["https://result-a.example/", "https://result-b.example/page"]
+        );
+    }
+
+    #[test]
+    fn extract_tag_links_bare_a_uses_own_href() {
+        let html =
+            r#"<a class="res" href="https://one.example/">One</a>
+               <a href="https://two.example/two">Two</a>"#;
+        let urls = extract_tag_links(html, "a", 20);
+        assert_eq!(
+            urls,
+            vec!["https://one.example/", "https://two.example/two"]
+        );
+    }
+
+    #[test]
+    fn extract_tag_links_prefers_first_anchor_over_svg_href() {
+        let html = r##"<div class="snippet">
+            <svg href="http://www.w3.org/2000/svg"><use href="#icon"/></svg>
+            <a href="https://real-result.example/page">Title</a>
+        </div>"##;
+        let urls = extract_tag_links(html, "div:class=snippet", 20);
+        assert_eq!(urls, vec!["https://real-result.example/page"]);
+    }
+
+    #[test]
+    fn extract_tag_links_wildcard_class_matches_any() {
+        let html = r#"<div class="whatever"><a href="https://x.example/">X</a></div>"#;
+        let urls = extract_tag_links(html, "div:class=?*", 20);
+        assert_eq!(urls, vec!["https://x.example/"]);
+    }
 
     #[test]
     fn domain_of_returns_lowercased_host() {
@@ -1651,5 +2025,31 @@ decode2=extract_parameter q *google.com/url?q=*
         // Ensures the F#22 humanize module exposes stop_words() to F#23.
         let v = crate::humanize::stop_words().expect("stop_words.dat should load");
         assert!(v.len() >= 500, "expected >= 500 stop-words, got {}", v.len());
+    }
+
+    #[test]
+    fn filter_engines_matches_names_case_insensitive() {
+        let sites = vec![site_named("Bing"), site_named("4get - Brave AR"), site_named("Google"), site_named("Bing Images")];
+        assert_eq!(filter_engines(&sites, &[]).len(), 4, "empty filter keeps all");
+        let hit = filter_engines(&sites, &["bing".to_string()]);
+        assert_eq!(hit.len(), 2, "case-insensitive substring match");
+        let two = filter_engines(&sites, &["bing images".to_string(), "google".to_string()]);
+        assert_eq!(two.len(), 2);
+    }
+
+    #[test]
+    fn filter_engines_ranks_exact_matches_first() {
+        // Asking for "Brave" must try the real [Brave] engine before the
+        // mirror engines whose names merely contain "brave" — otherwise a
+        // small max_sites walk cap prunes the canonical engine.
+        let sites = vec![
+            site_named("4get - Brave AR"),
+            site_named("4get - Brave AU"),
+            site_named("Brave"),
+        ];
+        let hit = filter_engines(&sites, &["brave".to_string()]);
+        assert_eq!(hit.len(), 3);
+        assert_eq!(hit[0].name, "Brave", "exact-name match ranks first");
+        assert_eq!(hit[1].name, "4get - Brave AR", "mirrors keep catalog order after");
     }
 }

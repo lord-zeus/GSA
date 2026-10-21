@@ -1815,6 +1815,14 @@ pub async fn run_project_pool(project_id: Uuid, state: &Arc<AppState>) -> anyhow
         },
         linkwheel_project_ids: project_row.as_ref().map(|p| p.linkwheel.clone()).unwrap_or_default(),
         auto_export: project_row.as_ref().map(|p| p.auto_export).unwrap_or(false),
+        // T5 — searched site list: the base page for discovery engines.
+        project_sites: Repo::new(state.pool.clone())
+            .list_project_sites(project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.url)
+            .collect(),
 
         ..Default::default()
     };
@@ -2266,6 +2274,17 @@ async fn test_engine_pool(
                 .unwrap_or(0),
         },
         linkwheel_project_ids: project_row.as_ref().map(|p| p.linkwheel.clone()).unwrap_or_default(),
+        // T5 — searched site list for discovery engines (test dry-runs too).
+        project_sites: {
+            let pid = project_id;
+            Repo::new(state.pool.clone())
+                .list_project_sites(pid)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r.url)
+                .collect::<Vec<_>>()
+        },
         // F#26 — test run should NOT pollute the export feed, regardless
         // of the project's setting.
         auto_export: false,
@@ -2724,17 +2743,39 @@ async fn site_find(body: Json<serde_json::Value>) -> Response {
     let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(20).min(200) as usize;
     let pages = v.get("pages").and_then(|x| x.as_u64()).unwrap_or(2).min(5) as u32;
     let max_sites = v.get("max_sites").and_then(|x| x.as_u64()).unwrap_or(12).min(100) as usize;
-    let stop_words_pct = v.get("stop_words_pct").and_then(|x| x.as_u64()).unwrap_or(20) as u32;
+    // MVP default 0 — clean keyword query.  GSA's "add stop words with N%"
+    // (multi-language word sampling) is opt-in via the request body.
+    let stop_words_pct = v.get("stop_words_pct").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    // T5 — optional engine whitelist (e.g. ["Bing"]); empty = whole catalog.
+    let engine_names: Vec<String> = v
+        .get("engines")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
     let mode = match v.get("mode").and_then(|x| x.as_str()) {        Some("site") => engine::site::QueryMode::Site,
+        Some("intitle") => engine::site::QueryMode::Intitle,
         Some("inurl") => engine::site::QueryMode::Inurl,
         Some("plain") => engine::site::QueryMode::Plain,
-        _ => engine::site::QueryMode::Intitle,
+        _ => engine::site::QueryMode::Plain,
     };
 
-    let sites = match engine::site::load_site_catalog() {
+    let all_sites = match engine::site::load_site_catalog() {
         Ok(sites) => sites,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e }))).into_response(),
+    };
+    // T5 — honor the engine whitelist (substring, case-insensitive).
+    let sites_refs = engine::site::filter_engines(&all_sites, &engine_names);
+    let sites: Vec<engine::site::SiteSpec> = if sites_refs.is_empty() {
+        if !engine_names.is_empty() {
+            return (StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("no catalog engine matches {:?} (see GET /api/sites)", engine_names),
+                }))).into_response();
+        }
+        Vec::new()
+    } else {
+        sites_refs.into_iter().cloned().collect()
     };
 
     let cfg = engine::site::SiteFindConfig {
@@ -2755,9 +2796,10 @@ async fn site_find(body: Json<serde_json::Value>) -> Response {
     };
 
     let driver: std::sync::Arc<dyn engine::driver::Driver> =
-        std::sync::Arc::new(engine::HttpDriver::new());
+        std::sync::Arc::new(engine::CurlDriver::new()); // curl TLS fingerprint passes Brave
 
     let started = std::time::Instant::now();
+    let attempted_engines = sites.len();
     let found = engine::site::find_sites(cfg, driver, sites).await;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
@@ -2777,8 +2819,186 @@ async fn site_find(body: Json<serde_json::Value>) -> Response {
         "keyword": keyword,
         "elapsed_ms": elapsed_ms,
         "count": sites_out.len(),
+        "attempted_engines": attempted_engines,
+        "engines": engine_names,
         "sites": sites_out,
     })).into_response()
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// T5 — project site list: where live search goes, where the runner
+// submits to.  GSA flow: search (se.dat catalog) → found sites → the
+// discovery engines post the backlink there.
+// ─────────────────────────────────────────────────────────────
+
+/// GET /api/projects/{id}/sites — the project's saved found-site list.
+async fn project_sites_list(Path(project_id): Path<Uuid>, state: State<Arc<AppState>>) -> Response {
+    match Repo::new(state.pool.clone()).list_project_sites(project_id).await {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "project_id": project_id.to_string(),
+                "count": rows.len(),
+                "sites": rows,
+            })),
+        )
+            .into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddSitesBody {
+    /// Site URLs (array is preferred).
+    #[serde(default)]
+    urls: Vec<String>,
+    /// Single-URL convenience form.
+    #[serde(default)]
+    url: Option<String>,
+    /// Where the URLs came from: "search" (site finder) or "manual".
+    #[serde(default = "default_site_origin")]
+    origin: String,
+}
+fn default_site_origin() -> String {
+    "manual".to_string()
+}
+
+/// POST /api/projects/{id}/sites — save found site URLs (upsert, unique
+/// per project).
+async fn project_sites_add(
+    Path(project_id): Path<Uuid>,
+    state: State<Arc<AppState>>,
+    body: Json<AddSitesBody>,
+) -> Response {
+    let b = &body.0;
+    let mut urls = b.urls.clone();
+    if let Some(u) = b.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        urls.push(u.to_string());
+    }
+    if urls.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "urls (array) or url (string) is required" })),
+        )
+            .into_response();
+    }
+    let repo = Repo::new(state.pool.clone());
+    if let Err(e) = repo.add_project_sites(project_id, &urls, &b.origin).await {
+        return error_response(e);
+    }
+    match repo.list_project_sites(project_id).await {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "saved": urls.len(), "total": rows.len(), "sites": rows })),
+        )
+            .into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// DELETE /api/projects/{id}/sites — clear the site list (fresh search).
+async fn project_sites_clear(Path(project_id): Path<Uuid>, state: State<Arc<AppState>>) -> Response {
+    match Repo::new(state.pool.clone()).clear_project_sites(project_id).await {
+        Ok(removed) => (StatusCode::OK, Json(serde_json::json!({ "removed": removed }))).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// POST /api/projects/{id}/sites/find — run the live site finder (same
+/// engine as `POST /api/sites/find` — keyword / mode / `engines` whitelist /
+/// limit / pages) and save the found sites into the project's site list.
+/// This is the GSA "find sites → submit to them" MVP loop.
+async fn project_sites_find(
+    Path(project_id): Path<Uuid>,
+    state: State<Arc<AppState>>,
+    body: Json<serde_json::Value>,
+) -> Response {
+    let v = &body.0;
+    let keyword = v.get("keyword").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    if keyword.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "keyword is required" })),
+        )
+            .into_response();
+    }
+    let domain = v.get("domain").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let quotes = v.get("quotes").and_then(|x| x.as_bool()).unwrap_or(false);
+    let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(20).min(200) as usize;
+    let pages = v.get("pages").and_then(|x| x.as_u64()).unwrap_or(1).min(5) as u32;
+    let engine_names: Vec<String> = v
+        .get("engines")
+        .and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let mode = match v.get("mode").and_then(|x| x.as_str()) {
+        Some("site") => engine::site::QueryMode::Site,
+        Some("intitle") => engine::site::QueryMode::Intitle,
+        Some("inurl") => engine::site::QueryMode::Inurl,
+        Some("plain") => engine::site::QueryMode::Plain,
+        _ => engine::site::QueryMode::Plain,
+    };
+
+    let all_sites = match engine::site::load_site_catalog() {
+        Ok(s) => s,
+        Err(e) => return error_response(anyhow::anyhow!(e)),
+    };
+    let refs = engine::site::filter_engines(&all_sites, &engine_names);
+    let sites: Vec<engine::site::SiteSpec> = refs.into_iter().cloned().collect();
+    if sites.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("no catalog engine matches {:?} (see GET /api/sites)", engine_names),
+            })),
+        )
+            .into_response();
+    }
+
+    let cfg = engine::site::SiteFindConfig {
+        keyword: keyword.clone(),
+        domain,
+        mode,
+        quotes,
+        stop_words_pct: 0,
+        max_results: limit,
+        max_sites: 12,
+        max_pages: pages.max(1),
+        min_keywords_present: 0,
+        skip_countries: Vec::new(),
+        skip_languages: Vec::new(),
+        block_domains: Vec::new(),
+        seen_ips: std::collections::HashSet::new(),
+        seed: 0xC0FFEE,
+    };
+    let driver: std::sync::Arc<dyn engine::driver::Driver> = std::sync::Arc::new(engine::CurlDriver::new());
+    let started = std::time::Instant::now();
+    let attempted_engines = sites.len();
+    let found = engine::site::find_sites(cfg, driver, sites).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    let urls: Vec<String> = found.iter().map(|f| f.url.clone()).collect();
+    let repo = Repo::new(state.pool.clone());
+    let saved = match repo.add_project_sites(project_id, &urls, "search").await {
+        Ok(n) => n,
+        Err(e) => return error_response(e),
+    };
+    let rows = repo.list_project_sites(project_id).await.unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "keyword": keyword,
+            "elapsed_ms": elapsed_ms,
+            "attempted_engines": attempted_engines,
+            "found": urls.len(),
+            "saved_new": saved,
+            "total_sites": rows.len(),
+            "sites": rows,
+        })),
+    )
+        .into_response()
 }
 
 // POST /api/sites/find_on — single-page live check of F#23 extraction on a
@@ -2798,7 +3018,7 @@ fn default_anchor() -> String { String::new() }
 async fn site_find_on(
     Json(body): Json<FindOnBody>,
 ) -> Response {
-    let driver: std::sync::Arc<dyn engine::driver::Driver> = std::sync::Arc::new(engine::HttpDriver::new());
+    let driver: std::sync::Arc<dyn engine::driver::Driver> = std::sync::Arc::new(engine::CurlDriver::new());
     let kw = if body.anchor_text.is_empty() { String::from("test") } else { body.anchor_text.clone() };
     let site = engine::site::SiteSpec {
         name: "test".into(),
@@ -2957,6 +3177,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/sites", get(site_catalog))
         .route("/api/sites/find", post(site_find))
 .route("/api/sites/find_on", post(site_find_on))
+        // T5 — project site list (search results the runner submits to)
+        .route("/api/projects/{id}/sites", get(project_sites_list).post(project_sites_add).delete(project_sites_clear))
+        .route("/api/projects/{id}/sites/find", post(project_sites_find))
 
         // F#17 — per-project scheduled runs (schedule CRUD + run-now).
         .route(
