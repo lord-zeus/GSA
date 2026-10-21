@@ -87,7 +87,7 @@ async fn fire(state: Arc<AppState>, id: Uuid) -> anyhow::Result<()> {
     eprintln!("[scheduler] firing project {} (schedule {})", row.project_id, id);
     // Run in-process; the pool's per-job timeout bounds the call. A failure
     // is logged but does NOT stop the scheduler loop — the tick continues.
-    let summary = match run_project_pool(row.project_id, &state).await {
+    let summary = match run_project_pool(row.project_id, &state, None).await {
         Ok(v) => v,
         Err(e) => {
             eprintln!("[scheduler] run project {} failed: {e}", row.project_id);

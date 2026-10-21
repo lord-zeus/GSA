@@ -46,6 +46,13 @@ export interface EngineRow {
   step_count: number
   enabled: boolean
   created_at: string
+  // — T6 · per-engine health (the auto-run router ranks by this) —
+  attempts?: number
+  successes?: number
+  captcha_failures?: number
+  last_attempt_at?: string | null
+  last_success_at?: string | null
+  last_error?: string | null
 }
 export interface JobRow {
   id: string
@@ -146,6 +153,33 @@ export interface RunSummary {
   done: number
   failed: number
   panics: number
+}
+// — T6 · live run feed (one line of the project's live log) —
+export type RunEventLevel = 'info' | 'engine' | 'step' | 'captcha' | 'success' | 'error' | 'auto'
+export interface RunEventRow {
+  id: number
+  project_id: string
+  job_id?: string | null
+  engine?: string | null
+  level: RunEventLevel
+  message: string
+  ts: string
+}
+export interface TestAllResult {
+  tested: number
+  ok: number
+  results: Array<Record<string, any>>
+}
+export interface CaptchaProbe {
+  target: string
+  ok: boolean
+  detail: string
+}
+export interface CaptchaTestResult {
+  provider: string
+  armed: boolean
+  detail: string
+  probes: CaptchaProbe[]
 }
 
 // ── F#17 · scheduled runs (cron) ──
@@ -450,6 +484,28 @@ export const api = {
   // — F#12 email-runner glue: run now + operator mailbox + email engine field —
   runProject: (projectId: string) =>
     req<RunSummary>(`/api/projects/${projectId}/run`, { method: 'POST' }),
+
+  // — T6 · the auto UX —
+  /** Auto-run: the SYSTEM ranks the project's engines by health and
+   *  tries them until `links` backlinks are created (first success
+   *  soft-stops the rest). No engine picking in the UI. */
+  projectRunAuto: (id: string, o?: { engines?: number; links?: number }) =>
+    req<RunSummary & { auto_run: boolean; engines_tried_order: string[]; links_target: number; enqueued_jobs: number }>(
+      `/api/projects/${id}/run-auto`,
+      { method: 'POST', body: JSON.stringify(o ?? {}) },
+    ),
+  /** Tail of the project's live run log (the DB — source of truth). */
+  projectEvents: (id: string, after = 0, limit = 200) =>
+    req<{ events: RunEventRow[] }>(`/api/projects/${id}/events?after=${after}&limit=${limit}`),
+  /** SSE URL for the live run log. */
+  projectEventsLiveUrl: (id: string) => `/api/projects/${id}/events/live`,
+  /** Dry-run every project engine (best health first) and report which
+   *  ones actually create a link. */
+  projectTestAll: (id: string, limit = 12) =>
+    req<TestAllResult>(`/api/projects/${id}/test-all`, { method: 'POST', body: JSON.stringify({ limit }) }),
+  /** Verify the configured captcha solver account (balance / key check). */
+  captchaTest: () =>
+    req<CaptchaTestResult>('/api/captcha/test', { method: 'POST' }),
   emailGet: () => req<EmailSetting>('/api/settings/email'),
   emailSet: (s: { address: string; password: string }) =>
     req<{ status: string }>('/api/settings/email', {

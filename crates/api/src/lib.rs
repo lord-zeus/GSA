@@ -40,6 +40,8 @@ pub mod scheduler;
 pub mod livebus;
 /// F#18 — the single emission funnel (persist → broadcast → email).
 pub mod notifier;
+/// T6 — live run feed (job_events rows + SSE run bus + runner sink).
+pub mod runfeed;
 
 use axum::routing::{delete, get, patch, post, put};
 
@@ -70,6 +72,9 @@ pub struct AppState {
     /// F#18 — real-time alert bus (shared by every SSE client).
     pub bus: crate::livebus::LiveBus,
 
+    /// T6 — live run-event bus (the project console streams from here).
+    pub run_bus: crate::runfeed::RunBus,
+
 }
 
 
@@ -78,7 +83,11 @@ pub async fn app_state(dsn: Option<&str>) -> anyhow::Result<Arc<AppState>> {
 
     let pool = ser_db::connect(dsn).await?;
 
-    Ok(Arc::new(AppState { pool, bus: crate::livebus::LiveBus::new() }))
+    Ok(Arc::new(AppState {
+        pool,
+        bus: crate::livebus::LiveBus::new(),
+        run_bus: crate::runfeed::RunBus::new(),
+    }))
 
 }
 
@@ -1675,7 +1684,14 @@ async fn browser_ws_endpoint(base: &str) -> Option<String> {
 
 /// JSON response, the scheduler just logs + records it).
 
-pub async fn run_project_pool(project_id: Uuid, state: &Arc<AppState>) -> anyhow::Result<serde_json::Value> {
+/// T6 — `pause_after_override` wins over `projects.pause_after` when
+/// `Some` (the auto-run endpoint uses `Some(links_target)` so the first
+/// winning engine soft-stops the rest of the queue).
+pub async fn run_project_pool(
+    project_id: Uuid,
+    state: &Arc<AppState>,
+    pause_after_override: Option<usize>,
+) -> anyhow::Result<serde_json::Value> {
 
     // GSA install root — same default the import path uses; override with
 
@@ -1823,6 +1839,13 @@ pub async fn run_project_pool(project_id: Uuid, state: &Arc<AppState>) -> anyhow
             .into_iter()
             .map(|r| r.url)
             .collect(),
+        // T6 — live run feed: every runner event lands in `job_events`
+        // (DB) and on the SSE bus (live console) at the moment it happens.
+        events: Some(crate::runfeed::RunEventSink::new(
+            project_id,
+            state.pool.clone(),
+            state.run_bus.sender(),
+        )),
 
         ..Default::default()
     };
@@ -1863,9 +1886,13 @@ pub async fn run_project_pool(project_id: Uuid, state: &Arc<AppState>) -> anyhow
     }
 
 
+    // T6 — a handler may override the project-level pause ceiling
+    // (auto-run: stop as soon as the target link count is reached).
+    let pause_after = pause_after_override
+        .unwrap_or_else(|| project_row.as_ref().map(|p| p.pause_after as usize).unwrap_or(0));
     let pool = runner::pool_for_disk(state.pool.clone(), cfg, roots, drivers)
         .with_context(ctx)
-        .with_pause_after(project_row.as_ref().map(|p| p.pause_after as usize).unwrap_or(0));
+        .with_pause_after(pause_after);
 
 
     // F#18 — time the run so the alert can carry a duration.
@@ -1922,7 +1949,7 @@ pub async fn run_project_pool(project_id: Uuid, state: &Arc<AppState>) -> anyhow
 
 async fn run_project(State(state): State<Arc<AppState>>, Path(project_id): Path<Uuid>) -> Response {
 
-    match run_project_pool(project_id, &state).await {
+    match run_project_pool(project_id, &state, None).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => error_response(e),
     }
@@ -2141,7 +2168,7 @@ async fn run_mixed(
         }
     }
 
-    match run_project_pool(project_id, &state).await {
+    match run_project_pool(project_id, &state, None).await {
         Ok(v) => {
             let mut v = v;
             if let Some(obj) = v.as_object_mut() {
@@ -2153,6 +2180,456 @@ async fn run_mixed(
         }
         Err(e) => error_response(e),
     }
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// T6 — Auto-run: the SYSTEM picks and orders the engines.
+//
+// The user names the site + link keywords; we rank the project's
+// engines by health (real successes first, captcha walls last,
+// least-used next so a fresh engine gets its shot) and queue ONE
+// job per engine in worst→best order.  The pool dispatches in
+// `created_at DESC` order, so the best engines are dispatched
+// first, in parallel waves, and the first success soft-stops the
+// rest (pause-after override).  That is GSA's "try engine, on
+// failure try the next" — the user never picks an engine.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RunAutoBody {
+    /// How many top-ranked engines to fan out with (default 5).
+    #[serde(default)]
+    engines: Option<usize>,
+    /// Successful links to create before soft-stopping the rest of the
+    /// queue (default: one per keyword — "try & error until we win").
+    #[serde(default)]
+    links: Option<usize>,
+}
+
+async fn run_auto(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    Json(body): Json<RunAutoBody>,
+) -> Response {
+    match run_auto_pool(project_id, &state, body).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn run_auto_pool(
+    project_id: Uuid,
+    state: &Arc<AppState>,
+    body: RunAutoBody,
+) -> anyhow::Result<serde_json::Value> {
+    let repo = Repo::new(state.pool.clone());
+
+    // 1) Sanity: there must be engines + keywords to drive.
+    let project = match repo.project_by_id(project_id).await? {
+        Some(p) => p,
+        None => anyhow::bail!("project not found"),
+    };
+    let keywords = repo.list_keywords(project_id).await?;
+    if keywords.is_empty() {
+        anyhow::bail!("no keywords on this project — add at least one link keyword first");
+    }
+    let mut engines = repo.list_engines_all(project_id).await?;
+    engines.retain(|e| e.enabled && !e.file_path.trim().is_empty());
+    if engines.is_empty() {
+        anyhow::bail!("no usable engines on this project (engines need an INI file path)");
+    }
+
+    // 2) Rank by health.  Successes are the only hard signal; then
+    // captcha walls (they eat a whole job), then least-used (fresh
+    // engines deserve a fair shot before re-tired ones).
+    engines.sort_by(|a, b| {
+        b.successes.cmp(&a.successes)
+            .then(b.last_success_at.cmp(&a.last_success_at))
+            .then(a.captcha_failures.cmp(&b.captcha_failures))
+            .then(a.attempts.cmp(&b.attempts))
+            .then_with(|| a.created_at.cmp(&b.created_at))
+    });
+    let top_n = body.engines.unwrap_or(5).clamp(1, 20);
+    // Head of the sorted list = best health first.
+    let picked: Vec<ser_db::Engine> = engines.into_iter().take(top_n).collect();
+    let _ = &project;
+    let order_names: Vec<String> = picked.iter().map(|e| e.engine_name.clone()).collect();
+
+    // 3) Banner line into the live feed (level "auto") — the console's
+    // first non-user line of every run, stating what the system chose.
+    {
+        use runner::EventSink as _;
+        let sink = crate::runfeed::RunEventSink::new(
+            project_id,
+            state.pool.clone(),
+            state.run_bus.sender(),
+        );
+        sink.record(runner::RunEvent {
+            job_id: None,
+            engine: None,
+            level: "auto".into(),
+            message: format!(
+                "AUTO-RUN — system picked {} engines (best health first): {} — first success wins",
+                picked.len(),
+                order_names.join(" → ")
+            ),
+        });
+    }
+
+    // 4) Queue jobs in REVERSE health order: the pool dispatches in
+    //    `created_at DESC`, so the best engines (created last) are
+    //    claimed first and fan out across the workers.
+    let links_target = body.links.unwrap_or(keywords.len()).max(1);
+    let mut enqueued = 0usize;
+    for kw in &keywords {
+        for e in picked.iter().rev() {
+            if repo
+                .create_job(project_id, Some(e.id), Some(kw.id))
+                .await
+                .is_ok()
+            {
+                enqueued += 1;
+            }
+        }
+    }
+
+    // 5) Execute — `links_target` successful links soft-stop the rest
+    //    (the try-and-fallback loop; the leftovers stay queued and can
+    //    be resumed with POST /resume if the user wants more).
+    let mut result = run_project_pool(project_id, state, Some(links_target)).await?;
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert("auto_run".to_string(), serde_json::json!(true));
+        obj.insert("engines_tried_order".to_string(), serde_json::json!(order_names));
+        obj.insert("links_target".to_string(), serde_json::json!(links_target));
+        obj.insert("enqueued_jobs".to_string(), serde_json::json!(enqueued));
+    }
+    Ok(result)
+}
+
+// ─────────────────────────────────────────────────────────────
+// T6 — Live run feed: DB-tail + SSE.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct EventsQ {
+    /// Continue after this `job_events.id` (default 0 = from the start).
+    #[serde(default)]
+    after: i64,
+    #[serde(default = "events_default_limit")]
+    limit: i64,
+}
+
+fn events_default_limit() -> i64 {
+    200
+}
+
+/// T6 — tail of the project's live run log (source of truth).
+/// The UI fetches this on open / reconnect and then follows the
+/// SSE stream; both carry the same `id`, so the console dedupes.
+async fn project_events(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    Query(q): Query<EventsQ>,
+) -> Response {
+    let repo = Repo::new(state.pool.clone());
+    match repo.list_job_events(project_id, q.after, q.limit).await {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "events": rows })),
+        )
+            .into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// T6 — live run log (SSE). Every `job_events` row is re-broadcast
+/// here the moment the runner emits it. Frames for OTHER projects are
+/// dropped server-side; a lagging client just misses a frame and
+/// recovers through `project_events` on reconnect.
+async fn project_events_live(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+) -> Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures_util::StreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    let rx = state.run_bus.subscribe();
+    let pid = project_id;
+    let hello_time = chrono::Utc::now().to_rfc3339();
+
+    type SseFrame = Result<Event, std::convert::Infallible>;
+    let stream: futures_util::stream::BoxStream<'static, SseFrame> =
+        futures_util::stream::once(std::future::ready(Ok::<Event, std::convert::Infallible>(
+            Event::default()
+                .event("hello")
+                .data(
+                    serde_json::to_string(&serde_json::json!({
+                        "serverTime": hello_time,
+                        "project_id": pid.to_string(),
+                    }))
+                    .unwrap_or_default(),
+                ),
+        )))
+        .chain(
+            BroadcastStream::new(rx).filter_map(move |r| {
+                let fut = async move {
+                    match r {
+                        Ok(msg) if msg.project_id == pid => Some(Ok::<Event, std::convert::Infallible>(
+                            Event::default()
+                                .event("run")
+                                .data(serde_json::to_string(&msg).unwrap_or_default()),
+                        )),
+                        // Other projects / lag frames: drop. The DB tail
+                        // endpoint is the recovery path.
+                        _ => None,
+                    }
+                };
+                fut
+            }),
+        )
+        .boxed();
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::default().interval(std::time::Duration::from_secs(15)),
+        )
+        .into_response()
+}
+
+// ─────────────────────────────────────────────────────────────
+// T6 — Test-all engines + captcha solver health.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct TestAllBody {
+    /// Max engines to test (default 12). Each test is a full
+    /// end-to-end dry run, so this is deliberately bounded.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// T6 — "test all those engines" (user request): dry-run the project's
+/// engines one by one (best-health first — previous test runs already
+/// demote broken ones) and report which ones actually create a link.
+/// Each attempt goes through `test_engine_pool` so results are
+/// `results`-free, and every attempt is visible in the live feed.
+async fn test_all_engines(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    Json(body): Json<TestAllBody>,
+) -> Response {
+    let max = body.limit.unwrap_or(12).clamp(1, 40);
+    let repo = Repo::new(state.pool.clone());
+    let engines = match repo.list_engines_all(project_id).await {
+        Ok(rows) => rows,
+        Err(e) => return error_response(e),
+    };
+    let mut engines: Vec<_> = engines
+        .into_iter()
+        .filter(|e| e.enabled && !e.file_path.trim().is_empty())
+        .collect();
+    engines.sort_by(|a, b| {
+        b.successes.cmp(&a.successes)
+            .then(b.last_success_at.cmp(&a.last_success_at))
+            .then(a.captcha_failures.cmp(&b.captcha_failures))
+            .then(a.attempts.cmp(&b.attempts))
+    });
+    let engines = engines.into_iter().take(max).collect::<Vec<_>>();
+    if engines.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "tested": 0, "ok": 0, "results": [] })),
+        )
+            .into_response();
+    }
+
+    // One keyword for the whole batch (the first one — a test needs
+    // SOME anchor text, but it is not the point).
+    let kw = repo
+        .list_keywords(project_id)
+        .await
+        .ok()
+        .and_then(|k| k.first().map(|k| k.id));
+
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(engines.len());
+    let mut ok = 0usize;
+    for e in &engines {
+        match test_engine_pool(
+            project_id,
+            TestEngineBody {
+                engine_id: e.id,
+                keyword_id: kw,
+            },
+            &state,
+        )
+        .await
+        {
+            Ok(mut v) => {
+                let successful = v
+                    .pointer("/report/successful")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+                if successful > 0 {
+                    ok += 1;
+                }
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("engine".to_string(), serde_json::json!(e.engine_name));
+                    o.insert("ok".to_string(), serde_json::json!(successful > 0));
+                }
+                results.push(v);
+            }
+            Err(err) => results.push(serde_json::json!({
+                "engine": e.engine_name,
+                "ok": false,
+                "successful": 0,
+                "error": err.to_string(),
+            })),
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "tested": results.len(),
+            "ok": ok,
+            "results": results,
+        })),
+    )
+        .into_response()
+}
+
+/// T6 — one probe of a captcha provider account: hit its key-info
+/// endpoint with the configured API key and report ok / balance /
+/// the provider's own error text.
+async fn captcha_probe(
+    name: &str,
+    url: String,
+) -> serde_json::Value {
+    use engine::Driver as _;
+    let d = engine::HttpDriver::new();
+    let r = d.navigate(url).await;
+    if !r.ok {
+        return serde_json::json!({
+            "target": name,
+            "ok": false,
+            "detail": r.error.clone().unwrap_or_else(|| "request failed".into()),
+        });
+    }
+    let body = r.html.trim().to_string();
+    let (ok, detail) = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+        match v.get("balance") {
+            Some(b) => (true, format!("balance = {b}")),
+            None if v.get("success").and_then(|s| s.as_bool()) == Some(true) => {
+                (true, "valid key (no balance field)".to_string())
+            }
+            _ => (false, body.chars().take(160).collect()),
+        }
+    } else if body.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+        (true, format!("balance = {body}"))
+    } else {
+        (false, body.chars().take(160).collect())
+    };
+    serde_json::json!({ "target": name, "ok": ok, "detail": detail })
+}
+
+/// T6 — "captcha solver link to them": verify the configured solver
+/// (local / 2captcha / anticaptcha / capmonster / auto-chain) before
+/// spending a run slot on an engine that will hit a captcha wall.
+/// `provider=auto` walks the F#29 free-first chain and reports the
+/// first account that accepts the key.
+async fn captcha_test(State(state): State<Arc<AppState>>) -> Response {
+    let repo = Repo::new(state.pool.clone());
+    let globals = repo.global_settings().await.unwrap_or_default();
+    let provider = globals
+        .captcha_provider
+        .clone()
+        .unwrap_or_else(|| "auto".to_string());
+    let key = globals.captcha_api_key.clone().unwrap_or_default();
+
+    if provider == "local" {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "provider": "local",
+                "armed": true,
+                "detail": "local captcha solver active (offline, covers in-page captchas without an account)",
+                "probes": [],
+            })),
+        )
+            .into_response();
+    }
+    if key.trim().is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "provider": provider,
+                "armed": false,
+                "detail": format!("no captcha API key configured (provider = {provider}) — engines behind a captcha wall will fail until one is set"),
+                "probes": [],
+            })),
+        )
+            .into_response();
+    }
+
+    let k = key.trim();
+    let mut candidates: Vec<(&str, String)> = Vec::new();
+    match provider.as_str() {
+        "2captcha" => candidates.push((
+            "2captcha",
+            format!("https://api.2captcha.com/res.php?action=getbalance&key={k}"),
+        )),
+        "capmonster" => candidates.push((
+            "capmonster",
+            format!("https://capmonster.cloud/getbalance?key={k}"),
+        )),
+        "anticaptcha" => candidates.push((
+            "anticaptcha",
+            format!("https://api.anticaptcha.com/antipal/checkkey.php?key={k}"),
+        )),
+        _ => {
+            // `auto` — the free-first chain, probed in solve order.
+            candidates.push((
+                "2captcha",
+                format!("https://api.2captcha.com/res.php?action=getbalance&key={k}"),
+            ));
+            candidates.push((
+                "anticaptcha",
+                format!("https://api.anticaptcha.com/antipal/checkkey.php?key={k}"),
+            ));
+            candidates.push((
+                "capmonster",
+                format!("https://capmonster.cloud/getbalance?key={k}"),
+            ));
+        }
+    }
+
+    let mut probes: Vec<serde_json::Value> = Vec::new();
+    let mut armed = false;
+    for (name, url) in candidates {
+        if armed {
+            break;
+        }
+        let probe = captcha_probe(name, url).await;
+        if probe.get("ok").and_then(|b| b.as_bool()) == Some(true) {
+            armed = true;
+        }
+        probes.push(probe);
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "provider": provider,
+            "armed": armed,
+            "detail": if armed {
+                "at least one solver account accepted the key"
+            } else {
+                "no solver account accepted this key — engine captcha walls will block submissions"
+            },
+            "probes": probes,
+        })),
+    )
+        .into_response()
 }
 
 
@@ -2291,6 +2768,12 @@ async fn test_engine_pool(
         // F#26 — THE critical flag: no job status / result row / CSV
         // append — just drive the engine and report back.
         dry_run: true,
+        // T6 — live run feed (the test console shows what's happening now).
+        events: Some(crate::runfeed::RunEventSink::new(
+            project_id,
+            state.pool.clone(),
+            state.run_bus.sender(),
+        )),
 
         ..Default::default()
     };
@@ -2656,7 +3139,7 @@ async fn run_now_schedule(
     if !claimed {
         return Json(serde_json::json!({ "status": "skipped", "reason": "next_run_at is not due / schedule is consumed" })).into_response();
     }
-    let summary = match run_project_pool(sched.project_id, &state).await {
+    let summary = match run_project_pool(sched.project_id, &state, None).await {
         Ok(v) => v,
         Err(e) => return error_response(e),
     };
@@ -3126,6 +3609,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/projects/{id}/pause-after", put(set_project_pause_after))
         .route("/api/projects/{id}/polish", patch(set_project_polish))
         .route("/api/projects/{id}/resume", post(resume_project))
+
+        // T6 — the auto UX: the system picks engines (try & fallback),
+        // live run feed (DB tail + SSE), test-all engines, captcha
+        // solver health.
+        .route("/api/projects/{id}/run-auto", post(run_auto))
+        .route("/api/projects/{id}/events", get(project_events))
+        .route("/api/projects/{id}/events/live", get(project_events_live))
+        .route("/api/projects/{id}/test-all", post(test_all_engines))
+        .route("/api/captcha/test", post(captcha_test))
 
         .route("/api/proxies", get(list_proxies).post(create_proxy))
 

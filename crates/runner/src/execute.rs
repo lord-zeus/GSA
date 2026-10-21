@@ -18,6 +18,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::config::RunnerConfig;
+use crate::events::{LoggingDriver, RunEvent};
 use crate::specprovider::SpecSource;
 
 /// Context shared across all workers in one pool run.
@@ -94,6 +95,13 @@ pub struct SubmissionContext {
     /// auto-export CSV append. Used by the UI "Test engine" dry-run so a
     /// single submission can be observed without polluting a real run's data.
     pub dry_run: bool,
+    /// T6 — optional live-event sink (GSA's "activity log"): when `Some`,
+    /// every interesting moment of the run (engine pick, each HTTP step
+    /// with outcome + timing, captcha attempts, the final submit result)
+    /// is recorded through it. The API wires this to the `job_events`
+    /// table + the SSE broadcast so the UI console updates live. `None` =
+    /// previous behavior (events not logged) — unit tests stay quiet.
+    pub events: Option<std::sync::Arc<dyn crate::events::EventSink>>,
 }
 
 /// The terminal state of one job's execution.
@@ -189,6 +197,34 @@ impl JobRunner {
         Self { cfg, spec, drivers, ctx }
     }
 
+    /// T6 — push one live-run event through the context's sink, if one is
+    /// wired. A no-op when `ctx.events` is `None` (unit tests, dry pools).
+    /// Never panics and never blocks — the sink is `record`-sync on purpose
+    /// (see `crate::events`); any I/O is its concern.
+    fn emit(&self, ev: crate::events::RunEvent) {
+        if let Some(sink) = &self.ctx.events {
+            sink.record(ev);
+        }
+    }
+
+    /// T6 — wrap a driver so every HTTP step it executes is logged through
+    /// the event sink (method / URL / outcome / wall time). `None` sink or
+    /// `None` input → the original driver, untouched.
+    fn with_logging(
+        &self,
+        driver: std::sync::Arc<dyn Driver>,
+        job_id: Uuid,
+        engine_name: Option<String>,
+    ) -> std::sync::Arc<dyn Driver> {
+        match &self.ctx.events {
+            Some(sink) => {
+                let ld = LoggingDriver::new(driver, sink.clone(), Some(job_id), engine_name);
+                std::sync::Arc::new(ld)
+            }
+            None => driver,
+        }
+    }
+
     /// Execute one already-claimed job. Returns the terminal outcome.
     /// All failure modes are folded into the returned `JobOutcome`; a
     /// panic here is the pool's problem.
@@ -206,6 +242,12 @@ impl JobRunner {
     }
 
     pub async fn run_one(&self, repo: &ser_db::Repo, job: &ser_db::Job) -> JobOutcome {
+        self.emit(RunEvent {
+            job_id: Some(job.id),
+            engine: None,
+            level: "info".into(),
+            message: "job started — resolving engine…".into(),
+        });
         let (engine_id, file_path) = match self
             .resolve_engine(repo, job)
             .await
@@ -214,6 +256,12 @@ impl JobRunner {
             Ok(p) => p,
             Err(msg) => return self.finish(repo, job.id, false, Some(msg), empty_report(), String::new(), None).await,
         };
+        self.emit(RunEvent {
+            job_id: Some(job.id),
+            engine: None,
+            level: "engine".into(),
+            message: format!("engine {engine_id} → {file_path}"),
+        });
 
         // 1b) keyword — job-level keyword_id wins over the pool context.
         //     A spintax keyword is spun here, once, to a concrete variant
@@ -228,6 +276,21 @@ impl JobRunner {
                                 return self.finish(repo, job.id, false, Some(msg), empty_report(), String::new(), None).await;
             }
         };
+        self.emit(RunEvent {
+            job_id: Some(job.id),
+            engine: Some(engine.name.clone()),
+            level: "engine".into(),
+            message: format!(
+                "engine “{}” [{}] — {}",
+                engine.name,
+                engine.engine_type,
+                if engine.base_url().is_empty() {
+                    String::from("discovery engine (target = searched site)")
+                } else {
+                    engine.base_url()
+                }
+            ),
+        });
 
         // 3) plan.
         //
@@ -406,6 +469,16 @@ impl JobRunner {
             site_url,
         };
         let plan = resolve_plan(&engine, &input);
+        self.emit(RunEvent {
+            job_id: Some(job.id),
+            engine: Some(engine.name.clone()),
+            level: "engine".into(),
+            message: format!(
+                "plan ready — {} step(s), driver kind {plan_kind}",
+                plan.steps.len(),
+                plan_kind = format!("{:?}", plan.required_driver)
+            ),
+        });
 
         // 3b) F#12 — mail-engine family (real POP3 mailbox + `pop3
         //     server=WEB` inbox-parse). These specs are `[setup]`-only:
@@ -421,7 +494,7 @@ impl JobRunner {
         //     whole catalog).
         if plan.required_driver == DriverKind::Email {
             let d = match self.drivers.get(DriverKind::Email) {
-                Some(d) => d,
+                Some(d) => self.with_logging(d, job.id, Some(engine.name.clone())),
                 None => {
                     let msg = "driver not registered for Email (F#12)".into();
                     return self.finish(repo, job.id, false, Some(msg), empty_report(), keyword, None).await;
@@ -525,7 +598,7 @@ impl JobRunner {
 
         // 4) driver by kind
         let driver = match self.drivers.get(plan.required_driver) {
-            Some(d) => d,
+            Some(d) => self.with_logging(d, job.id, Some(engine.name.clone())),
             None => {
                 let msg = format!("driver not registered for kind {:?}", plan.required_driver);
                                 return self.finish(repo, job.id, false, Some(msg), empty_report(), String::new(), None).await;
@@ -568,6 +641,21 @@ impl JobRunner {
             let timeout_secs = s.captcha_timeout_secs.unwrap_or(60);
             engine::captcha::make_solver(provider, api_key.as_deref(), timeout_secs)
         };
+        self.emit(if solver.is_some() {
+            RunEvent {
+                job_id: Some(job.id),
+                engine: Some(engine.name.clone()),
+                level: "captcha".into(),
+                message: "captcha solver armed — walls (reCAPTCHA/hCaptcha) will be solved on site".into(),
+            }
+        } else {
+            RunEvent {
+                job_id: Some(job.id),
+                engine: Some(engine.name.clone()),
+                level: "captcha".into(),
+                message: "no captcha solver configured — a captcha wall will block this engine".into(),
+            }
+        });
         // F#27 (GSA parity: register → activate → login → submit).
         //
         // These article/comment specs carry `extract from email=`: the account
@@ -720,7 +808,14 @@ impl JobRunner {
                 && looks_transport_failure(&r);
             if down {
                 *retried_down_proxy = true;
-                *attempt_idx = Some((used_idx.unwrap() + 1) % n);
+                let next = (used_idx.unwrap() + 1) % n;
+                self.emit(RunEvent {
+                    job_id: None,
+                    engine: None,
+                    level: "info".into(),
+                    message: format!("proxy seems down — retrying via {}", self.ctx.proxies[next].url()),
+                });
+                *attempt_idx = Some(next);
                 continue;
             }
             return r;
@@ -859,6 +954,42 @@ impl JobRunner {
         keyword: String,
         proxy_used: Option<&str>,
     ) -> JobOutcome {
+        // T6 — the terminal line the UI console flashes green or red.
+        {
+            let message = if done {
+                format!(
+                    "LINK CREATED ✓ {}{}",
+                    report.submitted_url.clone().unwrap_or_else(|| "(no URL captured)".to_string()),
+                    if report.captcha_failed > 0 {
+                        " (captchas were along the way)".to_string()
+                    } else {
+                        String::new()
+                    }
+                )
+            } else {
+                format!(
+                    "FAILED ✗ {} | steps ok {} / failed {} / captcha {}",
+                    err.clone().unwrap_or_else(|| "no step matched submit success".to_string()),
+                    report.successful,
+                    report.failed,
+                    report.captcha_failed
+                )
+            };
+            self.emit(RunEvent {
+                job_id: Some(job_id),
+                engine: None,
+                level: if done { "success" } else { "error" }.into(),
+                message,
+            });
+        }
+        // T6 — engine health: every attempt (success, failure, or captcha
+        // wall) updates the engine's ranking counters so auto-selection
+        // demotes proven-bad engines and promotes working ones. Dry-run
+        // tests count too — a Test button hit is a genuine attempt.
+        let captcha = report.captcha_failed > 0;
+        if let Some(engine_id) = repo.job_by_id(job_id).await.ok().flatten().and_then(|j| j.engine_id) {
+            let _ = repo.bump_engine_health(engine_id, done, captcha, err.as_deref()).await;
+        }
         let status = if done { ser_db::JobStatus::Done } else { ser_db::JobStatus::Failed };
 
         // F#26 — Test Button: drive the engine end-to-end but persist

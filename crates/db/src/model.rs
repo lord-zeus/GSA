@@ -83,6 +83,36 @@ pub struct Engine {
     pub step_count: i32,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
+    /// T6 — per-engine health (written by the runner after every attempt).
+    /// Drives auto engine-selection ranking: proven engines go first,
+    /// captcha walls get demoted.
+    #[serde(default)]
+    #[sqlx(default)]
+    pub attempts: i32,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub successes: i32,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub captcha_failures: i32,
+    #[sqlx(default)]
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    #[sqlx(default)]
+    pub last_success_at: Option<DateTime<Utc>>,
+    #[sqlx(default)]
+    pub last_error: Option<String>,
+}
+
+/// T6 — one row of the append-only job_events log (the live run feed).
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct JobEvent {
+    pub id: i64,
+    pub project_id: Uuid,
+    pub job_id: Option<Uuid>,
+    pub engine_name: Option<String>,
+    pub level: String,
+    pub message: String,
+    pub ts: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]

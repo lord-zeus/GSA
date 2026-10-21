@@ -9,7 +9,9 @@ import {
   type Project,
   type ProjectResult,
   type ResultStats,
+  type RunEventRow,
   type RunSummary,
+  type TestAllResult,
 } from '@/api/client'
 
 // — projects (master list) —
@@ -472,6 +474,151 @@ async function runNow() {
 }
 
 const hasActiveJob = computed(() => jobs.value.some((j) => j.status === 'pending' || j.status === 'running'))
+
+// — T6 · the auto UX: auto-build, live run log, test-all, captcha check —
+const autoBusy = ref(false)
+const autoMsg = ref('')
+const autoFail = ref(false)
+const autoLinks = ref(5)
+const autoEngines = ref(5)
+const testAllBusy = ref(false)
+const testAllMsg = ref<{ kind: 'ok' | 'err'; text: string } | null>(null)
+const captchaBusy = ref(false)
+const captchaMsg = ref<{ kind: 'ok' | 'err'; text: string } | null>(null)
+const liveLogOpen = ref(true)
+const liveEvents = ref<RunEventRow[]>([])
+const liveConnected = ref(false)
+let liveES: EventSource | null = null
+let liveLastId = 0
+
+function levelClass(level: string): string {
+  switch (level) {
+    case 'success': return 'lv-ok'
+    case 'error': return 'lv-err'
+    case 'captcha': return 'lv-captcha'
+    case 'auto': return 'lv-auto'
+    case 'step': return 'lv-step'
+    case 'engine': return 'lv-engine'
+    default: return 'lv-info'
+  }
+}
+
+function addEvent(ev: RunEventRow) {
+  if (ev.id && ev.id <= liveLastId) return // already on screen (dup via catch-up)
+  if (ev.id) liveLastId = ev.id
+  liveEvents.value.push(ev)
+  if (liveEvents.value.length > 500) liveEvents.value.splice(0, liveEvents.value.length - 500)
+}
+
+async function openLiveLog(projectId: string) {
+  closeLiveLog()
+  liveEvents.value = []
+  liveLastId = 0
+  // 1) catch up: the DB tail is the source of truth (covers events from
+  //    before this tab opened, or missed during a disconnect)
+  try {
+    const t = await api.projectEvents(projectId, 0, 200)
+    for (const ev of t.events) addEvent(ev)
+  } catch { /* old API / transient — the live stream still works */ }
+  // 2) live: SSE push for everything from now on
+  liveES = new EventSource(api.projectEventsLiveUrl(projectId))
+  liveES.addEventListener('run', (m: MessageEvent) => {
+    try { addEvent(JSON.parse(m.data) as RunEventRow) } catch { /* ignore */ }
+  })
+  liveES.onopen = () => { liveConnected.value = true }
+  liveES.onerror = () => {
+    liveConnected.value = false
+    // EventSource auto-reconnects; after each reconnect re-tail the DB
+    // so any frames we missed are filled back in (both carry `id`).
+    window.setTimeout(async () => {
+      try {
+        const t = await api.projectEvents(projectId, liveLastId, 200)
+        for (const ev of t.events) addEvent(ev)
+      } catch { /* ignore */ }
+    }, 1500)
+  }
+}
+
+function closeLiveLog() {
+  if (liveES) { liveES.close(); liveES = null }
+  liveConnected.value = false
+}
+
+async function runAuto() {
+  if (!selected.value) return
+  autoBusy.value = true
+  autoFail.value = false
+  autoMsg.value = 'System is ranking engines by health and building backlinks… this streams live below.'
+  try {
+    const s = await api.projectRunAuto(selected.value, {
+      engines: autoEngines.value,
+      links: autoLinks.value,
+    })
+    autoMsg.value =
+      `Done — claimed ${s.claimed}, completed ${s.done}, failed ${s.failed}` +
+      (s.enqueued_jobs != null ? `, ${s.enqueued_jobs} jobs enqueued` : '') +
+      (s.engines_tried_order?.length ? ` · tried: ${s.engines_tried_order.join(' → ')}` : '')
+    await loadJobs()
+    await loadResults()
+  } catch (e: any) {
+    autoFail.value = true
+    autoMsg.value = 'Auto-build: ' + (e?.message || String(e))
+  } finally {
+    autoBusy.value = false
+  }
+}
+
+async function testAllEngines() {
+  if (!selected.value) return
+  testAllBusy.value = true
+  testAllMsg.value = { kind: 'ok', text: 'Testing engines (dry run, best health first)… can take a few minutes.' }
+  try {
+    const t = await api.projectTestAll(selected.value, 12)
+    const winners: string[] = []
+    const losers: string[] = []
+    for (const r of t.results) {
+      const name = r.engine || r.engine_id || 'engine'
+      const ok = t && (r.report?.successful > 0 || r.ok === true)
+      ;(ok ? winners : losers).push(name)
+    }
+    testAllMsg.value = {
+      kind: ok_list(t, winners) ? 'ok' : 'err',
+      text:
+        `${t.ok}/${t.tested} engines created a link. ` +
+        (winners.length ? `✓ ${winners.join(', ')} — ` : '') +
+        (losers.length ? `✗ ${losers.length} failed (health demoted, tried last now).` : ''),
+    }
+    await loadEngines()
+  } catch (e: any) {
+    testAllMsg.value = { kind: 'err', text: 'Test-all failed: ' + (e?.message || String(e)) }
+  } finally {
+    testAllBusy.value = false
+  }
+}
+// small helper: true if any engine succeeded (for the ok/err badge)
+function ok_list(t: TestAllResult, winners: string[]): boolean {
+  return t.ok > 0 && winners.length > 0
+}
+
+async function checkCaptcha() {
+  captchaBusy.value = true
+  captchaMsg.value = null
+  try {
+    const c = await api.captchaTest()
+    captchaMsg.value = {
+      kind: c.armed ? 'ok' : 'err',
+      text:
+        c.armed
+          ? `✓ solver armed (${c.provider}) — ${c.detail}`
+          : `✗ ${c.detail}` +
+            (c.probes?.length ? ' · ' + c.probes.map((p) => `${p.target}: ${p.ok ? 'ok' : 'no'}`).join(' | ') : ''),
+    }
+  } catch (e: any) {
+    captchaMsg.value = { kind: 'err', text: 'Captcha check failed: ' + (e?.message || String(e)) }
+  } finally {
+    captchaBusy.value = false
+  }
+}
 watch(hasActiveJob, (on) => {
   if (on && pollTimer.value == null) {
     pollTimer.value = window.setInterval(() => {
@@ -531,6 +678,7 @@ async function load() {
       loadMailbox()
       loadUseProxies(selected.value)
       loadPolish(selected.value)
+      openLiveLog(selected.value)
     }
   }
 }
@@ -543,6 +691,7 @@ async function selectProject(p: Project) {
   loadResults()
   loadUseProxies(p.id)
   loadPolish(p.id)
+  openLiveLog(p.id)
 }
 
 async function createProject() {
@@ -737,6 +886,7 @@ watch(
 onMounted(load)
 onBeforeUnmount(() => {
   if (pollTimer.value != null) window.clearInterval(pollTimer.value)
+  closeLiveLog()
 })
 
 function fmt(iso: string | null) {
@@ -888,12 +1038,16 @@ function cls(status: string) {
           <table class="table">
             <thead>
               <tr>
-                <th>Name</th><th>Type</th><th>Steps</th><th>URL</th><th>Enabled</th><th></th>
+                <th>Name</th><th>Type</th><th>Steps</th><th>URL</th>
+                <th class="num" title="jobs this engine has run (any run or test)">Used</th>
+                <th class="num" title="jobs that created a real link">Won</th>
+                <th class="num" title="jobs blocked by a captcha wall">Captcha</th>
+                <th>Enabled</th><th></th>
               </tr>
             </thead>
             <tbody>
               <tr v-if="!enginesLoaded || (enginesLoaded && !engines.length)">
-                <td colspan="6" class="muted" style="text-align:center;padding:22px">
+                <td colspan="8" class="muted" style="text-align:center;padding:22px">
                   no engines on this project yet — add from the catalog or custom above
                 </td>
               </tr>
@@ -905,6 +1059,9 @@ function cls(status: string) {
                   <a v-if="e.url" :href="e.url" target="_blank" rel="noreferrer">{{ e.url }}</a>
                   <span v-else class="muted">—</span>
                 </td>
+                <td class="num muted">{{ e.attempts ?? 0 }}</td>
+                <td class="num" :style="(e.successes ?? 0) > 0 ? 'color:#86efac;font-weight:700' : 'opacity:.6'">{{ e.successes ?? 0 }}</td>
+                <td class="num" :style="(e.captcha_failures ?? 0) > 0 ? 'color:#fcd34d' : 'opacity:.6'">{{ e.captcha_failures ?? 0 }}</td>
                 <td>
                   <input
                     type="checkbox"
@@ -1101,6 +1258,111 @@ function cls(status: string) {
           </div>
         </div>
         <div style="height:12px"></div>
+        <div style="height:12px"></div>
+        <!-- T6 · the auto UX — THE way to build backlinks -->
+        <div class="card" style="margin-top:12px;border:1.5px solid rgba(16,185,129,0.7);background:linear-gradient(180deg,rgba(16,185,129,0.07),rgba(16,185,129,0.02))">
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+            <div>
+              <strong>⚡ Auto-build backlinks — the system picks the engines</strong>
+              <p class="muted" style="margin:3px 0 0;max-width:62vw">
+                No engine selection: we rank this project's engines by
+                real-world health (proven successes first, captcha walls
+                last) and try them — first link created wins, then we stop.
+                Watch it happen live in the log below.
+              </p>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <label class="muted" style="display:flex;gap:6px;align-items:center">
+                links
+                <select v-model.number="autoLinks" style="width:76px">
+                  <option :value="1">1</option>
+                  <option :value="2">2</option>
+                  <option :value="5">5</option>
+                  <option :value="10">10</option>
+                </select>
+              </label>
+              <label class="muted" style="display:flex;gap:6px;align-items:center">
+                try up to
+                <select v-model.number="autoEngines" style="width:76px">
+                  <option :value="3">3</option>
+                  <option :value="5">5</option>
+                  <option :value="8">8</option>
+                  <option :value="12">12</option>
+                </select>
+              </label>
+              <button
+                class="primary"
+                style="padding:10px 20px;font-weight:700"
+                :disabled="autoBusy"
+                @click="runAuto"
+                title="rank engines by health, try them until a link is created"
+              >
+                {{ autoBusy ? 'Building… (watch the log)' : '⚡ Auto-build' }}
+              </button>
+            </div>
+          </div>
+          <div v-if="autoMsg" style="margin-top:10px" class="muted" :style="autoFail ? 'color:#f87171' : 'color:#86efac'">
+            {{ autoMsg }}
+          </div>
+        </div>
+
+        <!-- T6 · live run log (SSE + DB catch-up) -->
+        <div class="card" style="margin-top:12px;padding:0;overflow:hidden">
+          <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--border)">
+            <span
+              :style="liveConnected ? 'width:9px;height:9px;border-radius:50%;background:#22c55e;display:inline-block' : 'width:9px;height:9px;border-radius:50%;background:#f59e0b;display:inline-block'"
+              :title="liveConnected ? 'live' : 'reconnecting…'"
+            ></span>
+            <strong style="font-size:13px">Live run log</strong>
+            <span class="muted" style="font-size:12px">
+              {{ liveEvents.length }} event(s) · streams in real time
+            </span>
+            <span style="margin-left:auto;display:flex;gap:8px">
+              <button
+                class="muted"
+                :disabled="captchaBusy"
+                @click="checkCaptcha"
+                title="verify the configured captcha solver account"
+              >
+                {{ captchaBusy ? 'Checking…' : '🛡 check captcha solver' }}
+              </button>
+              <button
+                class="muted"
+                :disabled="testAllBusy"
+                @click="testAllEngines"
+                title="dry-run every engine and report which create a link"
+              >
+                {{ testAllBusy ? 'Testing…' : '🧪 test all engines' }}
+              </button>
+              <button class="muted" @click="liveEvents = []">clear</button>
+              <button class="muted" @click="liveLogOpen = !liveLogOpen">
+                {{ liveLogOpen ? 'hide' : 'show' }}
+              </button>
+            </span>
+          </div>
+          <div
+            v-if="liveLogOpen"
+            style="height:190px;overflow:auto;padding:10px 14px;background:#0b0f14;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.55"
+          >
+            <div v-if="!liveEvents.length" class="muted" style="padding:6px 0">
+              idle — press ⚡ Auto-build and watch every step appear here as it happens
+            </div>
+            <div v-for="ev in liveEvents" :key="ev.id" style="white-space:pre-wrap">
+              <span class="muted">{{ new Date(ev.ts).toLocaleTimeString() }}</span>
+              <span :class="levelClass(ev.level)" style="font-weight:700">
+                {{ ev.level.toUpperCase().padEnd(7) }}
+              </span>
+              <span v-if="ev.engine" style="color:#7dd3fc">[{{ ev.engine }}]</span>
+              <span :style="ev.level === 'error' ? 'color:#fca5a5' : ev.level === 'success' ? 'color:#86efac' : ev.level === 'captcha' ? 'color:#fcd34d' : ''">
+                {{ ev.message }}
+              </span>
+              <div style="height:2px"></div>
+            </div>
+          </div>
+          <div v-if="testAllMsg" style="padding:8px 14px" class="muted" :style="testAllMsg.kind === 'err' ? 'color:#fca5a5' : ''">{{ testAllMsg.text }}</div>
+          <div v-if="captchaMsg" style="padding:0 14px 8px" class="muted" :style="captchaMsg.kind === 'err' ? 'color:#fca5a5' : ''">{{ captchaMsg.text }}</div>
+        </div>
+
         <div class="card" style="margin-top:12px;border:1.5px solid rgba(64,192,166,0.6)">
           <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
             <div>

@@ -380,7 +380,8 @@ impl Repo {
     /// enabled toggle state). Ordered by name for stable display.
     pub async fn list_engines_all(&self, project_id: Uuid) -> anyhow::Result<Vec<Engine>> {
         let rows = sqlx::query(
-            "SELECT id, project_id, engine_name, engine_type, url, file_path, step_count, enabled, created_at
+            "SELECT id, project_id, engine_name, engine_type, url, file_path, step_count, enabled, created_at,
+             attempts, successes, captcha_failures, last_attempt_at, last_success_at, last_error
              FROM engines WHERE project_id = $1 ORDER BY engine_name",
         )
         .bind(project_id)
@@ -391,7 +392,8 @@ impl Repo {
 
     pub async fn list_engines(&self, project_id: Uuid) -> anyhow::Result<Vec<Engine>> {
         let rows = sqlx::query(
-            "SELECT id, project_id, engine_name, engine_type, url, file_path, step_count, enabled, created_at
+            "SELECT id, project_id, engine_name, engine_type, url, file_path, step_count, enabled, created_at,
+             attempts, successes, captcha_failures, last_attempt_at, last_success_at, last_error
              FROM engines WHERE project_id = $1 AND enabled ORDER BY engine_name",
         )
         .bind(project_id)
@@ -402,7 +404,8 @@ impl Repo {
 
     pub async fn engine_by_file(&self, project_id: Uuid, file_path: &str) -> anyhow::Result<Option<Engine>> {
         let row = sqlx::query(
-            "SELECT id, project_id, engine_name, engine_type, url, file_path, step_count, enabled, created_at
+            "SELECT id, project_id, engine_name, engine_type, url, file_path, step_count, enabled, created_at,
+             attempts, successes, captcha_failures, last_attempt_at, last_success_at, last_error
              FROM engines WHERE project_id = $1 AND file_path = $2",
         )
         .bind(project_id)
@@ -416,7 +419,8 @@ impl Repo {
     /// worker pool to resolve a job's `engine_id` to its `.ini` file path.
     pub async fn engine_by_id(&self, engine_id: Uuid) -> anyhow::Result<Option<Engine>> {
         let row = sqlx::query(
-            "SELECT id, project_id, engine_name, engine_type, url, file_path, step_count, enabled, created_at
+            "SELECT id, project_id, engine_name, engine_type, url, file_path, step_count, enabled, created_at,
+             attempts, successes, captcha_failures, last_attempt_at, last_success_at, last_error
              FROM engines WHERE id = $1",
         )
         .bind(engine_id)
@@ -722,7 +726,93 @@ impl Repo {
             .fetch_all(&self.pool)
             .await?
         };
-        Ok(rows.into_iter().map(|r| Job::from_row(&r)).collect::<Result<_, _>>()?)
+        Ok(rows
+            .into_iter()
+            .map(|r| Job::from_row(&r))
+            .collect::<Result<_, _>>()?)
+    }
+
+    // ── T6 — live run feed (job_events) + engine health ──────────────────
+    /// Append one row to the project's live log. `level` is one of
+    /// info|engine|step|captcha|success|error|auto. `job_id` may be None
+    /// for project-level lines (auto-run banner, completion).
+    pub async fn insert_job_event(
+        &self,
+        project_id: Uuid,
+        job_id: Option<Uuid>,
+        engine_name: Option<&str>,
+        level: &str,
+        message: &str,
+    ) -> anyhow::Result<i64> {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO job_events (project_id, job_id, engine_name, level, message)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id",
+        )
+        .bind(project_id)
+        .bind(job_id)
+        .bind(engine_name)
+        .bind(level)
+        .bind(message)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Events after `since_id` (exclusive) for the project, ascending,
+    /// capped at `limit`. The UI polls this to tail the run log.
+    pub async fn list_job_events(
+        &self,
+        project_id: Uuid,
+        since_id: i64,
+        limit: i64,
+    ) -> anyhow::Result<Vec<crate::model::JobEvent>> {
+        let rows = sqlx::query(
+            "SELECT id, project_id, job_id, engine_name, level, message, ts
+             FROM job_events WHERE project_id = $1 AND id > $2
+             ORDER BY id ASC LIMIT $3",
+        )
+        .bind(project_id)
+        .bind(since_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::model::JobEvent::from_row(&r))
+            .collect::<Result<_, _>>()?)
+    }
+
+    /// Record one engine attempt (auto-run or test-engine) into the
+    /// engine's health counters. `success` = did it submit; `captcha` =
+    /// did it hit a captcha wall; `error` = human-readable failure (None on
+    /// success).
+    pub async fn bump_engine_health(
+        &self,
+        engine_id: Uuid,
+        success: bool,
+        captcha: bool,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE engines SET
+                 attempts = attempts + 1,
+                 successes = successes + $1,
+                 captcha_failures = captcha_failures + $2,
+                 last_attempt_at = now(),
+                 last_success_at = CASE WHEN $3 THEN now() ELSE last_success_at END,
+                 last_error = CASE WHEN $4 IS NULL THEN NULL ELSE $5 END
+             WHERE id = $6",
+        )
+        .bind(i32::from(success))
+        .bind(i32::from(captcha))
+        .bind(success)
+        .bind(error)
+        .bind(error)
+        .bind(engine_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     // ── results ───────────────────────────────────────────────────────────

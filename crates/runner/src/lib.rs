@@ -15,11 +15,13 @@
 //! on the Postgres container (same pattern as `crates/db/tests`).
 
 pub mod config;
+pub mod events;
 pub mod execute;
 pub mod pool;
 pub mod specprovider;
 
 pub use config::RunnerConfig;
+pub use events::{EventSink, LoggingDriver, RunEvent};
 pub use execute::{DriverRegistry, JobOutcome, JobRunner, SubmissionContext};
 pub use pool::{PoolSummary, WorkerPool};
 pub use specprovider::{SpecRegistry, SpecSource};
