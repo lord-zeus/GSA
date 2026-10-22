@@ -1691,6 +1691,11 @@ pub async fn run_project_pool(
     project_id: Uuid,
     state: &Arc<AppState>,
     pause_after_override: Option<usize>,
+    // T9 — fair-share controller for this run. `None` = legacy first-come-first-
+    // served pool (the previous behavior, and the path used by manual / test
+    // runs). `Some(..)` = work-conserving fair dispatch with per-engine rate
+    // caps, 429/403 backoff, and a global target gate.
+    fair: Option<std::sync::Arc<std::sync::Mutex<runner::FairState>>>,
 ) -> anyhow::Result<serde_json::Value> {
 
     // GSA install root — same default the import path uses; override with
@@ -1893,6 +1898,12 @@ pub async fn run_project_pool(
     let pool = runner::pool_for_disk(state.pool.clone(), cfg, roots, drivers)
         .with_context(ctx)
         .with_pause_after(pause_after);
+    // T9 — attach the fair-share controller when this run uses fair share.
+    // (Moves the Arc in; the pool clones it per worker.)
+    let pool = match fair {
+        Some(f) => pool.with_fair(f),
+        None => pool,
+    };
 
 
     // F#18 — time the run so the alert can carry a duration.
@@ -1949,7 +1960,7 @@ pub async fn run_project_pool(
 
 async fn run_project(State(state): State<Arc<AppState>>, Path(project_id): Path<Uuid>) -> Response {
 
-    match run_project_pool(project_id, &state, None).await {
+    match run_project_pool(project_id, &state, None, None).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => error_response(e),
     }
@@ -2168,7 +2179,7 @@ async fn run_mixed(
         }
     }
 
-    match run_project_pool(project_id, &state, None).await {
+    match run_project_pool(project_id, &state, None, None).await {
         Ok(v) => {
             let mut v = v;
             if let Some(obj) = v.as_object_mut() {
@@ -2255,6 +2266,7 @@ async fn run_auto_pool(
     let picked: Vec<ser_db::Engine> = engines.into_iter().take(top_n).collect();
     let _ = &project;
     let order_names: Vec<String> = picked.iter().map(|e| e.engine_name.clone()).collect();
+    let links_target = body.links.unwrap_or(keywords.len()).max(1);
 
     // 3) Banner line into the live feed (level "auto") — the console's
     // first non-user line of every run, stating what the system chose.
@@ -2270,39 +2282,81 @@ async fn run_auto_pool(
             engine: None,
             level: "auto".into(),
             message: format!(
-                "AUTO-RUN — system picked {} engines (best health first): {} — first success wins",
+                "AUTO-RUN — fair-share across {} engines (rate-capped, 429/403 auto-backoff), target {} links: {}",
                 picked.len(),
+                links_target,
                 order_names.join(" → ")
             ),
         });
     }
 
-    // 4) Queue jobs in REVERSE health order: the pool dispatches in
-    //    `created_at DESC`, so the best engines (created last) are
-    //    claimed first and fan out across the workers.
-    let links_target = body.links.unwrap_or(keywords.len()).max(1);
+    // 4) T9 — provision the job queue. Over-provision (2× target, capped at
+    //    5000) so the full target stays reachable even if one engine goes hot
+    //    or down: fair-share absorbs the failed engine's share onto the healthy
+    //    ones. Round-robin across engines (fair); cycle keywords for variety.
+    let n_eng = picked.len().max(1);
+    let total_jobs = (links_target * 2).min(5000).max(1);
     let mut enqueued = 0usize;
-    for kw in &keywords {
-        for e in picked.iter().rev() {
-            if repo
-                .create_job(project_id, Some(e.id), Some(kw.id))
-                .await
-                .is_ok()
-            {
-                enqueued += 1;
-            }
+    for slot in 0..total_jobs {
+        let e = &picked[slot % n_eng];
+        let kw = &keywords[(slot / n_eng) % keywords.len()];
+        if repo.create_job(project_id, Some(e.id), Some(kw.id)).await.is_ok() {
+            enqueued += 1;
         }
     }
 
-    // 5) Execute — `links_target` successful links soft-stop the rest
-    //    (the try-and-fallback loop; the leftovers stay queued and can
-    //    be resumed with POST /resume if the user wants more).
-    let mut result = run_project_pool(project_id, state, Some(links_target)).await?;
+    // 5) T9 — build the fair-share controller and execute. `pause_after` is 0
+    //    (fair owns the stopping): the leader stops admitting jobs once
+    //    `links_target` links are created; a 429/403/captcha puts an engine on
+    //    exponential cooldown so the others absorb the load (work-conserving).
+    let policy = runner::FairPolicy {
+        target: links_target,
+        max_inflight_per_engine: 2,
+        max_per_engine: 0,
+        base_backoff: std::time::Duration::from_secs(20),
+        max_backoff: std::time::Duration::from_secs(300),
+    };
+    let fair = std::sync::Arc::new(std::sync::Mutex::new(
+        runner::FairState::new(policy, picked.iter().map(|e| e.id)),
+    ));
+    let fair_read = std::sync::Arc::clone(&fair);
+    let mut result = run_project_pool(project_id, state, Some(0), Some(fair)).await?;
     if let Some(obj) = result.as_object_mut() {
         obj.insert("auto_run".to_string(), serde_json::json!(true));
+        obj.insert("fair_share".to_string(), serde_json::json!(true));
         obj.insert("engines_tried_order".to_string(), serde_json::json!(order_names));
         obj.insert("links_target".to_string(), serde_json::json!(links_target));
         obj.insert("enqueued_jobs".to_string(), serde_json::json!(enqueued));
+        let st = fair_read.lock().unwrap();
+        let (rj_target, rj_cool, rj_inflight, rj_quota) = st.rejections();
+        let engines_json: Vec<serde_json::Value> = st
+            .snapshot(std::time::Instant::now())
+            .into_iter()
+            .map(|s| {
+                serde_json::json!({
+                    "engine": s.engine,
+                    "links": s.links,
+                    "admitted": s.admitted,
+                    "rate_hits": s.rate_hits,
+                    "cool_remaining_secs": s.cool_remaining.map(|d| d.as_secs()),
+                })
+            })
+            .collect();
+        obj.insert(
+            "fair".to_string(),
+            serde_json::json!({
+                "target": links_target,
+                "links_created": st.total_links(),
+                "reached_target": st.total_links() >= links_target,
+                "engines": engines_json,
+                "rejections": {
+                    "target": rj_target,
+                    "cooling": rj_cool,
+                    "in_flight_cap": rj_inflight,
+                    "quota": rj_quota
+                },
+            }),
+        );
     }
     Ok(result)
 }
@@ -3380,7 +3434,7 @@ async fn run_now_schedule(
     if !claimed {
         return Json(serde_json::json!({ "status": "skipped", "reason": "next_run_at is not due / schedule is consumed" })).into_response();
     }
-    let summary = match run_project_pool(sched.project_id, &state, None).await {
+    let summary = match run_project_pool(sched.project_id, &state, None, None).await {
         Ok(v) => v,
         Err(e) => return error_response(e),
     };

@@ -17,12 +17,14 @@
 pub mod config;
 pub mod events;
 pub mod execute;
+pub mod fair;
 pub mod pool;
 pub mod specprovider;
 
 pub use config::RunnerConfig;
 pub use events::{EventSink, LoggingDriver, RunEvent};
 pub use execute::{DriverRegistry, JobOutcome, JobRunner, SubmissionContext};
+pub use fair::{classify, fair_quota, is_rate_limited, FairPolicy, FairState, OutcomeClass};
 pub use pool::{PoolSummary, WorkerPool};
 pub use specprovider::{SpecRegistry, SpecSource};
 

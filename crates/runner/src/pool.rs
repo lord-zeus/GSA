@@ -58,6 +58,10 @@ pub struct WorkerPool {
     /// successful submissions have happened (0 / None = run to completion,
     /// the default). Mirrors `projects.pause_after`; set via `with_pause_after`.
     pause_after: usize,
+    /// T9 — Fair-share controller shared by the leader (admit-before-dispatch)
+    /// and every worker (complete/release on job end). `None` = legacy
+    /// first-come-first-served dispatch (the previous behavior).
+    fair: Option<std::sync::Arc<std::sync::Mutex<crate::fair::FairState>>>,
 }
 
 impl WorkerPool {
@@ -75,6 +79,7 @@ impl WorkerPool {
             drivers: Arc::new(drivers),
             ctx: Default::default(),
             pause_after: 0,
+            fair: None,
         }
     }
 
@@ -82,6 +87,18 @@ impl WorkerPool {
     /// default) means "run to completion" — the previous behavior.
     pub fn with_pause_after(mut self, pause_after: usize) -> Self {
         self.pause_after = pause_after.max(0);
+        self
+    }
+
+    /// T9 — attach a fair-share controller for this pool run. When set, the
+    /// leader consults it before dispatching each job (per-engine rate cap,
+    /// 429/403 cooldown, global target) and every worker reports outcomes back
+    /// to it. `None` (the default) = the legacy first-come-first-served pool.
+    pub fn with_fair(
+        mut self,
+        fair: std::sync::Arc<std::sync::Mutex<crate::fair::FairState>>,
+    ) -> Self {
+        self.fair = Some(fair);
         self
     }
 
@@ -133,12 +150,19 @@ impl WorkerPool {
         // each worker takes ownership of exactly one receiver.  The senders
         // stay in `senders`; we drop them at the end of the leader loop,
         // which closes every channel and unblocks the workers' recv().
-        let mut pairs: Vec<(mpsc::Sender<Uuid>, mpsc::Receiver<Uuid>)> = Vec::with_capacity(workers);
+        //
+        // T9 — the payload is a `(job_id, engine_id)` slot, not a bare id, so
+        // a worker can always release/report the fair-share slot it was given
+        // even on the claim-race path (where it never saw the full `Job` row).
+        let mut pairs: Vec<(
+            mpsc::Sender<(Uuid, Option<Uuid>)>,
+            mpsc::Receiver<(Uuid, Option<Uuid>)>,
+        )> = Vec::with_capacity(workers);
         for _ in 0..workers {
-            pairs.push(mpsc::channel::<Uuid>(workers));
+            pairs.push(mpsc::channel::<(Uuid, Option<Uuid>)>(workers));
         }
-        let mut senders: Vec<mpsc::Sender<Uuid>> = Vec::with_capacity(workers);
-        let mut receivers: Vec<mpsc::Receiver<Uuid>> = Vec::with_capacity(workers);
+        let mut senders: Vec<mpsc::Sender<(Uuid, Option<Uuid>)>> = Vec::with_capacity(workers);
+        let mut receivers: Vec<mpsc::Receiver<(Uuid, Option<Uuid>)>> = Vec::with_capacity(workers);
         for (t, r) in pairs.drain(..) {
             senders.push(t);
             receivers.push(r);
@@ -155,6 +179,7 @@ impl WorkerPool {
                 self.clone(),
                 Arc::clone(&summary),
                 Some(Arc::clone(&successful)),
+                self.fair.clone(),
                 rx,
             ));
         }
@@ -186,6 +211,22 @@ impl WorkerPool {
                     break;
                 }
 
+                // T9 — fair-share: stop dispatching once the global target is
+                // met. Remaining queued jobs stay `pending` (resumable), and
+                // no new work is admitted — the run has reached the requested
+                // link count, so the leader drains the in-flight and exits.
+                if let Some(fair) = self.fair.as_ref() {
+                    if fair.lock().unwrap().target_met() {
+                        let links = fair.lock().unwrap().total_links();
+                        if dispatched > 0 {
+                            eprintln!(
+                                "runner: fair target met ({links} links); {dispatched} dispatched this run; remaining jobs stay queued"
+                            );
+                        }
+                        break;
+                    }
+                }
+
                 let jobs = match repo
                     .list_jobs(project_id, Some(ser_db::JobStatus::Pending))
                     .await
@@ -200,9 +241,26 @@ impl WorkerPool {
                     break; // drained
                 }
                 for j in jobs {
+                    let slot = (j.id, j.engine_id);
+                    // T9 — fair-share gate: only dispatch a job for an engine the
+                    // controller admits right now (not cooling, within its
+                    // in-flight + per-run caps, global target not yet met).
+                    // admit() reserves an in-flight slot; the worker gives it
+                    // back via complete()/release(). If denied, the job stays
+                    // queued and a healthy engine (or a later cycle) takes the
+                    // load — this is what lets the run keep reaching the target
+                    // even when one engine is hot or down.
+                    if let (Some(e), Some(fair)) = (slot.1, self.fair.as_ref()) {
+                        if !fair.lock().unwrap().admit(e, std::time::Instant::now()) {
+                            continue;
+                        }
+                    }
                     let tx = &senders[next % senders.len()];
                     next += 1;
-                    if tx.send(j.id).await.is_err() {
+                    if tx.send(slot).await.is_err() {
+                        if let (Some(e), Some(fair)) = (slot.1, self.fair.as_ref()) {
+                            fair.lock().unwrap().release(e);
+                        }
                         break; // that worker is gone; the rest will be
                         // unblocked by the drop below anyway.
                     }
@@ -241,22 +299,25 @@ impl WorkerPool {
     }
 }
 
-/// One worker's loop: pull `job_id` over the channel, claim atomically,
-/// run the job, persist, continue. `successful` (F#26) is the shared
-/// pause-after counter — `None` in tests that don't need it.
+/// One worker's loop: pull `(job_id, engine)` over the channel, claim
+/// atomically, run the job, persist, and report the outcome to the fair-share
+/// controller. `successful` (F#26) is the shared pause-after counter — `None`
+/// in tests that don't need it. `fair` (T9) is `None` in the legacy pool.
 async fn worker_loop(
     pool: WorkerPool,
     summary: Arc<std::sync::Mutex<PoolSummary>>,
     successful: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    mut rx: mpsc::Receiver<Uuid>,
+    fair: Option<Arc<std::sync::Mutex<crate::fair::FairState>>>,
+    mut rx: mpsc::Receiver<(Uuid, Option<Uuid>)>,
 ) {
+    use crate::fair::{classify, OutcomeClass};
     let cfg = pool.cfg.clone();
     let spec = pool.spec.clone();
     let drivers = Arc::clone(&pool.drivers);
     let ctx = pool.ctx.clone();
     let db = pool.db.clone();
 
-    while let Some(job_id) = rx.recv().await {
+    while let Some((job_id, engine)) = rx.recv().await {
         let repo = ser_db::Repo::new(db.clone());
 
         // Claim atomically. If someone beat us to it, the guard clause
@@ -264,6 +325,11 @@ async fn worker_loop(
         let claimed = match repo.claim_by_id(job_id).await {
             Ok(j) => j,
             Err(e) => {
+                // T9: the leader already admitted this slot for `engine` —
+                // hand it back (no outcome known).
+                if let (Some(e), Some(f)) = (engine, fair.as_ref()) {
+                    f.lock().unwrap().release(e);
+                }
                 let mut s = summary.lock().unwrap();
                 s.failed += 1;
                 eprintln!("runner: claim_by_id({job_id}) errored: {e}");
@@ -271,7 +337,11 @@ async fn worker_loop(
             }
         };
         let Some(job) = claimed else {
-            continue; // already claimed elsewhere (or already terminal)
+            // already claimed elsewhere (or already terminal)
+            if let (Some(e), Some(f)) = (engine, fair.as_ref()) {
+                f.lock().unwrap().release(e);
+            }
+            continue;
         };
 
         // Build the runner locally (all inputs cloned from `pool`).
@@ -291,6 +361,13 @@ async fn worker_loop(
                             Some("worker-side timeout (outer)"),
                         )
                         .await;
+                    // T9: a timeout is neither a success nor a rate-limit →
+                    // report `Other` (releases the in-flight slot, no penalty).
+                    if let (Some(e), Some(f)) = (engine, fair.as_ref()) {
+                        f.lock()
+                            .unwrap()
+                            .complete(e, OutcomeClass::Other, std::time::Instant::now());
+                    }
                     let mut s = summary.lock().unwrap();
                     s.claimed += 1;
                     s.failed += 1;
@@ -306,6 +383,16 @@ async fn worker_loop(
             s.failed += 1;
         }
         drop(s);
+
+        // T9 — report the real result to the fair-share controller: a success
+        // counts toward the target, a rate-limit (429/403/captcha) schedules a
+        // cooldown so other engines take the load, and other failures carry no
+        // engine-level penalty.
+        if let (Some(e), Some(f)) = (engine, fair.as_ref()) {
+            f.lock()
+                .unwrap()
+                .complete(e, classify(&outcome), std::time::Instant::now());
+        }
 
         // F#26 — Pause-after-N: count this job toward the ceiling iff it
         // actually submitted ≥1 link (the same condition as a `done` job).
