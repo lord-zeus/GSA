@@ -2399,6 +2399,247 @@ async fn project_events_live(
 }
 
 // ─────────────────────────────────────────────────────────────
+// Phase 1 — Auto-pick: the system fills a project with working
+// engines on its own.  The user's job ends at URL + keyword +
+// link count.
+//
+// Over-automation guardrail (agreed plan):
+//   * static scoring over the whole catalog is FREE (no network —
+//     no liveness probing: dofollow + friction only);
+//   * live dry-runs happen on a bounded SAMPLE — `per_family`
+//     (<= 8) engines per family, capped at `max_total` (<= 60);
+//   * failed engines are DISABLED, not deleted — the decision
+//     stays visible and auditable, and manually re-enablable.
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AutoPickBody {
+    /// How many engines to sample per family for live verification
+    /// (default 4, clamped 1..8).
+    #[serde(default)]
+    per_family: Option<usize>,
+    /// Hard cap on the total number of engines sampled (default 24).
+    #[serde(default)]
+    max_total: Option<usize>,
+    /// Live-test each sampled engine and keep only verified ones enabled
+    /// (default true; false = add without testing).
+    #[serde(default)]
+    test: bool,
+}
+
+/// Phase 1 — "Auto-pick" endpoint: sample the whole engine catalog,
+/// rank it statically per family, dry-run the (bounded) sample, and
+/// leave the project holding only verified engines, ready for
+/// `run-auto`.  Auditable: every consideration is reported back.
+async fn auto_pick(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+    Json(body): Json<AutoPickBody>,
+) -> Response {
+    match auto_pick_pool(project_id, &state, body).await {
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn auto_pick_pool(
+    project_id: Uuid,
+    state: &Arc<AppState>,
+    body: AutoPickBody,
+) -> anyhow::Result<serde_json::Value> {
+    let repo = Repo::new(state.pool.clone());
+
+    // 0) Sanity: a keyword (dry-runs need anchor text) and the project.
+    if repo.project_by_id(project_id).await?.is_none() {
+        anyhow::bail!("project not found");
+    }
+    let keywords = repo.list_keywords(project_id).await?;
+    if keywords.is_empty() {
+        anyhow::bail!("no keywords on this project — add at least one link keyword first");
+    }
+    let kw = keywords.first().map(|k| k.id);
+    let have: std::collections::BTreeSet<String> = repo
+        .list_engines_all(project_id)
+        .await?
+        .into_iter()
+        .map(|e| e.file_path)
+        .collect();
+
+    // 1) Whole catalog, posting families only.  Free: local INI parse +
+    //    stored metadata, no network (liveness is left to the dry run).
+    let cat = Registry::new(&state.pool).list(None, None, 10000, 0).await?;
+    let mut rows: Vec<ser_db::CatalogEngine> = Vec::new();
+    let mut cands: Vec<engine::CandidateEngine> = Vec::new();
+    for ce in cat {
+        if have.contains(&ce.file_path) {
+            continue; // already on the project — never re-considered
+        }
+        let et = std::str::FromStr::from_str(&ce.engine_type)
+            .unwrap_or(engine::EngineType::Unknown);
+        if engine::Family::for_type(&et).is_none() {
+            continue; // email / video / unknown — not a posting family
+        }
+        let (field_count, just_download) =
+            match engine::parse_engine_file(resolve_engine_path(&ce.file_path).as_path()) {
+                Ok(eng) => (
+                    eng.steps.iter().map(|s| s.fields.len()).sum::<usize>(),
+                    eng.fixed_url.is_some(),
+                ),
+                Err(_) => (0_usize, false),
+            };
+        cands.push(engine::CandidateEngine {
+            engine_name: ce.engine_name.clone(),
+            engine_type: et,
+            dofollow: ce.dofollow,
+            field_count,
+            just_download,
+            is_enabled: true,
+            is_live: None, // liveness decided by the dry-run, not a probe
+        });
+        rows.push(ce);
+    }
+    if cands.is_empty() {
+        anyhow::bail!(
+            "nothing new to consider — the catalog is empty or every engine is already on the project"
+        );
+    }
+
+    // 2) Bounded sample: top-N per family, then an absolute cap.
+    let per = body.per_family.unwrap_or(4).clamp(1, 8);
+    let max_total = body.max_total.unwrap_or(24).clamp(1, 60);
+    let sel = engine::best_per_family(&cands, per);
+    let mut picked: Vec<usize> = Vec::new();
+    for (_fam, idxs) in sel {
+        picked.extend(idxs);
+    }
+    picked.truncate(max_total);
+
+    // 3) Add the sampled engines to the project.
+    let mut added: Vec<ser_db::Engine> = Vec::new();
+    for i in &picked {
+        let ce = &rows[*i];
+        let row = repo
+            .upsert_engine(
+                project_id,
+                &ce.engine_name,
+                &ce.engine_type,
+                &ce.url,
+                &ce.file_path,
+                ce.step_count,
+            )
+            .await?;
+        added.push(row);
+    }
+
+    // 4) Banner into the live feed — the console shows the decision.
+    {
+        use runner::EventSink as _;
+        let sink = crate::runfeed::RunEventSink::new(
+            project_id,
+            state.pool.clone(),
+            state.run_bus.sender(),
+        );
+        sink.record(runner::RunEvent {
+            job_id: None,
+            engine: None,
+            level: "auto".into(),
+            message: format!(
+                "AUTO-PICK — considered {} catalog engines, sampled {} (per-family cap {}, total cap {}) — {}",
+                cands.len(),
+                added.len(),
+                per,
+                max_total,
+                if body.test {
+                    "live-testing each, only verified ones stay enabled"
+                } else {
+                    "no live test (added as-is)"
+                },
+            ),
+        });
+    }
+
+    // 5) Live dry-run (if asked): success → verified, stays enabled;
+    //    failure → disabled (still visible for manual re-enable).
+    let mut verified: Vec<serde_json::Value> = Vec::new();
+    let mut failed: Vec<serde_json::Value> = Vec::new();
+    for row in &added {
+        let fam = engine::Family::for_type(
+            &std::str::FromStr::from_str(&row.engine_type).unwrap_or(engine::EngineType::Unknown),
+        )
+        .map(|f| f.as_str().to_string())
+        .unwrap_or_else(|| row.engine_type.clone());
+        if !body.test {
+            verified.push(serde_json::json!({
+                "engine": row.engine_name,
+                "family": fam,
+                "url": row.url,
+                "verified": null
+            }));
+            continue;
+        }
+        match test_engine_pool(
+            project_id,
+            TestEngineBody { engine_id: row.id, keyword_id: kw },
+            state,
+        )
+        .await
+        {
+            Ok(v) => {
+                let successful = v
+                    .pointer("/report/successful")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0);
+                if successful > 0 {
+                    verified.push(serde_json::json!({
+                        "engine": row.engine_name, "family": fam, "url": row.url,
+                        "verified": true
+                    }));
+                } else {
+                    let reason = v
+                        .get("report")
+                        .and_then(|r| r.get("errors"))
+                        .and_then(|e| e.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str())
+                                .take(2)
+                                .collect::<Vec<_>>()
+                                .join("; ")
+                        })
+                        .or_else(|| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
+                        .unwrap_or_else(|| "dry run created no link".into());
+                    let _ = repo.set_engine_enabled(row.id, false).await;
+                    failed.push(serde_json::json!({
+                        "engine": row.engine_name, "family": fam, "url": row.url,
+                        "verified": false, "reason": reason
+                    }));
+                }
+            }
+            Err(e) => {
+                let _ = repo.set_engine_enabled(row.id, false).await;
+                failed.push(serde_json::json!({
+                    "engine": row.engine_name, "family": fam, "url": row.url,
+                    "verified": false, "reason": e.to_string()
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "considered": cands.len(),
+        "sampled": added.len(),
+        "tested": if body.test { added.len() } else { 0 },
+        "verified": verified,
+        "failed": failed,
+        "note": if verified.is_empty() && !failed.is_empty() {
+            "no engines verified this pass — bump per_family and re-run, or re-enable a failed one manually"
+        } else {
+            "verified engines stay enabled — hit run-auto to create links"
+        },
+    }))
+}
+
+// ─────────────────────────────────────────────────────────────
 // T6 — Test-all engines + captcha solver health.
 // ─────────────────────────────────────────────────────────────
 
@@ -3614,6 +3855,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         // live run feed (DB tail + SSE), test-all engines, captcha
         // solver health.
         .route("/api/projects/{id}/run-auto", post(run_auto))
+        .route("/api/projects/{id}/auto-pick", post(auto_pick))
         .route("/api/projects/{id}/events", get(project_events))
         .route("/api/projects/{id}/events/live", get(project_events_live))
         .route("/api/projects/{id}/test-all", post(test_all_engines))
