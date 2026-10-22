@@ -3466,7 +3466,7 @@ async fn site_find(body: Json<serde_json::Value>) -> Response {
     let quotes = v.get("quotes").and_then(|x| x.as_bool()).unwrap_or(false);
     let limit = v.get("limit").and_then(|x| x.as_u64()).unwrap_or(20).min(200) as usize;
     let pages = v.get("pages").and_then(|x| x.as_u64()).unwrap_or(2).min(5) as u32;
-    let max_sites = v.get("max_sites").and_then(|x| x.as_u64()).unwrap_or(12).min(100) as usize;
+    let max_sites = v.get("max_sites").and_then(|x| x.as_u64()).unwrap_or(48).min(400) as usize;
     // MVP default 0 — clean keyword query.  GSA's "add stop words with N%"
     // (multi-language word sampling) is opt-in via the request body.
     let stop_words_pct = v.get("stop_words_pct").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
@@ -3687,7 +3687,10 @@ async fn project_sites_find(
         quotes,
         stop_words_pct: 0,
         max_results: limit,
-        max_sites: 12,
+        // 48 engine fetches: budget big enough to walk past the ~36 dead
+        // "brave" catalog entries and reach the working scrapers, while
+        // dead-service skipping keeps actual fetch count small.
+        max_sites: 48,
         max_pages: pages.max(1),
         min_keywords_present: 0,
         skip_countries: Vec::new(),
@@ -3757,6 +3760,7 @@ async fn site_find_on(
     };
     let res = engine::site::find_sites_on_site(&site, &cfg, Arc::clone(&driver)).await;
     let hits: Vec<serde_json::Value> = res
+        .hits
         .into_iter()
         .map(|f| serde_json::json!({ "url": f.url }))
         .collect();

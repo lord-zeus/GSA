@@ -1209,9 +1209,16 @@ pub fn clean_found_url(url: &str) -> Option<String> {
     } else {
         url.to_string()
     };
+    if ASSET_SUFFIXES.iter().any(|s| u.to_ascii_lowercase().ends_with(s)) {
+        return None;
+    }
     match domain_of(&u) {
         Some(host) if host == "localhost" => Some(u),
         Some(host) if META_HOSTS.iter().any(|m| host == *m || host.ends_with(&format!(".{m}"))) => None,
+        // 4get wraps every result in a Yandex "find this URL" search link
+        // (`yandex.com/search/?text=url%3Ahttps%3A%2F...`) alongside the real
+        // result — keep site pages on Yandex, drop the lookup links.
+        Some(host) if (host == "yandex.com" || host == "yandex.ru") && u.contains("text=url%3A") => None,
         Some(host) if host.contains('.') => Some(u),
         _ => None,
     }
@@ -1220,8 +1227,40 @@ pub fn clean_found_url(url: &str) -> Option<String> {
 /// Hosts that can never be a submission target: markup standards bodies,
 /// CDNs, and other infrastructure that search engines link to inside
 /// their own pages (observed: `w3.org/TR/html4/strict.dtd` from a 4get
-/// mirror `<a>` in the result area).
-const META_HOSTS: [&str; 5] = ["w3.org", "wix.com", "schema.org", "cloudflare.com", "sentry.io"];
+/// mirror `<a>` in the result area, `bsky.app/profile/4getisdown` 4get
+/// status link, and 4get's per-result archive wrapper cluster —
+/// `web.archive.org`, `archive.ph`, `ghostarchive.org`, `arquivo.pt`,
+/// `megalodon.jp`, `webcitation.org`, Yandex "look-up" search links —
+/// which surround every real result on working 4get scrapers; plus the
+/// 4get mirror hosts themselves, which appear in the down-page/footer of
+/// every one of them).
+const META_HOSTS: [&str; 30] = [
+    "w3.org", "wix.com", "schema.org", "cloudflare.com", "sentry.io",
+    "bsky.app", "web.archive.org", "archive.ph", "ghostarchive.org",
+    "arquivo.pt", "megalodon.jp", "webcitation.org",
+    "nboeck.de", "sijh.net", "eloy.ar", "opnxng.com", "lunar.icu",
+    "edmateo.site", "softwareheritage.org",
+    // Search-engine chrome / telemetry / CDN clusters observed flooding
+    // stage-3 (generic) extraction when Bing/Baidu pages carry no usable
+    // result markup: bing.com (www/r/th/s + chrome), live.com
+    // (storage/login/schemas), Bing's own CDN (bcebos.com), the
+    // bingparachute + staging-bing-int telemetry hosts, Baidu's
+    // subdomain result redirects (not decodable without decode1 yet).
+    "bing.com", "baidu.com", "live.com", "bingparachute.com",
+    "staging-bing-int.com", "bcebos.com",
+    // Daum/Kakao (Korean search engine chrome) + DuckDuckGo chrome +
+    // Melon (Korean meta-search) observed in the "german shepherd rescue
+    // forum" run.
+    "daum.net", "daumcdn.net", "kakao.com", "melon.com", "duckduckgo.com",
+];
+
+/// Path suffixes that are files, not pages — a search result pointing at
+/// `bing.com/rp/x.css` (css/js/favicon assets found in 4get result pages
+/// and Bing's own page chrome) is never a submission target.
+const ASSET_SUFFIXES: [&str; 17] = [
+    ".css", ".js", ".mjs", ".map", ".svg", ".ico", ".png", ".jpg", ".jpeg",
+    ".gif", ".webp", ".gz", ".woff", ".woff2", ".ttf", ".eot", ".json",
+];
 
 pub fn domain_of(url: &str) -> Option<String> {
     let u = url.trim();
@@ -1327,6 +1366,19 @@ pub fn ip_duplicated(site_ip: &str, seen: &HashSet<String>) -> bool {
 //  6. Site-finding pipeline  (the GSA "Find New Sites" button)
 // ===========================================================================
 
+/// Outcome of one site's share of a `find_sites` walk.
+///
+/// * `hits` — extracted, filtered candidate sites (dedupe left to the
+///   caller, `find_sites`).
+/// * `reachable` — true when at least one page load returned HTML, even if
+///   no results extracted (a "down/empty" page is reachable; a TCP-dead
+///   host is not).  Callers use this to separate "site reachable but
+///   produced nothing" from "site down" for dead-service bookkeeping.
+pub struct SiteFindResult {
+    pub hits: Vec<FoundSite>,
+    pub reachable: bool,
+}
+
 /// One iteration of the find pipeline: run the query against one catalog
 /// entry, extract the results, apply the quality filters, and cap.
 ///
@@ -1337,10 +1389,10 @@ pub async fn find_sites_on_site(
     site: &SiteSpec,
     cfg: &SiteFindConfig,
     driver: Arc<dyn Driver>,
-) -> Vec<FoundSite> {
+) -> SiteFindResult {
     // A disabled site is skipped outright (catalog `enabled=0`).
     if !site.enabled {
-        return Vec::new();
+        return SiteFindResult { hits: Vec::new(), reachable: false };
     }
     // 1. Assemble the query.
     let stop_words: Vec<String> = {
@@ -1356,7 +1408,7 @@ pub async fn find_sites_on_site(
         &stop_words,
     );
     if query.is_empty() {
-        return Vec::new();
+        return SiteFindResult { hits: Vec::new(), reachable: false };
     }
 
     // 2. Walk `max_pages` pages (or `max page` in the SiteSpec, whichever
@@ -1376,12 +1428,16 @@ pub async fn find_sites_on_site(
     };
 
     let mut out: Vec<FoundSite> = Vec::new();
+    let mut reachable = false;
     let mut seen_ips = cfg.seen_ips.clone();
     for p in 0..pages {
         let offset = site.start_page + p * site.inc_page;
         let url = substitute_url(&site.url, &query, offset, &cfg.domain, &HashMap::new());
 
         let resp: DriverResponse = driver.navigate(url).await;
+        if resp.ok || !resp.html.is_empty() {
+            reachable = true;
+        }
             // GSA's `banned=` patterns mean "this response is a ban page;
             // stop searching this site now".
             if site.banned.iter().any(|b| b.starts_with('!').then(|| resp
@@ -1422,7 +1478,7 @@ pub async fn find_sites_on_site(
             let _ = &mut seen_ips;
             out.push(h);
             if out.len() >= cfg.max_results {
-                return out;
+                return SiteFindResult { hits: out, reachable };
             }
         }
 
@@ -1432,7 +1488,7 @@ pub async fn find_sites_on_site(
         let _ = site.wait_between_search;
     }
 
-    out
+    SiteFindResult { hits: out, reachable }
 }
 
 /// Run the query across the whole catalog, collect hits, dedupe, cap.
@@ -1440,6 +1496,18 @@ pub async fn find_sites_on_site(
 /// `sites` = `load_site_catalog()`; `driver` = the driver to navigate
 /// with.  This is the top-level function the API endpoint and the runner
 /// both call.
+///
+/// **Dead-service awareness.**  The catalog carries ~900 near-identical
+/// entries per dead mirror (e.g. 4get.eloy.ar × 923).  A *service* —
+/// resolved host, plus `scraper=` when present (a 4get mirror serves each
+/// scraper independently: brave down ≠ yep down) — that comes back
+/// zero-result on two different engines is marked dead and the remaining
+/// entries sharing it are skipped WITHOUT spending walk budget.
+///
+/// **Scraper rotation (4get family).**  When a `scraper=X` entry's page
+/// loads but yields nothing (observed 2026-10-22: the "4get is down"
+/// status page), the same host is retried with the two most reliable
+/// alternate scrapers before the engine is counted as a zero-result.
 pub async fn find_sites(
     cfg: SiteFindConfig,
     driver: Arc<dyn Driver>,
@@ -1448,30 +1516,138 @@ pub async fn find_sites(
     let mut out: Vec<FoundSite> = Vec::new();
     let mut seen_canonical: HashSet<String> = HashSet::new();
 
+    const ZERO_STREAK: u32 = 2;
+    let mut zero_streak: HashMap<String, u32> = HashMap::new();
+    let mut dead: HashSet<String> = HashSet::new();
+
     let mut walked = 0usize;
     for site in &sites {
         if !site.enabled || site.url.is_empty() {
             continue;
         }
+        let key = service_key(&site.url);
+        if dead.contains(&key) {
+            continue; // known-dead service — skip, no walk budget spent
+        }
         // Walk-count cap: with this many already fetched (0 = no cap),
         // stop early.  A bounded API call must not walk thousands of
-        // 60-second sites serially.
+        // 60-second sites serially.  (Dead-service skips don't count.)
         if cfg.max_sites > 0 && walked >= cfg.max_sites {
             return out;
         }
         walked += 1;
-        let hits = find_sites_on_site(site, &cfg, Arc::clone(&driver)).await;
-        for h in hits {
-            let key = h.canonical();
-            if seen_canonical.insert(key) {
+
+        let mut fresh: Vec<FoundSite> = Vec::new();
+        let mut tried_any = false;
+        'variants: for v in scraper_variants(site) {
+            let wr = find_sites_on_site(&v, &cfg, Arc::clone(&driver)).await;
+            tried_any = true;
+            if !wr.hits.is_empty() {
+                for h in wr.hits {
+                    if seen_canonical.insert(h.canonical()) {
+                        fresh.push(h);
+                    }
+                }
+                break 'variants;
+            }
+            // Page didn't load at all (TCP-dead host / timeout): rotating
+            // scrapers on the same host can't help — don't spend their
+            // fetches.  A loaded-but-empty page (down/empty results) still
+            // warrants a scraper rotation.
+            if !wr.reachable {
+                break 'variants;
+            }
+        }
+
+        if !fresh.is_empty() {
+            zero_streak.insert(key, 0);
+            for h in fresh {
                 out.push(h);
                 if out.len() >= cfg.max_results {
                     return out;
                 }
             }
+        } else if tried_any {
+            let s = zero_streak.entry(key.clone()).or_insert(0);
+            *s += 1;
+            if *s >= ZERO_STREAK {
+                dead.insert(key);
+            }
         }
     }
     out
+}
+
+/// Dead-service identity: resolved host + `scraper=` (when present).
+fn service_key(url: &str) -> String {
+    let resolved = if url.contains('{') {
+        resolve_host_alternates(url)
+    } else {
+        url.to_string()
+    };
+    let host = domain_of(&resolved).unwrap_or_else(|| resolved.clone());
+    match resolved.split_once("scraper=") {
+        Some((_, rest)) => {
+            let sc = rest
+                .split(|c: char| c == '&' || c == '?' || c == '|')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if sc.is_empty() {
+                host
+            } else {
+                format!("{host}::{sc}")
+            }
+        }
+        None => host,
+    }
+}
+
+/// Original engine first, then (4get-family `scraper=` entries only) the
+/// two most reliable alternates.  Non-4get entries: just the original.
+fn scraper_variants(site: &SiteSpec) -> Vec<SiteSpec> {
+    let mut v: Vec<SiteSpec> = vec![site.clone()];
+    if !site.url.contains("scraper=") {
+        return v;
+    }
+    let current = service_key(&site.url)
+        .rsplit_once("::")
+        .map(|(_, s)| s)
+        .unwrap_or("")
+        .to_string();
+    for fs in [
+        "yep", "mwmbl", "baidu", "marginalia", "yandex",
+        "startpage", "qwant", "ddg", "mullvad", "greppr", "mojeek", "brave",
+    ]
+    .iter()
+    {
+        if *fs == current {
+            continue;
+        }
+        if let Some(mut alt) = with_scraper(site, fs) {
+            alt.name = format!("{}·{fs}", alt.name);
+            v.push(alt);
+            if v.len() >= 3 {
+                break;
+            }
+        }
+    }
+    v
+}
+
+/// Replace `scraper=old` with `scraper=new` in a catalog URL, preserving
+/// any trailing parameters.
+fn with_scraper(site: &SiteSpec, new: &str) -> Option<SiteSpec> {
+    let (head, rest) = site.url.split_once("scraper=")?;
+    let mut url = head.to_string();
+    url.push_str("scraper=");
+    url.push_str(new);
+    if let Some(i) = rest.find(|c: char| c == '&' || c == '?' || c == '|') {
+        url.push_str(&rest[i..]);
+    }
+    let mut v = site.clone();
+    v.url = url;
+    Some(v)
 }
 
 // ===========================================================================
@@ -1970,9 +2146,10 @@ decode2=extract_parameter q *google.com/url?q=*
             seen_ips: HashSet::new(),
             seed: 7,
         };
-        let v = find_sites_on_site(&site, &cfg, driver).await;
-        assert!(!v.is_empty(), "should have found at least one hit");
-        assert!(v.iter().all(|f| f.source_site == "TestEngine"));
+        let r = find_sites_on_site(&site, &cfg, driver).await;
+        assert!(!r.hits.is_empty(), "should have found at least one hit");
+        assert!(r.reachable);
+        assert!(r.hits.iter().all(|f| f.source_site == "TestEngine"));
     }
 
     #[tokio::test]
@@ -1988,8 +2165,96 @@ decode2=extract_parameter q *google.com/url?q=*
             max_results: 5,
             ..Default::default()
         };
-        let v = find_sites_on_site(&site, &cfg, driver).await;
+        let r = find_sites_on_site(&site, &cfg, driver).await;
+        assert!(r.hits.is_empty());
+        assert!(!r.reachable, "a disabled site performs no request");
+    }
+
+    /// Driver that branches on the URL: `scraper=brave` returns a "down
+    /// page" (reachable, only a bsky chrome link — filtered), everything
+    /// else returns one real hit.
+    struct ScraperBranchDriver;
+    #[async_trait::async_trait]
+    impl Driver for ScraperBranchDriver {
+        async fn navigate(&self, url: String) -> DriverResponse {
+            if url.contains("scraper=brave") {
+                DriverResponse { ok: true, final_url: url.clone(), html: "<html><a href=\"https://bsky.app/profile/4getisdown\">status</a></html>".into(), error: None }
+            } else {
+                DriverResponse { ok: true, final_url: url.clone(), html: "<html><a href=\"https://good.example/post\">t</a></html>".into(), error: None }
+            }
+        }
+        async fn submit(&self, url: String, fields: std::collections::HashMap<String, String>, timeout: std::time::Duration) -> DriverResponse {
+            let _ = (fields, timeout);
+            self.navigate(url).await
+        }
+    }
+
+    /// Driver that is TCP-dead on host `dead.example` (ok=false, empty
+    /// body) and returns one hit elsewhere.  Counts navigations so the
+    /// dead-service skip test can assert the third engine was never
+    /// fetched.
+    struct DeadHostDriver {
+        calls: std::sync::Arc<std::sync::Mutex<usize>>,
+    }
+    #[async_trait::async_trait]
+    impl Driver for DeadHostDriver {
+        async fn navigate(&self, url: String) -> DriverResponse {
+            *self.calls.lock().unwrap() += 1;
+            if url.starts_with("https://dead.example") {
+                DriverResponse { ok: false, final_url: String::new(), html: String::new(), error: Some("connection refused".into()) }
+            } else {
+                DriverResponse { ok: true, final_url: url.clone(), html: "<html><a href=\"https://good.example/1\">x</a></html>".into(), error: None }
+            }
+        }
+        async fn submit(&self, url: String, fields: std::collections::HashMap<String, String>, timeout: std::time::Duration) -> DriverResponse {
+            let _ = (fields, timeout);
+            self.navigate(url).await
+        }
+    }
+
+    #[tokio::test]
+    async fn find_sites_rotates_scraper_when_brave_page_is_down() {
+        // Engine 'a' is a brave entry whose page loads but only carries the
+        // 4get status-link chrome (bsky) → zero hits; the walk must rotate
+        // to a working scraper on the same host before giving up.
+        let mk = |name: &str, scraper: &str| SiteSpec {
+            name: name.into(),
+            url: format!("https://4host.example/web?s=%search%&scraper={scraper}"),
+            enabled: true,
+            ..Default::default()
+        };
+        let cfg = SiteFindConfig {
+            keyword: "vlbook".into(),
+            max_results: 5,
+            max_sites: 0,
+            seed: 1,
+            ..Default::default()
+        };
+        let v = find_sites(cfg, Arc::new(ScraperBranchDriver), vec![
+            mk("4get-brave", "brave"),
+            mk("4get-mwmbl", "mwmbl"),
+        ]).await;
+        assert_eq!(v.len(), 1, "rotation must recover the hit: {v:?}");
+        assert!(v[0].url.contains("good.example"), "{:?}", v[0].url);
+    }
+
+    #[tokio::test]
+    async fn find_sites_skips_dead_host_after_streak_without_spending_budget() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let mk = |name: &str| SiteSpec {
+            name: name.into(),
+            url: "https://dead.example/s?q=%search%".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let cfg = SiteFindConfig { keyword: "kw".into(), max_results: 5, max_sites: 0, seed: 1, ..Default::default() };
+        let v = find_sites(cfg, Arc::new(DeadHostDriver { calls: calls.clone() }), vec![
+            mk("dead-a"), mk("dead-b"), mk("dead-c"), mk("dead-d"),
+        ]).await;
         assert!(v.is_empty());
+        // Two fetches establish the dead streak; engines c and d must be
+        // skipped WITHOUT any navigate (no 60s timeouts spent on them).
+        assert_eq!(*calls.lock().unwrap(), 2, "expected exactly 2 navigations");
     }
 
     #[tokio::test]
