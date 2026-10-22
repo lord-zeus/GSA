@@ -36,6 +36,14 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// T10c — an engine that produces this many consecutive non-success
+/// outcomes (of *any* class) is blacklisted for the run: it is presumed
+/// dead or permanently blocked, so `admit()` stops offering it work and
+/// [`FairState::engines_exhausted`] can go true. This is what lets a
+/// replenished run TERMINATE (every engine out) instead of re-queueing a
+/// dead engine forever. A success resets the streak (the engine recovered).
+pub const BLACKLIST_AFTER: u32 = 3;
+
 /// Per-run scheduling policy for the fair-share controller.
 #[derive(Debug, Clone, Copy)]
 pub struct FairPolicy {
@@ -99,6 +107,11 @@ struct EngineFair {
     rate_hits: u32,
     /// Total admits granted (for the per-engine rollup).
     admitted: u32,
+    /// T10c — consecutive non-success outcomes (any class). `Success`
+    /// resets it to 0; `>= BLACKLIST_AFTER` flips `disabled`.
+    fail_streak: u32,
+    /// T10c — blacklisted for this run: `admit()` refuses it.
+    disabled: bool,
 }
 
 /// One engine's share of a fair share (the even split the policy would give it).
@@ -143,6 +156,12 @@ pub struct FairState {
     // the top of its loop (in-flight/buffered work still drains). Separate from
     // `target_met()` so "stopped by hand" stays distinguishable in the summary.
     force_stop: bool,
+    /// T10c — admits rejected because the engine was blacklisted.
+    rejected_disabled: u32,
+    /// T10c — why the leader stopped (set by the pool at the stop moment and
+    /// surfaced in the run summary, so "why did it stop?" is always answered
+    /// in plain English: cancelled / target met / engines exhausted / …).
+    stop_reason: Option<String>,
 }
 
 impl FairState {
@@ -162,6 +181,8 @@ impl FairState {
             rejected_inflight: 0,
             rejected_quota: 0,
             force_stop: false,
+            rejected_disabled: 0,
+            stop_reason: None,
         }
     }
 
@@ -174,6 +195,13 @@ impl FairState {
     pub fn admit(&mut self, engine: Uuid, now: Instant) -> bool {
         if self.policy.target > 0 && self.total_links >= self.policy.target {
             self.rejected_target += 1;
+            return false;
+        }
+        // T10c — a blacklisted engine (3 consecutive non-successes) is not
+        // offered any more work this run: re-dispatching a dead engine forever
+        // is exactly the loop that a replenished queue would otherwise create.
+        if self.engines.get(&engine).map(|e| e.disabled).unwrap_or(false) {
+            self.rejected_disabled += 1;
             return false;
         }
         let e = self.engines.entry(engine).or_default();
@@ -211,16 +239,30 @@ impl FairState {
                 e.links += 1;
                 self.total_links += 1;
                 e.rate_streak = 0; // recovered — reset the backoff streak
+                e.fail_streak = 0; // healthy again — clear the blacklist streak
             }
             OutcomeClass::RateLimited => {
                 e.rate_streak = e.rate_streak.saturating_add(1);
                 e.rate_hits += 1;
                 let backoff = backoff_delay(base, max, e.rate_streak);
                 e.cool_until = Some(now + backoff);
+                // T10c — also counts the blacklist streak: an engine
+                // 429-walled three times in a row is not coming back this run.
+                e.fail_streak = e.fail_streak.saturating_add(1);
+                if e.fail_streak >= BLACKLIST_AFTER {
+                    e.disabled = true;
+                }
             }
             OutcomeClass::Other => {
-                // No penalty. A clean non-rate error is not evidence the engine
-                // is rate-limiting; keep its backoff state as-is.
+                // No rate penalty — a clean non-rate error is not evidence the
+                // engine is rate-limiting, so the backoff state stays as-is.
+                // But it still counts the blacklist streak (T10c): three
+                // straight non-successes of any kind means the engine is dead
+                // for this run, and replenishment must not keep offering it.
+                e.fail_streak = e.fail_streak.saturating_add(1);
+                if e.fail_streak >= BLACKLIST_AFTER {
+                    e.disabled = true;
+                }
             }
         }
     }
@@ -255,6 +297,32 @@ impl FairState {
         self.force_stop || self.target_met()
     }
 
+    // ── T10c — exhaustion + stop reason ──────────────────────────────────
+    /// T10c — every registered engine is blacklisted (3 consecutive
+    /// non-successes each). With queue replenishment on, this is the run's
+    /// termination condition: nothing left that can do work, so the leader
+    /// stops instead of provisioning jobs for dead engines forever.
+    pub fn engines_exhausted(&self) -> bool {
+        !self.engines.is_empty() && self.engines.values().all(|e| e.disabled)
+    }
+    /// T10c — how many engines are blacklisted this run (summary).
+    pub fn blacklisted_count(&self) -> u32 {
+        self.engines.values().filter(|e| e.disabled).count() as u32
+    }
+    /// T10c — is `engine` blacklisted? (per-engine summary row)
+    pub fn disabled_for(&self, engine: Uuid) -> bool {
+        self.engines.get(&engine).map(|e| e.disabled).unwrap_or(false)
+    }
+    /// T10c — record why the leader stopped. The pool sets this at the exact
+    /// stop moment; the API surfaces it in the run summary + live status.
+    pub fn set_stop_reason(&mut self, reason: impl Into<String>) {
+        self.stop_reason = Some(reason.into());
+    }
+    /// T10c — the recorded stop reason (once set, kept).
+    pub fn stop_reason(&self) -> Option<&str> {
+        self.stop_reason.as_deref()
+    }
+
     // ── introspection (summary + tests) ─────────────────────────────
     pub fn policy(&self) -> &FairPolicy {
         &self.policy
@@ -280,12 +348,13 @@ impl FairState {
     pub fn admitted_for(&self, id: Uuid) -> u32 {
         self.engines.get(&id).map(|e| e.admitted).unwrap_or(0)
     }
-    pub fn rejections(&self) -> (u32, u32, u32, u32) {
+    pub fn rejections(&self) -> (u32, u32, u32, u32, u32) {
         (
             self.rejected_target,
             self.rejected_cool,
             self.rejected_inflight,
             self.rejected_quota,
+            self.rejected_disabled,
         )
     }
 
@@ -301,6 +370,7 @@ impl FairState {
                 rate_hits: e.rate_hits,
                 admitted: e.admitted,
                 cool_remaining: self.cool_remaining(*id, now),
+                disabled: e.disabled,
             })
             .collect();
         out.sort_by(|a, b| a.engine.to_string().cmp(&b.engine.to_string()));
@@ -317,6 +387,8 @@ pub struct EngineSnapshot {
     pub rate_hits: u32,
     pub admitted: u32,
     pub cool_remaining: Option<Duration>,
+    /// T10c — blacklisted for this run (3 straight non-successes).
+    pub disabled: bool,
 }
 
 /// Is this failure an engine "got hot" signal (rate-limit family) rather than a
@@ -396,7 +468,7 @@ mod tests {
         assert_eq!(s.links_for(a), 1);
         // Target met: nothing more is admitted.
         assert!(!s.admit(a, now));
-        let (rt, _, _, _) = s.rejections();
+        let (rt, _, _, _, _) = s.rejections();
         assert_eq!(rt, 1);
     }
 
@@ -509,7 +581,7 @@ mod tests {
         // ...the 3rd admit is rejected because `a` hit its per-run cap — so a
         // capped engine never exceeds its share and the load goes elsewhere.
         assert!(!s.admit(a, now));
-        let (_, _, _, rq) = s.rejections();
+        let (_, _, _, rq, _) = s.rejections();
         assert_eq!(rq, 1);
     }
 
@@ -534,5 +606,77 @@ mod tests {
         s.release(a);
         assert_eq!(s.in_flight_for(a), 0);
         assert!(s.admit(a, now));
+    }
+
+    #[test]
+    fn blacklist_after_three_failures_stops_admissions() {
+        let a = Uuid::new_v4();
+        let mut s = FairState::new(FairPolicy { target: 0, ..Default::default() }, [a]);
+        // Distinct, advancing timestamps: a RateLimited outcome puts the
+        // engine in cooldown, so re-admitting "at the same instant" would be
+        // rejected on cooling (correct behavior) before ever testing the
+        // blacklist path.
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(3600);
+        let t2 = t1 + Duration::from_secs(3600);
+        // Two consecutive non-successes: still offered work…
+        assert!(s.admit(a, t0));
+        s.complete(a, OutcomeClass::Other, t0);
+        assert!(s.admit(a, t1));
+        s.complete(a, OutcomeClass::RateLimited, t1);
+        assert!(!s.disabled_for(a));
+        // …the third consecutive one blacklists the engine for the run.
+        assert!(s.admit(a, t2));
+        s.complete(a, OutcomeClass::Other, t2);
+        assert!(s.disabled_for(a));
+        assert!(!s.admit(a, t2 + Duration::from_secs(3600)));
+        let (_, _, _, _, rj_disabled) = s.rejections();
+        assert_eq!(rj_disabled, 1);
+        // Single engine out => the run can terminate instead of looping.
+        assert!(s.engines_exhausted());
+    }
+
+    #[test]
+    fn success_clears_blacklist_streak() {
+        let a = Uuid::new_v4();
+        let mut s = FairState::new(FairPolicy { target: 0, ..Default::default() }, [a]);
+        let t0 = Instant::now();
+        assert!(s.admit(a, t0));
+        s.complete(a, OutcomeClass::Other, t0); // streak 1
+        assert!(s.admit(a, t0));
+        s.complete(a, OutcomeClass::Success, t0); // reset
+        assert!(s.admit(a, t0));
+        s.complete(a, OutcomeClass::Other, t0); // streak 1 again
+        assert!(s.admit(a, t0));
+        s.complete(a, OutcomeClass::Other, t0); // streak 2 — under the threshold
+        assert!(!s.disabled_for(a));
+    }
+
+    #[test]
+    fn engines_exhausted_only_when_all_blacklisted() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let mut s = FairState::new(FairPolicy::default(), [a, b]);
+        let t0 = Instant::now();
+        for _ in 0..BLACKLIST_AFTER {
+            assert!(s.admit(a, t0));
+            s.complete(a, OutcomeClass::Other, t0);
+        }
+        assert!(s.disabled_for(a));
+        assert!(!s.engines_exhausted()); // b can still work
+        for _ in 0..BLACKLIST_AFTER {
+            assert!(s.admit(b, t0));
+            s.complete(b, OutcomeClass::Other, t0);
+        }
+        assert!(s.engines_exhausted());
+        assert_eq!(s.blacklisted_count(), 2);
+    }
+
+    #[test]
+    fn stop_reason_records_and_survives() {
+        let mut s = FairState::new(FairPolicy::default(), [Uuid::new_v4()]);
+        assert_eq!(s.stop_reason(), None);
+        s.set_stop_reason("all engines exhausted (0 links created)");
+        assert_eq!(s.stop_reason(), Some("all engines exhausted (0 links created)"));
     }
 }

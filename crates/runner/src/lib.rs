@@ -25,7 +25,7 @@ pub use config::RunnerConfig;
 pub use events::{EventSink, LoggingDriver, RunEvent};
 pub use execute::{DriverRegistry, JobOutcome, JobRunner, SubmissionContext};
 pub use fair::{classify, fair_quota, is_rate_limited, FairPolicy, FairState, OutcomeClass};
-pub use pool::{PoolSummary, WorkerPool};
+pub use pool::{PoolSummary, ReplenishFn, WorkerPool};
 pub use specprovider::{SpecRegistry, SpecSource};
 
 /// Convenience: build a pool for an inline test registry.

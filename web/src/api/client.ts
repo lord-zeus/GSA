@@ -310,6 +310,7 @@ export interface RunStatusRejections {
   cooling?: number
   in_flight_cap?: number
   quota?: number
+  disabled?: number            // T10c — engines blacklisted this run
 }
 export interface RunStatusEngine {
   engine: string
@@ -317,6 +318,7 @@ export interface RunStatusEngine {
   admitted?: number
   rate_hits?: number
   cool_remaining_secs?: number | null
+  disabled?: boolean          // T10c — blacklisted (3 consecutive non-successes)
 }
 export interface RunStatusActive {
   run_id: string
@@ -328,6 +330,8 @@ export interface RunStatusActive {
   reached_target: boolean
   in_flight?: number
   cooling_down?: number
+  stop_reason?: string | null    // T10c — why the run stopped (finished state)
+  engines_blacklisted?: number  // T10c
   rejections?: RunStatusRejections
   engines_json?: RunStatusEngine[]
 }

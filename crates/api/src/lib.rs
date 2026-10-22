@@ -1706,6 +1706,10 @@ pub async fn run_project_pool(
     // runs). `Some(..)` = work-conserving fair dispatch with per-engine rate
     // caps, 429/403 backoff, and a global target gate.
     fair: Option<std::sync::Arc<std::sync::Mutex<runner::FairState>>>,
+    // T10c — lazy queue-refill provider (auto-runs only). `Some(..)` = when
+    // the queue drains before the fair target is met, provision more jobs
+    // and keep going instead of stopping.
+    replenish: Option<runner::ReplenishFn>,
 ) -> anyhow::Result<serde_json::Value> {
 
     // GSA install root — same default the import path uses; override with
@@ -1883,20 +1887,30 @@ pub async fn run_project_pool(
     // A bound WebDriver owns ONE live page target, so with the browser
     // driver registered the run serializes (`concurrent_workers = 1`):
     // interleaving two multi-step engine runs on one page cross-talks.
+    //
+    // T10c — but ONLY when this run's pending queue actually contains
+    // browser-routed engines. HTTP/email fleets (the common case) keep
+    // their full worker width even while Edge is up.
     {
         let base = std::env::var("SER_EDGE_CDP")
             .unwrap_or_else(|_| "http://127.0.0.1:9222".to_string());
-        if base != "0" {
+        let needs_browser = queue_needs_browser(project_id, &state.pool).await;
+        if base != "0" && needs_browser {
             match browser_ws_endpoint(&base).await {
                 Some(ws) => match engine::WebDriver::connect(ws).await {
                     Ok(wd) => {
                         drivers = drivers.with_browser(wd);
                         cfg.concurrent_workers = 1;
+                        eprintln!(
+                            "[browser] queue contains browser-routed engines — run on single CDP page (concurrent_workers=1)"
+                        );
                     }
                     Err(e) => eprintln!("[browser] CDP ws connect failed: {e}"),
                 },
                 None => eprintln!("[browser] no CDP endpoint at {base} (15s probe) — browser-routed engines will report a clean failure"),
             }
+        } else if needs_browser {
+            eprintln!("[browser] queue has browser-routed engines but SER_EDGE_CDP=0 — they will fail with a clean driver error");
         }
     }
 
@@ -1912,6 +1926,11 @@ pub async fn run_project_pool(
     // (Moves the Arc in; the pool clones it per worker.)
     let pool = match fair {
         Some(f) => pool.with_fair(f),
+        None => pool,
+    };
+    // T10c — attach the lazy queue-refill provider (auto-runs only).
+    let pool = match replenish {
+        Some(rp) => pool.with_replenish(rp),
         None => pool,
     };
 
@@ -1966,6 +1985,56 @@ pub async fn run_project_pool(
 
 
 
+/// T10c — does this project's *pending* queue contain any browser-routed
+/// engine? A bound CDP WebDriver owns one live page target, so only runs
+/// that actually touch browser engines serialize to a single worker; the
+/// HTTP/email fleet (the vast majority) keeps full worker width. Reads each
+/// queued engine's INI and applies the same routing rule GSA uses (browser
+/// markers → `DriverKind::Browser`). Fails conservative: any read it can't
+/// answer (unknown queue, engine-less job, missing spec) treats the run as
+/// browser-needing — the pre-T10c behaviour.
+async fn queue_needs_browser(project_id: Uuid, pool: &sqlx::PgPool) -> bool {
+    let repo = ser_db::Repo::new(pool.clone());
+    let pending = match repo.list_jobs(project_id, Some(ser_db::JobStatus::Pending)).await {
+        Ok(j) => j,
+        Err(_) => return true,
+    };
+    if pending.is_empty() {
+        return false;
+    }
+    let mut ids: std::collections::BTreeSet<Uuid> = Default::default();
+    for j in &pending {
+        match j.engine_id {
+            Some(id) => {
+                ids.insert(id);
+            }
+            None => return true,
+        }
+    }
+    let engines = match repo.list_engines_all(project_id).await {
+        Ok(e) => e,
+        Err(_) => return true,
+    };
+    let root = std::env::var("GSA_INSTALL_ROOT")
+        .unwrap_or_else(|_| r"C:\Users\kingsly\GSA_SER_portable".into());
+    for id in &ids {
+        let Some(path) = engines.iter().find(|e| e.id == *id).map(|e| e.file_path.clone())
+        else {
+            return true;
+        };
+        let raw = match std::fs::read_to_string(std::path::Path::new(&root).join(&path)) {
+            Ok(t) => t,
+            Err(_) => return true, // unresolvable spec — be conservative
+        };
+        if engine::routing::required_driver_kind_from_text(&raw)
+            == engine::routing::DriverKind::Browser
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// T10 — background multi-project run dispatcher.
 ///
 /// Spawns the pool as a detached tokio task (survives the HTTP request
@@ -1984,16 +2053,24 @@ async fn dispatch_background(
     fair: Option<Arc<std::sync::Mutex<runner::FairState>>>,
     enqueued_jobs: usize,
     order_names: Vec<String>,
+    replenish: Option<runner::ReplenishFn>,
 ) -> Result<Uuid, crate::runtrack::BeginErr> {
     let run_id = Uuid::new_v4();
     let st = Arc::clone(state);
     let fair_task = fair.clone();
+    let replen_task = replenish.clone();
     let names = order_names;
     let enq = enqueued_jobs;
 
     let task = tokio::spawn(async move {
-        let outcome =
-            run_project_pool(project_id, &st, pause_override, fair_task.clone()).await;
+        let outcome = run_project_pool(
+            project_id,
+            &st,
+            pause_override,
+            fair_task.clone(),
+            replen_task.clone(),
+        )
+        .await;
         let (status, payload) = match outcome {
             Ok(mut s) => {
                 if fair_task.is_some() {
@@ -2007,11 +2084,12 @@ async fn dispatch_background(
                                 "links": ss.links,
                                 "admitted": ss.admitted,
                                 "rate_hits": ss.rate_hits,
+                                "disabled": ss.disabled,
                                 "cool_remaining_secs": ss.cool_remaining.map(|d| d.as_secs()),
                             })
                         })
                         .collect();
-                    let (rj_target, rj_cool, rj_inflight, rj_quota) = r.rejections();
+                    let (rj_target, rj_cool, rj_inflight, rj_quota, rj_disabled) = r.rejections();
                     let created = r.total_links();
                     let target = r.policy().target;
                     if let Some(obj) = s.as_object_mut() {
@@ -2037,12 +2115,15 @@ async fn dispatch_background(
                                 "links_created": created,
                                 "reached_target": created >= target,
                                 "cancelled": r.force_stop(),
+                                "stop_reason": r.stop_reason().map(|s| s.to_string()),
+                                "engines_blacklisted": r.blacklisted_count(),
                                 "engines": engines_json,
                                 "rejections": {
                                     "target": rj_target,
                                     "cooling": rj_cool,
                                     "in_flight_cap": rj_inflight,
-                                    "quota": rj_quota
+                                    "quota": rj_quota,
+                                    "disabled": rj_disabled
                                 }
                             }),
                         );
@@ -2130,7 +2211,7 @@ fn begin_err_response(
 /// Progress: `GET …/run-status`; logs: `GET …/events/live` (SSE).  A second
 /// start of the same project is rejected while one is active (409).
 async fn run_project(State(state): State<Arc<AppState>>, Path(project_id): Path<Uuid>) -> Response {
-    match dispatch_background(&state, project_id, 0, 0, false, None, None, 0, Vec::new()).await {
+    match dispatch_background(&state, project_id, 0, 0, false, None, None, 0, Vec::new(), None).await {
         Ok(run_id) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
@@ -2361,7 +2442,7 @@ async fn run_mixed(
         }
     }
 
-    match run_project_pool(project_id, &state, None, None).await {
+    match run_project_pool(project_id, &state, None, None, None).await {
         Ok(v) => {
             let mut v = v;
             if let Some(obj) = v.as_object_mut() {
@@ -2419,7 +2500,8 @@ async fn run_auto(
         Some(0),
         Some(pre.fair),
         pre.enqueued,
-        pre.order_names,
+        pre.order_names.clone(),
+        Some(pre.replenish),
     )
     .await
     {
@@ -2518,13 +2600,71 @@ async fn project_run_cancel(
 
 /// T10 — the global "what's running now" view across ALL projects (the
 /// operator's cross-project dashboard). Lists every in-flight run live.
+/// T11 — each run carries its FULL live state (fair-share breakdown,
+/// in-flight workers, rejections, blacklisted engines) via active_status.
 async fn global_runs(State(state): State<Arc<AppState>>) -> Response {
+    let active = state.runs.all_active();
+    let mut runs = Vec::with_capacity(active.len());
+    for base in active {
+        let mut v = base;
+        // Attach the live fair-share state when the run registered one.
+        let pid = v
+            .get("project_id")
+            .and_then(|s| s.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+        let fair = match pid {
+            Some(p) => state.runs.fair_of(p),
+            None => None,
+        };
+        if let Some(fair) = fair {
+            let r = fair.lock().unwrap();
+            let engines_json: Vec<serde_json::Value> = r
+                .snapshot(std::time::Instant::now())
+                .into_iter()
+                .map(|ss| {
+                    serde_json::json!({
+                        "engine": ss.engine,
+                        "links": ss.links,
+                        "admitted": ss.admitted,
+                        "rate_hits": ss.rate_hits,
+                        "disabled": ss.disabled,
+                        "cool_remaining_secs": ss.cool_remaining.map(|d| d.as_secs()),
+                    })
+                })
+                .collect();
+            let (rj_target, rj_cool, rj_inflight, rj_quota, rj_disabled) = r.rejections();
+            let target = r.policy().target;
+            let created = r.total_links();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "fair".to_string(),
+                    serde_json::json!({
+                        "target": target,
+                        "links_created": created,
+                        "reached_target": created >= target,
+                        "cancelled": r.force_stop(),
+                        "stop_reason": r.stop_reason().map(|s| s.to_string()),
+                        "engines_blacklisted": r.blacklisted_count(),
+                        "engines": engines_json,
+                        "rejections": {
+                            "target": rj_target,
+                            "cooling": rj_cool,
+                            "in_flight_cap": rj_inflight,
+                            "quota": rj_quota,
+                            "disabled": rj_disabled
+                        }
+                    }),
+                );
+            }
+        }
+        runs.push(v);
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "active_runs": state.runs.active_count(),
+            "active_runs": runs.len(),
             "capacity": state.runs.capacity(),
-            "runs": state.runs.all_active(),
+            "runs": runs,
         })),
     )
         .into_response()
@@ -2536,6 +2676,8 @@ struct RunAutoReady {
     enqueued: usize,
     order_names: Vec<String>,
     fair: std::sync::Arc<std::sync::Mutex<runner::FairState>>,
+    /// T10c — lazy queue-refill provider for the pool (budget-capped).
+    replenish: runner::ReplenishFn,
 }
 
 /// T10 — validate, rank engines, banner, provision the job queue, and build
@@ -2632,12 +2774,63 @@ async fn run_auto_prepare(
     let fair = std::sync::Arc::new(std::sync::Mutex::new(
         runner::FairState::new(policy, picked.iter().map(|e| e.id)),
     ));
+    // 6) T10c — lazy refill. When the provisioned queue drains before the
+    //    target is met (a 1,000-link run burns through its 4,000 pre-queued
+    //    jobs quickly), the pool leader calls this: it re-provisions jobs
+    //    round-robin on the same engines/keywords and returns how many it
+    //    made. Hard per-run budget (5×target, min 5,000) guarantees the run
+    //    has a termination condition even for a fully dead fleet — the fair
+    //    blacklist + `engines_exhausted()` is the real stop signal, the
+    //    budget the guard against unbounded refills. A `0` return = stop.
+    let links_budget = (links_target * 5).max(5000);
+    let enq_counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(enqueued));
+    let eng_ids: Vec<Uuid> = picked.iter().map(|e| e.id).collect();
+    let kw_ids: Vec<Uuid> = keywords.iter().map(|k| k.id).collect();
+    let state_rc = std::sync::Arc::clone(state);
+    let replenish: runner::ReplenishFn = std::sync::Arc::new(move |need: usize| {
+        let budget = links_budget;
+        let already = enq_counter.load(std::sync::atomic::Ordering::Acquire);
+        let count = need.min(budget.saturating_sub(already));
+        let eng_ids = eng_ids.clone();
+        let kw_ids = kw_ids.clone();
+        let db = state_rc.pool.clone();
+        let bus = state_rc.run_bus.sender();
+        let enq_counter = std::sync::Arc::clone(&enq_counter);
+        let project = project_id;
+        Box::pin(async move {
+            if count == 0 {
+                return Ok(0usize);
+            }
+            let repo = Repo::new(db.clone());
+            let mut made = 0usize;
+            for slot in 0..count {
+                let eng = eng_ids[slot % eng_ids.len()];
+                let kw = kw_ids[slot % kw_ids.len()];
+                if repo.create_job(project, Some(eng), Some(kw)).await.is_ok() {
+                    made += 1;
+                }
+            }
+            enq_counter.fetch_add(made, std::sync::atomic::Ordering::Release);
+            if made > 0 {
+                use runner::EventSink as _;
+                let sink = crate::runfeed::RunEventSink::new(project, db, bus);
+                let _ = sink.record(runner::RunEvent {
+                    job_id: None,
+                    engine: None,
+                    level: "auto".into(),
+                    message: format!("queue drained before target — replenished {made} more jobs (per-run cap {budget}) — continuing"),
+                });
+            }
+            Ok(made)
+        })
+    });
     Ok(RunAutoReady {
         links_target,
         engines: picked.len(),
         enqueued,
         order_names,
         fair,
+        replenish,
     })
 }
 
@@ -3714,7 +3907,7 @@ async fn run_now_schedule(
     if !claimed {
         return Json(serde_json::json!({ "status": "skipped", "reason": "next_run_at is not due / schedule is consumed" })).into_response();
     }
-    let summary = match run_project_pool(sched.project_id, &state, None, None).await {
+    let summary = match run_project_pool(sched.project_id, &state, None, None, None).await {
         Ok(v) => v,
         Err(e) => return error_response(e),
     };

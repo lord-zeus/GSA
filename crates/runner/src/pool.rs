@@ -14,6 +14,7 @@
 //! end-to-end. Panics in a worker are captured by the `JoinSet`,
 //! counted, and do NOT tear down the other workers or the leader.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -62,6 +63,33 @@ pub struct WorkerPool {
     /// and every worker (complete/release on job end). `None` = legacy
     /// first-come-first-served dispatch (the previous behavior).
     fair: Option<std::sync::Arc<std::sync::Mutex<crate::fair::FairState>>>,
+    /// T10c — lazy queue-refill provider (see [`ReplenishFn`]). `None` = the
+    /// run stops when the queue drains (the pre-T10c behavior); `Some(..)` =
+    /// the leader provisions more jobs when the queue empties before the
+    /// fair target is met — how a 1,000-link run actually delivers.
+    replenish: Option<ReplenishFn>,
+}
+
+/// T10c — the queue-refill callable the pool leader invokes when the `pending`
+/// queue drains *before* the fair target is met. The API owns the closure
+/// (it holds the DB + project context): given `how many links are still
+/// needed`, it provisions new jobs on the run's engine set and returns how
+/// many it created. A `0` return is the run's termination signal (budget hit
+/// or nothing left to provision) — the leader stops instead of looping.
+pub type ReplenishFn = Arc<
+    dyn Fn(usize)
+        -> Pin<Box<dyn std::future::Future<Output = std::result::Result<usize, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// T10c — what to do when the `pending` queue drains mid-run.
+enum DrainState {
+/// Stop the run (record `reason` when set).
+Stop { reason: Option<String> },
+/// Provision more jobs (via the replenishment provider) and continue.
+/// `need` = links still to go (the provider may cap it to its budget).
+Continue { need: usize },
 }
 
 impl WorkerPool {
@@ -80,6 +108,7 @@ impl WorkerPool {
             ctx: Default::default(),
             pause_after: 0,
             fair: None,
+            replenish: None,
         }
     }
 
@@ -99,6 +128,12 @@ impl WorkerPool {
         fair: std::sync::Arc<std::sync::Mutex<crate::fair::FairState>>,
     ) -> Self {
         self.fair = Some(fair);
+        self
+    }
+
+    /// T10c — attach the lazy queue-refill provider for this pool run.
+    pub fn with_replenish(mut self, replenish: ReplenishFn) -> Self {
+        self.replenish = Some(replenish);
         self
     }
 
@@ -216,13 +251,20 @@ impl WorkerPool {
                 // no new work is admitted — the run has reached the requested
                 // link count, so the leader drains the in-flight and exits.
                 if let Some(fair) = self.fair.as_ref() {
-                    let st = fair.lock().unwrap();
+                    let mut st = fair.lock().unwrap();
                     if st.should_stop() {
-                        let links = st.total_links();
-                        let why = if st.force_stop() { "cancelled by operator" } else { "fair target met" };
+                        let reason = if st.force_stop() {
+                            "cancelled by operator".to_string()
+                        } else {
+                            format!(
+                                "target met ({} links created)",
+                                st.total_links()
+                            )
+                        };
+                        st.set_stop_reason(reason.clone()); // T10c — record for the summary
                         if dispatched > 0 {
                             eprintln!(
-                                "runner: {why} ({links} links); {dispatched} dispatched this run; remaining jobs stay queued"
+                                "runner: {reason}; {dispatched} dispatched this run; remaining jobs stay queued"
                             );
                         }
                         break;
@@ -240,7 +282,80 @@ impl WorkerPool {
                     }
                 };
                 if jobs.is_empty() {
-                    break; // drained
+                    // T10c — queue drained before the fair target was met.
+                    //  - no fair controller (legacy run): drain = done (old behavior)
+                    //  - fair run already ending (cancel / target met / all engines
+                    //    blacklisted): record WHY and stop
+                    //  - otherwise + replenishment attached: provision more
+                    //    jobs and keep going — this is how a 1,000-link run
+                    //    actually keeps delivering instead of stalling at 1
+                    let drain_state = match self.fair.as_ref() {
+                        None => DrainState::Stop { reason: None },
+                        Some(f) => {
+                            let st = f.lock().unwrap();
+                            if st.force_stop() {
+                                DrainState::Stop {
+                                    reason: Some("cancelled by operator".into()),
+                                }
+                            } else if st.target_met() {
+                                DrainState::Stop {
+                                    reason: Some(format!(
+                                        "target met ({} links created)",
+                                        st.total_links()
+                                    )),
+                                }
+                            } else if st.engines_exhausted() {
+                                DrainState::Stop {
+                                    reason: Some(format!(
+                                        "all engines exhausted ({} links created; every engine blacklisted after {} straight non-successes)",
+                                        st.total_links(),
+                                        crate::fair::BLACKLIST_AFTER
+                                    )),
+                                }
+                            } else {
+                                DrainState::Continue {
+                                    need: st.policy().target.saturating_sub(st.total_links()),
+                                }
+                            }
+                        }
+                    };
+                    match drain_state {
+                        DrainState::Stop { reason } => {
+                            if let (Some(f), Some(r)) = (self.fair.as_ref(), reason.as_ref()) {
+                                f.lock().unwrap().set_stop_reason(r.clone());
+                            }
+                            if let Some(reason) = reason {
+                                eprintln!(
+                                    "runner: {reason}; {dispatched} dispatched this run — stopping"
+                                );
+                            }
+                            break;
+                        }
+                        DrainState::Continue { need } => {
+                            let extra = match self.replenish.as_ref() {
+                                Some(rp) => match rp(need).await {
+                                    Ok(n) => n,
+                                    Err(e) => {
+                                        if let Some(f) = self.fair.as_ref() {
+                                            f.lock()
+                                                .unwrap()
+                                                .set_stop_reason(format!("replenishment failed: {e}"));
+                                        }
+                                        eprintln!("runner: replenishment failed: {e} — stopping");
+                                        0
+                                    }
+                                },
+                                None => 0, // fair run with no provider: drained
+                            };
+                            if extra > 0 {
+                                eprintln!(
+                                    "runner: queue drained before target — provisioned {extra} more jobs, continuing"
+                                );
+                                continue;
+                            }
+                            break;
+                        }
+                    }
                 }
                 for j in jobs {
                     let slot = (j.id, j.engine_id);
