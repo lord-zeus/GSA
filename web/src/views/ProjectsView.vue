@@ -12,10 +12,17 @@ import {
   type RunEventRow,
   type RunSummary,
   type TestAllResult,
+  type AutoPickResult,
 } from '@/api/client'
 
 // — projects (master list) —
 const projects = ref<Project[]>([])
+const projFilter = ref('')
+const filteredProjects = computed(() => {
+  const q = projFilter.value.trim().toLowerCase()
+  if (!q) return projects.value
+  return projects.value.filter((p) => p.name.toLowerCase().includes(q) || (p.description || '').toLowerCase().includes(q))
+})
 const name = ref('')
 const desc = ref('')
 const busy = ref(false)
@@ -600,6 +607,34 @@ function ok_list(t: TestAllResult, winners: string[]): boolean {
   return t.ok > 0 && winners.length > 0
 }
 
+// — T7 · auto-pick: step 1 — the system scores the catalog, samples,
+//    live-verifies, and builds this project's engine list for you.
+const pickBusy = ref(false)
+const pickErr = ref('')
+const pickTest = ref(true) // live dry-run verification ON by default
+const pickPerFamily = ref(4)
+const pickMaxTotal = ref(12)
+const pickResult = ref<AutoPickResult | null>(null)
+
+async function autoPick() {
+  if (!selected.value) return
+  pickBusy.value = true
+  pickErr.value = ''
+  pickResult.value = null
+  try {
+    pickResult.value = await api.projectAutoPick(selected.value, {
+      test: pickTest.value,
+      per_family: pickPerFamily.value,
+      max_total: pickMaxTotal.value,
+    })
+    await loadEngines()
+  } catch (e: any) {
+    pickErr.value = 'Auto-pick failed: ' + (e?.message || String(e))
+  } finally {
+    pickBusy.value = false
+  }
+}
+
 async function checkCaptcha() {
   captchaBusy.value = true
   captchaMsg.value = null
@@ -921,6 +956,10 @@ function cls(status: string) {
     </div>
 
     <div class="card" style="padding:0;overflow:hidden">
+      <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;gap:10px;align-items:center">
+        <input v-model="projFilter" placeholder="🔍 filter projects by name… (search 'Phase-1')" style="flex:1;max-width:420px" />
+        <span class="muted" style="font-size:12px;white-space:nowrap">{{ filteredProjects.length }} / {{ projects.length }} shown</span>
+      </div>
       <table class="table">
         <thead>
           <tr>
@@ -932,7 +971,7 @@ function cls(status: string) {
             <td colspan="5" class="muted" style="text-align:center;padding:26px">no projects yet — create one above</td>
           </tr>
           <tr
-            v-for="p in projects"
+            v-for="p in filteredProjects"
             :key="p.id"
             style="cursor:pointer"
             :style="selected === p.id ? 'background:rgba(16,185,129,.08)' : ''"
@@ -980,6 +1019,222 @@ function cls(status: string) {
           </select>
         </span>
       </div>
+
+      <!-- T7/T6 · THE FLOW — always on top: pick engines, build links, watch it live -->
+              <!-- T7 · auto-pick — STEP 1: the system builds your engine list for you -->
+        <div class="card" style="margin-top:12px;border:1.5px solid rgba(56,189,248,0.7);background:linear-gradient(180deg,rgba(56,189,248,0.08),rgba(56,189,248,0.02))">
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+            <div>
+              <strong>🎯 Step 1 · Auto-pick engines — the system does the selecting</strong>
+              <p class="muted" style="margin:3px 0 0;max-width:64vw">
+                Scores the whole engine catalog by family (article / comment /
+                link), samples only the top of each, and — with live
+                verification on — dry-runs them and keeps just the engines that
+                actually create a link. Failed ones are disabled, not deleted,
+                and each gets a reason you can audit. Then you press
+                ⚡ Auto-build below.
+              </p>
+            </div>
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+              <label class="muted" style="display:flex;gap:6px;align-items:center;cursor:pointer"
+                     title="live dry-run each sampled engine; keeps only proven ones (a bit slower)">
+                <input type="checkbox" v-model="pickTest" />
+                live-verify (recommended)
+              </label>
+              <label class="muted" style="display:flex;gap:6px;align-items:center">
+                per family
+                <select v-model.number="pickPerFamily" style="width:64px">
+                  <option :value="2">2</option>
+                  <option :value="4">4</option>
+                  <option :value="8">8</option>
+                </select>
+              </label>
+              <label class="muted" style="display:flex;gap:6px;align-items:center" title="cap on total engines sampled">
+                max total
+                <select v-model.number="pickMaxTotal" style="width:64px">
+                  <option :value="6">6</option>
+                  <option :value="12">12</option>
+                  <option :value="24">24</option>
+                </select>
+              </label>
+              <button
+                class="primary"
+                style="padding:10px 20px;font-weight:700"
+                :disabled="pickBusy"
+                @click="autoPick"
+                :title="pickTest ? 'score catalog, sample, live-verify, add proven engines' : 'score catalog, sample, add best engines (no live test)'"
+              >
+                {{ pickBusy ? (pickTest ? 'Picking & verifying live…' : 'Picking…') : '🎯 Auto-pick' }}
+              </button>
+            </div>
+          </div>
+          <div v-if="pickErr" style="margin-top:10px;color:#f87171;font-size:13px">{{ pickErr }}</div>
+          <div v-if="pickResult" style="margin-top:12px">
+            <!-- pipeline summary chips -->
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;font-size:13px">
+              <span class="muted" style="padding:4px 10px;border:1px solid var(--border);border-radius:999px">
+                {{ pickResult.considered }} considered
+              </span>
+              <span class="muted">→</span>
+              <span class="muted" style="padding:4px 10px;border:1px solid var(--border);border-radius:999px">
+                {{ pickResult.sampled }} sampled
+              </span>
+              <span class="muted">→</span>
+              <span style="padding:4px 10px;border-radius:999px;border:1px solid rgba(34,197,94,0.5);color:#86efac;font-weight:700">
+                ✓ {{ pickResult.verified.length }} live-verified
+              </span>
+              <span v-if="pickResult.failed.length" style="padding:4px 10px;border-radius:999px;border:1px solid rgba(239,68,68,0.4);color:#fca5a5">
+                ✗ {{ pickResult.failed.length }} rejected
+              </span>
+            </div>
+            <!-- audited verdicts -->
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+              <div style="border:1px solid rgba(34,197,94,0.35);border-radius:10px;overflow:hidden">
+                <div style="padding:8px 12px;background:rgba(34,197,94,0.08);font-weight:700;font-size:13px">
+                  ✓ Verified engines (added to this project)
+                </div>
+                <div v-if="!pickResult.verified.length" class="muted" style="padding:10px 12px;font-size:12px">
+                  none yet — raise "per family" / "max total" and pick again
+                </div>
+                <div v-for="e in pickResult.verified" :key="'v'+e.engine"
+                     style="display:flex;justify-content:space-between;gap:8px;padding:7px 12px;font-size:12.5px;border-top:1px solid var(--border)">
+                  <span><span class="muted" style="font-size:11px;margin-right:6px;text-transform:uppercase">{{ e.family }}</span>{{ e.engine }}</span>
+                  <span class="muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:45%">{{ e.url || '' }}</span>
+                </div>
+              </div>
+              <div style="border:1px solid rgba(239,68,68,0.3);border-radius:10px;overflow:hidden">
+                <div style="padding:8px 12px;background:rgba(239,68,68,0.06);font-weight:700;font-size:13px">
+                  ✗ Rejected (disabled — auditable, re-enableable)
+                </div>
+                <div v-if="!pickResult.failed.length" class="muted" style="padding:10px 12px;font-size:12px">
+                  clean sweep — nothing failed
+                </div>
+                <div v-for="e in pickResult.failed" :key="'f'+e.engine"
+                     style="display:flex;justify-content:space-between;gap:8px;padding:7px 12px;font-size:12.5px;border-top:1px solid var(--border)">
+                  <span style="white-space:nowrap"><span class="muted" style="font-size:11px;margin-right:6px;text-transform:uppercase">{{ e.family }}</span>{{ e.engine }}</span>
+                  <span class="muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%" :title="e.reason || ''">{{ e.reason || '' }}</span>
+                </div>
+              </div>
+            </div>
+            <!-- next step -->
+            <div style="margin-top:12px;padding:10px 14px;border-radius:10px;font-size:13.5px;font-weight:600"
+                 :style="pickResult.verified.length
+                        ? 'background:rgba(34,197,94,0.1);color:#86efac;border:1px solid rgba(34,197,94,0.4)'
+                        : 'background:rgba(245,158,11,0.08);color:#fcd34d;border:1px solid rgba(245,158,11,0.4)'">
+              <span v-if="pickResult.verified.length">
+                ✓ Engine list ready — {{ pickResult.verified.length }} proven engine(s) added.
+                Scroll down and press ⚡ Auto-build to create your links.
+              </span>
+              <span v-else>
+                ⚠ Nothing verified this round — widen the sample (per family / max total) and Auto-pick again.
+              </span>
+            </div>
+            <p class="muted" style="margin:8px 0 0;font-size:12px">{{ pickResult.note }}</p>
+          </div>
+        </div>
+        <!-- T6 · the auto UX — THE way to build backlinks -->
+        <div class="card" style="margin-top:12px;border:1.5px solid rgba(16,185,129,0.7);background:linear-gradient(180deg,rgba(16,185,129,0.07),rgba(16,185,129,0.02))">
+          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+            <div>
+              <strong>⚡ Auto-build backlinks — the system picks the engines</strong>
+              <p class="muted" style="margin:3px 0 0;max-width:62vw">
+                No engine selection: we rank this project's engines by
+                real-world health (proven successes first, captcha walls
+                last) and try them — first link created wins, then we stop.
+                Watch it happen live in the log below.
+              </p>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <label class="muted" style="display:flex;gap:6px;align-items:center">
+                links
+                <select v-model.number="autoLinks" style="width:76px">
+                  <option :value="1">1</option>
+                  <option :value="2">2</option>
+                  <option :value="5">5</option>
+                  <option :value="10">10</option>
+                </select>
+              </label>
+              <label class="muted" style="display:flex;gap:6px;align-items:center">
+                try up to
+                <select v-model.number="autoEngines" style="width:76px">
+                  <option :value="3">3</option>
+                  <option :value="5">5</option>
+                  <option :value="8">8</option>
+                  <option :value="12">12</option>
+                </select>
+              </label>
+              <button
+                class="primary"
+                style="padding:10px 20px;font-weight:700"
+                :disabled="autoBusy"
+                @click="runAuto"
+                title="rank engines by health, try them until a link is created"
+              >
+                {{ autoBusy ? 'Building… (watch the log)' : '⚡ Auto-build' }}
+              </button>
+            </div>
+          </div>
+          <div v-if="autoMsg" style="margin-top:10px" class="muted" :style="autoFail ? 'color:#f87171' : 'color:#86efac'">
+            {{ autoMsg }}
+          </div>
+        </div>
+
+        <!-- T6 · live run log (SSE + DB catch-up) -->
+        <div class="card" style="margin-top:12px;padding:0;overflow:hidden">
+          <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--border)">
+            <span
+              :style="liveConnected ? 'width:9px;height:9px;border-radius:50%;background:#22c55e;display:inline-block' : 'width:9px;height:9px;border-radius:50%;background:#f59e0b;display:inline-block'"
+              :title="liveConnected ? 'live' : 'reconnecting…'"
+            ></span>
+            <strong style="font-size:13px">Live run log</strong>
+            <span class="muted" style="font-size:12px">
+              {{ liveEvents.length }} event(s) · streams in real time
+            </span>
+            <span style="margin-left:auto;display:flex;gap:8px">
+              <button
+                class="muted"
+                :disabled="captchaBusy"
+                @click="checkCaptcha"
+                title="verify the configured captcha solver account"
+              >
+                {{ captchaBusy ? 'Checking…' : '🛡 check captcha solver' }}
+              </button>
+              <button
+                class="muted"
+                :disabled="testAllBusy"
+                @click="testAllEngines"
+                title="dry-run every engine and report which create a link"
+              >
+                {{ testAllBusy ? 'Testing…' : '🧪 test all engines' }}
+              </button>
+              <button class="muted" @click="liveEvents = []">clear</button>
+              <button class="muted" @click="liveLogOpen = !liveLogOpen">
+                {{ liveLogOpen ? 'hide' : 'show' }}
+              </button>
+            </span>
+          </div>
+          <div
+            v-if="liveLogOpen"
+            style="height:190px;overflow:auto;padding:10px 14px;background:#0b0f14;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.55"
+          >
+            <div v-if="!liveEvents.length" class="muted" style="padding:6px 0">
+              idle — press ⚡ Auto-build and watch every step appear here as it happens
+            </div>
+            <div v-for="ev in liveEvents" :key="ev.id" style="white-space:pre-wrap">
+              <span class="muted">{{ new Date(ev.ts).toLocaleTimeString() }}</span>
+              <span :class="levelClass(ev.level)" style="font-weight:700">
+                {{ ev.level.toUpperCase().padEnd(7) }}
+              </span>
+              <span v-if="ev.engine" style="color:#7dd3fc">[{{ ev.engine }}]</span>
+              <span :style="ev.level === 'error' ? 'color:#fca5a5' : ev.level === 'success' ? 'color:#86efac' : ev.level === 'captcha' ? 'color:#fcd34d' : ''">
+                {{ ev.message }}
+              </span>
+              <div style="height:2px"></div>
+            </div>
+          </div>
+          <div v-if="testAllMsg" style="padding:8px 14px" class="muted" :style="testAllMsg.kind === 'err' ? 'color:#fca5a5' : ''">{{ testAllMsg.text }}</div>
+          <div v-if="captchaMsg" style="padding:0 14px 8px" class="muted" :style="captchaMsg.kind === 'err' ? 'color:#fca5a5' : ''">{{ captchaMsg.text }}</div>
+        </div>
 
       <!-- Engines -->
       <div v-if="tab === 'engines'">
@@ -1257,111 +1512,7 @@ function cls(status: string) {
             </div>
           </div>
         </div>
-        <div style="height:12px"></div>
-        <div style="height:12px"></div>
-        <!-- T6 · the auto UX — THE way to build backlinks -->
-        <div class="card" style="margin-top:12px;border:1.5px solid rgba(16,185,129,0.7);background:linear-gradient(180deg,rgba(16,185,129,0.07),rgba(16,185,129,0.02))">
-          <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
-            <div>
-              <strong>⚡ Auto-build backlinks — the system picks the engines</strong>
-              <p class="muted" style="margin:3px 0 0;max-width:62vw">
-                No engine selection: we rank this project's engines by
-                real-world health (proven successes first, captcha walls
-                last) and try them — first link created wins, then we stop.
-                Watch it happen live in the log below.
-              </p>
-            </div>
-            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-              <label class="muted" style="display:flex;gap:6px;align-items:center">
-                links
-                <select v-model.number="autoLinks" style="width:76px">
-                  <option :value="1">1</option>
-                  <option :value="2">2</option>
-                  <option :value="5">5</option>
-                  <option :value="10">10</option>
-                </select>
-              </label>
-              <label class="muted" style="display:flex;gap:6px;align-items:center">
-                try up to
-                <select v-model.number="autoEngines" style="width:76px">
-                  <option :value="3">3</option>
-                  <option :value="5">5</option>
-                  <option :value="8">8</option>
-                  <option :value="12">12</option>
-                </select>
-              </label>
-              <button
-                class="primary"
-                style="padding:10px 20px;font-weight:700"
-                :disabled="autoBusy"
-                @click="runAuto"
-                title="rank engines by health, try them until a link is created"
-              >
-                {{ autoBusy ? 'Building… (watch the log)' : '⚡ Auto-build' }}
-              </button>
-            </div>
-          </div>
-          <div v-if="autoMsg" style="margin-top:10px" class="muted" :style="autoFail ? 'color:#f87171' : 'color:#86efac'">
-            {{ autoMsg }}
-          </div>
-        </div>
 
-        <!-- T6 · live run log (SSE + DB catch-up) -->
-        <div class="card" style="margin-top:12px;padding:0;overflow:hidden">
-          <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--border)">
-            <span
-              :style="liveConnected ? 'width:9px;height:9px;border-radius:50%;background:#22c55e;display:inline-block' : 'width:9px;height:9px;border-radius:50%;background:#f59e0b;display:inline-block'"
-              :title="liveConnected ? 'live' : 'reconnecting…'"
-            ></span>
-            <strong style="font-size:13px">Live run log</strong>
-            <span class="muted" style="font-size:12px">
-              {{ liveEvents.length }} event(s) · streams in real time
-            </span>
-            <span style="margin-left:auto;display:flex;gap:8px">
-              <button
-                class="muted"
-                :disabled="captchaBusy"
-                @click="checkCaptcha"
-                title="verify the configured captcha solver account"
-              >
-                {{ captchaBusy ? 'Checking…' : '🛡 check captcha solver' }}
-              </button>
-              <button
-                class="muted"
-                :disabled="testAllBusy"
-                @click="testAllEngines"
-                title="dry-run every engine and report which create a link"
-              >
-                {{ testAllBusy ? 'Testing…' : '🧪 test all engines' }}
-              </button>
-              <button class="muted" @click="liveEvents = []">clear</button>
-              <button class="muted" @click="liveLogOpen = !liveLogOpen">
-                {{ liveLogOpen ? 'hide' : 'show' }}
-              </button>
-            </span>
-          </div>
-          <div
-            v-if="liveLogOpen"
-            style="height:190px;overflow:auto;padding:10px 14px;background:#0b0f14;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.55"
-          >
-            <div v-if="!liveEvents.length" class="muted" style="padding:6px 0">
-              idle — press ⚡ Auto-build and watch every step appear here as it happens
-            </div>
-            <div v-for="ev in liveEvents" :key="ev.id" style="white-space:pre-wrap">
-              <span class="muted">{{ new Date(ev.ts).toLocaleTimeString() }}</span>
-              <span :class="levelClass(ev.level)" style="font-weight:700">
-                {{ ev.level.toUpperCase().padEnd(7) }}
-              </span>
-              <span v-if="ev.engine" style="color:#7dd3fc">[{{ ev.engine }}]</span>
-              <span :style="ev.level === 'error' ? 'color:#fca5a5' : ev.level === 'success' ? 'color:#86efac' : ev.level === 'captcha' ? 'color:#fcd34d' : ''">
-                {{ ev.message }}
-              </span>
-              <div style="height:2px"></div>
-            </div>
-          </div>
-          <div v-if="testAllMsg" style="padding:8px 14px" class="muted" :style="testAllMsg.kind === 'err' ? 'color:#fca5a5' : ''">{{ testAllMsg.text }}</div>
-          <div v-if="captchaMsg" style="padding:0 14px 8px" class="muted" :style="captchaMsg.kind === 'err' ? 'color:#fca5a5' : ''">{{ captchaMsg.text }}</div>
-        </div>
 
         <div class="card" style="margin-top:12px;border:1.5px solid rgba(64,192,166,0.6)">
           <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">

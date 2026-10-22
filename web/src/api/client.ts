@@ -181,6 +181,25 @@ export interface CaptchaTestResult {
   detail: string
   probes: CaptchaProbe[]
 }
+// — T7 · auto-pick: step 1 of the flow — the system builds the engine list —
+export interface AutoPickEngine {
+  engine: string
+  family: string
+  url?: string | null
+  reason?: string | null
+  verified?: boolean
+}
+export interface AutoPickResult {
+  considered: number
+  sample_limit?: number
+  per_family?: number
+  max_total?: number
+  sampled: number
+  tested: number
+  verified: AutoPickEngine[]
+  failed: AutoPickEngine[]
+  note: string
+}
 
 // ── F#17 · scheduled runs (cron) ──
 // Mirrors `Schedule` in crates/db/src/model.rs. Datetimes serialize as
@@ -506,6 +525,18 @@ export const api = {
   /** Verify the configured captcha solver account (balance / key check). */
   captchaTest: () =>
     req<CaptchaTestResult>('/api/captcha/test', { method: 'POST' }),
+  /** T7 · auto-pick: the SYSTEM scores the whole catalog, samples the top
+   *  per-engine-family, and — with test:true — live-verify by dry-run,
+   *  adding only engines that prove they can create a link. This is
+   *  step 1 of the flow (build the engine list); run-auto is step 2. */
+  projectAutoPick: (
+    id: string,
+    o: { test?: boolean; per_family?: number; max_total?: number } = {},
+  ) =>
+    req<AutoPickResult>(`/api/projects/${id}/auto-pick`, {
+      method: 'POST',
+      body: JSON.stringify(o),
+    }),
   emailGet: () => req<EmailSetting>('/api/settings/email'),
   emailSet: (s: { address: string; password: string }) =>
     req<{ status: string }>('/api/settings/email', {
