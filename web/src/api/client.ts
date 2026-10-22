@@ -289,6 +289,74 @@ export interface Dashboard {
   projects: ProjectStat[]
 }
 
+// ── T10 · background multi-project runs ──
+// POST /run and /run-auto are now NON-BLOCKING: they spawn the pool in the
+// background and return 202 with a run id immediately. The client then polls
+// /run-status (and streams /events/live) to see progress at any point in time.
+export interface RunAccepted {
+  run_id: string
+  status: string                 // "running"
+  background: boolean            // true (always for T10)
+  project_id: string
+  links_target?: number
+  engines?: number
+  enqueued_jobs?: number
+  engines_tried_order?: string[]
+  active_runs?: number
+  capacity?: number
+}
+export interface RunStatusRejections {
+  target?: number
+  cooling?: number
+  in_flight_cap?: number
+  quota?: number
+}
+export interface RunStatusEngine {
+  engine: string
+  links: number
+  admitted?: number
+  rate_hits?: number
+  cool_remaining_secs?: number | null
+}
+export interface RunStatusActive {
+  run_id: string
+  project_id: string
+  status: string                 // running | finishing
+  started_at: string
+  links_target: number
+  links_created: number
+  reached_target: boolean
+  in_flight?: number
+  cooling_down?: number
+  rejections?: RunStatusRejections
+  engines_json?: RunStatusEngine[]
+}
+export interface RunStatusLast {
+  run_id: string
+  finished_at: string
+  status: string
+  summary: Record<string, unknown>
+}
+export interface RunStatus {
+  project_id: string
+  active: RunStatusActive | null
+  jobs: Record<string, number>
+  last_run: RunStatusLast | null
+  active_runs_global: number
+  capacity: number
+}
+export interface RunCancelResult {
+  project_id: string
+  force_stop_requested: boolean
+  pending_cancelled: number
+  active: RunStatusActive | null
+}
+export interface GlobalRuns {
+  active_runs: number
+  capacity: number
+  runs: Array<RunStatusActive>
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
@@ -501,15 +569,25 @@ export const api = {
   scheduleRunNow: (id: string) => req<RunSummary & { status?: string; reason?: string }>(`/api/schedules/${id}/run-now`, { method: 'POST' }),
 
   // — F#12 email-runner glue: run now + operator mailbox + email engine field —
+  // T10: now non-blocking (202 + run id); poll projectRunStatus for progress.
   runProject: (projectId: string) =>
-    req<RunSummary>(`/api/projects/${projectId}/run`, { method: 'POST' }),
+    req<RunAccepted>(`/api/projects/${projectId}/run`, { method: 'POST' }),
+
+  // — T10 · background multi-project run controls —
+  /** Live state of the project's run (active progress + job counts + last run). */
+  projectRunStatus: (id: string) => req<RunStatus>(`/api/projects/${id}/run-status`),
+  /** Cancel the project's active background run (soft: stops admitting + cancels queued). */
+  projectRunCancel: (id: string) =>
+    req<RunCancelResult>(`/api/projects/${id}/run-cancel`, { method: 'POST' }),
+  /** Global "what's running now across all projects" (the operator view). */
+  globalRuns: () => req<GlobalRuns>('/api/runs'),
 
   // — T6 · the auto UX —
   /** Auto-run: the SYSTEM ranks the project's engines by health and
    *  tries them until `links` backlinks are created (first success
    *  soft-stops the rest). No engine picking in the UI. */
   projectRunAuto: (id: string, o?: { engines?: number; links?: number }) =>
-    req<RunSummary & { auto_run: boolean; engines_tried_order: string[]; links_target: number; enqueued_jobs: number }>(
+    req<RunAccepted>(
       `/api/projects/${id}/run-auto`,
       { method: 'POST', body: JSON.stringify(o ?? {}) },
     ),

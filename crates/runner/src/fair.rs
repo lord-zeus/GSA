@@ -139,6 +139,10 @@ pub struct FairState {
     rejected_cool: u32,
     rejected_inflight: u32,
     rejected_quota: u32,
+    // T10 — operator cancel: once set, the leader stops admitting new jobs at
+    // the top of its loop (in-flight/buffered work still drains). Separate from
+    // `target_met()` so "stopped by hand" stays distinguishable in the summary.
+    force_stop: bool,
 }
 
 impl FairState {
@@ -157,6 +161,7 @@ impl FairState {
             rejected_cool: 0,
             rejected_inflight: 0,
             rejected_quota: 0,
+            force_stop: false,
         }
     }
 
@@ -234,6 +239,20 @@ impl FairState {
     /// jobs stay `pending` (resumable) and no new work is admitted.
     pub fn target_met(&self) -> bool {
         self.policy.target == 0 || self.total_links >= self.policy.target
+    }
+
+    /// T10 — operator cancel. `set_force_stop(true)` asks the leader to stop
+    /// admitting new jobs; `force_stop()` reports whether a cancel was requested.
+    pub fn set_force_stop(&mut self, v: bool) {
+        self.force_stop = v;
+    }
+    pub fn force_stop(&self) -> bool {
+        self.force_stop
+    }
+    /// Leader stop condition: cancel requested OR the fair target is met.
+    /// Either one ends the current dispatch pass (in-flight work still drains).
+    pub fn should_stop(&self) -> bool {
+        self.force_stop || self.target_met()
     }
 
     // ── introspection (summary + tests) ─────────────────────────────

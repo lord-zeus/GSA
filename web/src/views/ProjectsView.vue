@@ -13,6 +13,8 @@ import {
   type RunSummary,
   type TestAllResult,
   type AutoPickResult,
+  type RunStatus,
+  type GlobalRuns,
 } from '@/api/client'
 
 // — projects (master list) —
@@ -465,14 +467,14 @@ async function saveUseProxies() {
 async function runNow() {
   if (!selected.value) return
   running.value = true
-  runMsg.value = 'Running queued jobs in-process (web + email engines)… this can take a while'
-  runSummary.value = null
+  runMsg.value = 'Launching a background drain of the queued jobs…'
   try {
-    const s = await api.runProject(selected.value)
-    runSummary.value = s
-    runMsg.value = `Done — claimed ${s.claimed}, completed ${s.done}, failed ${s.failed}, panics ${s.panics}.`
+    const a = await api.runProject(selected.value)
+    runMsg.value =
+      `✓ Started background run ${a.run_id.slice(0, 8)}… — draining queued jobs across ${a.engines ?? 0} engine(s). ` +
+      `Watch it in the LIVE RUN panel at the top; the Jobs + Results tabs refresh live.`
+    startRunPoll()
     await loadJobs()
-    await loadResults()
   } catch (e: any) {
     runMsg.value = 'Run failed: ' + (e?.message || String(e))
   } finally {
@@ -486,7 +488,7 @@ const hasActiveJob = computed(() => jobs.value.some((j) => j.status === 'pending
 const autoBusy = ref(false)
 const autoMsg = ref('')
 const autoFail = ref(false)
-const autoLinks = ref(5)
+const autoLinks = ref(100)
 const autoEngines = ref(5)
 const testAllBusy = ref(false)
 const testAllMsg = ref<{ kind: 'ok' | 'err'; text: string } | null>(null)
@@ -555,18 +557,17 @@ async function runAuto() {
   if (!selected.value) return
   autoBusy.value = true
   autoFail.value = false
-  autoMsg.value = 'System is ranking engines by health and building backlinks… this streams live below.'
+  autoMsg.value = 'System is ranking engines by health and launching a background run…'
   try {
-    const s = await api.projectRunAuto(selected.value, {
-      engines: autoEngines.value,
+    const a = await api.projectRunAuto(selected.value, {
       links: autoLinks.value,
+      engines: autoEngines.value,
     })
     autoMsg.value =
-      `Done — claimed ${s.claimed}, completed ${s.done}, failed ${s.failed}` +
-      (s.enqueued_jobs != null ? `, ${s.enqueued_jobs} jobs enqueued` : '') +
-      (s.engines_tried_order?.length ? ` · tried: ${s.engines_tried_order.join(' → ')}` : '')
-    await loadJobs()
-    await loadResults()
+      `✓ Launched background run ${a.run_id.slice(0, 8)}… — building ${a.links_target ?? autoLinks.value} link(s) across ${a.engines ?? autoEngines.value} engine(s), ${a.enqueued_jobs ?? 0} job(s) queued.` +
+      ` It runs in the background — open other projects, come back anytime and watch the LIVE RUN panel above.` +
+      (a.active_runs != null ? ` · ${a.active_runs}/${a.capacity} global slots busy` : '')
+    startRunPoll()
   } catch (e: any) {
     autoFail.value = true
     autoMsg.value = 'Auto-build: ' + (e?.message || String(e))
@@ -605,6 +606,60 @@ async function testAllEngines() {
 // small helper: true if any engine succeeded (for the ok/err badge)
 function ok_list(t: TestAllResult, winners: string[]): boolean {
   return t.ok > 0 && winners.length > 0
+}
+
+// — T10 · background multi-project runs: live progress · cancel · global view —
+const liveRun = ref<RunStatus | null>(null)
+const globalRuns = ref<GlobalRuns | null>(null)
+const cancelling = ref(false)
+let runPollTimer: ReturnType<typeof setInterval> | null = null
+const active = computed(() => liveRun.value?.active ?? null)
+const liveCreated = computed(() => active.value?.links_created ?? 0)
+const liveTarget = computed(() => active.value?.links_target ?? 0)
+const livePct = computed(() => (liveTarget.value > 0 ? Math.min(100, Math.round((liveCreated.value / liveTarget.value) * 100)) : 0))
+function rejectReasons(): string[] {
+  const r = active.value?.rejections
+  if (!r) return []
+  const out: string[] = []
+  if (r.target) out.push(`${r.target} target-reached`)
+  if (r.cooling) out.push(`${r.cooling} cooling-down`)
+  if (r.in_flight_cap) out.push(`${r.in_flight_cap} in-flight cap`)
+  if (r.quota) out.push(`${r.quota} fair-share quota`)
+  return out
+}
+async function refreshRunStatus() {
+  if (!selected.value) return
+  try { liveRun.value = await api.projectRunStatus(selected.value) } catch { liveRun.value = null }
+}
+async function refreshGlobalRuns() {
+  try { globalRuns.value = await api.globalRuns() } catch { globalRuns.value = null }
+}
+function startRunPoll() {
+  stopRunPoll()
+  refreshRunStatus()
+  refreshGlobalRuns()
+  runPollTimer = setInterval(() => { refreshRunStatus(); refreshGlobalRuns() }, 2500)
+}
+function stopRunPoll() {
+  if (runPollTimer != null) { clearInterval(runPollTimer); runPollTimer = null }
+}
+async function cancelRun() {
+  if (!selected.value) return
+  cancelling.value = true
+  try {
+    const r = await api.projectRunCancel(selected.value)
+    autoFail.value = false
+    autoMsg.value =
+      `⏹ Stopping… force-stop requested` +
+      (r.pending_cancelled ? `, ${r.pending_cancelled} queued job(s) cancelled` : '') +
+      ` — in-flight work drains, then it stops.`
+    startRunPoll()
+  } catch (e: any) {
+    autoFail.value = true
+    autoMsg.value = 'Cancel failed: ' + (e?.message || String(e))
+  } finally {
+    cancelling.value = false
+  }
 }
 
 // — T7 · auto-pick: step 1 — the system scores the catalog, samples,
@@ -714,12 +769,14 @@ async function load() {
       loadUseProxies(selected.value)
       loadPolish(selected.value)
       openLiveLog(selected.value)
+      startRunPoll()
     }
   }
 }
 
 async function selectProject(p: Project) {
   selected.value = p.id
+  liveRun.value = null
   loadEngines()
   loadKeywords()
   loadJobs()
@@ -727,6 +784,7 @@ async function selectProject(p: Project) {
   loadUseProxies(p.id)
   loadPolish(p.id)
   openLiveLog(p.id)
+  startRunPoll()
 }
 
 async function createProject() {
@@ -796,6 +854,7 @@ function onProjectChange() {
   kwNotice.value = ''
   editEngine.value = null
   jobResultsFor.value = null
+  liveRun.value = null
   if (!selected.value) return
   loadEngines()
   loadKeywords()
@@ -804,6 +863,7 @@ function onProjectChange() {
   loadUseProxies(selected.value)
   loadPolish(selected.value)
   if (tab.value === 'options') loadProjectOptions()
+  startRunPoll()
 }
 
 // — options tab (F#19: GSA "Data" tab + "Anchor Text" tab) —
@@ -921,6 +981,7 @@ watch(
 onMounted(load)
 onBeforeUnmount(() => {
   if (pollTimer.value != null) window.clearInterval(pollTimer.value)
+  stopRunPoll()
   closeLiveLog()
 })
 
@@ -1147,11 +1208,14 @@ function cls(status: string) {
             <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
               <label class="muted" style="display:flex;gap:6px;align-items:center">
                 links
-                <select v-model.number="autoLinks" style="width:76px">
-                  <option :value="1">1</option>
-                  <option :value="2">2</option>
-                  <option :value="5">5</option>
+                <select v-model.number="autoLinks" style="width:88px">
                   <option :value="10">10</option>
+                  <option :value="25">25</option>
+                  <option :value="50">50</option>
+                  <option :value="100">100</option>
+                  <option :value="250">250</option>
+                  <option :value="500">500</option>
+                  <option :value="1000">1000</option>
                 </select>
               </label>
               <label class="muted" style="display:flex;gap:6px;align-items:center">
@@ -1176,6 +1240,79 @@ function cls(status: string) {
           </div>
           <div v-if="autoMsg" style="margin-top:10px" class="muted" :style="autoFail ? 'color:#f87171' : 'color:#86efac'">
             {{ autoMsg }}
+          </div>
+        </div>
+
+        <!-- T10 · LIVE RUN — the run's real-time progress, visible at any point, cancellable -->
+        <div class="card" style="margin-top:12px;border:1.5px solid rgba(16,185,129,0.65);background:linear-gradient(180deg,rgba(16,185,129,0.10),rgba(16,185,129,0.02))">
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <span
+              :style="active ? 'width:10px;height:10px;border-radius:50%;background:#22c55e;display:inline-block;box-shadow:0 0 9px #22c55e' : 'width:10px;height:10px;border-radius:50%;background:#475569;display:inline-block'"
+              :title="active ? 'running in the background' : 'idle'"
+            ></span>
+            <div style="flex:1;min-width:240px">
+              <strong>
+                🛰 Live run — <span v-if="active" style="color:#86efac">{{ liveCreated }} / {{ liveTarget }}</span><span v-else style="color:#9aa4b2;font-weight:600">idle</span>
+              </strong>
+              <p class="muted" style="margin:2px 0 0">
+                <span v-if="active">Runs in the background — switch projects, do other work, and come back anytime. Progress + per-engine detail below, refreshed every 2.5s.</span>
+                <span v-else>No active run for this project. Press ⚡ Auto-build to launch one; it stays running even if you navigate away.</span>
+              </p>
+            </div>
+            <div v-if="globalRuns" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+              <span class="muted" style="display:inline-flex;align-items:center;padding:4px 10px;border:1px solid var(--border);border-radius:999px;font-size:12px">
+                🖥 {{ globalRuns.active_runs }}/{{ globalRuns.capacity }} project slots busy
+              </span>
+              <span
+                v-if="globalRuns.runs.some(r => r.project_id !== selected)"
+                style="display:inline-flex;align-items:center;padding:4px 10px;border:1px solid rgba(56,189,248,0.5);border-radius:999px;font-size:12px;color:#7dd3fc"
+                title="Other projects with in-flight runs right now"
+              >
+                ＋{{ globalRuns.runs.filter(r => r.project_id !== selected).length }} other project(s) running
+              </span>
+            </div>
+            <button
+              v-if="active"
+              :disabled="cancelling"
+              style="padding:9px 18px;font-weight:700;background:rgba(239,68,68,0.14);border:1.5px solid rgba(239,68,68,0.55);color:#fca5a5;border-radius:9px;cursor:pointer"
+              @click="cancelRun"
+              title="Soft stop: stops admitting new work and cancels queued jobs; in-flight work drains shortly"
+            >
+              {{ cancelling ? 'Stopping…' : '⏹ Cancel run' }}
+            </button>
+          </div>
+
+          <div v-if="active" style="margin-top:12px;height:12px;border-radius:999px;background:rgba(255,255,255,0.08);overflow:hidden">
+            <div style="height:100%;border-radius:999px;background:linear-gradient(90deg,#16a34a,#4ade80);transition:width .5s" :style="'width:' + livePct + '%'"></div>
+          </div>
+          <div v-if="active" style="margin-top:7px;display:flex;gap:15px;flex-wrap:wrap;font-size:12.5px;align-items:center">
+            <span class="muted">target {{ liveTarget }}</span>
+            <span style="color:#86efac;font-weight:700">{{ liveCreated }} created</span>
+            <span class="muted">{{ active.in_flight ?? 0 }} in-flight</span>
+            <span class="muted">{{ active.cooling_down ?? 0 }} cooling</span>
+            <span v-if="rejectReasons().length" style="color:#fcd34d">rejected {{ rejectReasons().join(' · ') }}</span>
+          </div>
+
+          <div v-if="active && active.engines_json && active.engines_json.length" style="margin-top:10px;max-height:190px;overflow:auto;border:1px solid var(--border);border-radius:8px">
+            <table class="table" style="margin:0">
+              <thead>
+                <tr><th>Engine</th><th>Links</th><th>Admitted</th><th>Rate hits</th><th>Cool</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="e in active.engines_json" :key="'er' + e.engine">
+                  <td style="white-space:nowrap">{{ e.engine }}</td>
+                  <td style="font-weight:700;color:#86efac">{{ e.links }}</td>
+                  <td class="muted">{{ e.admitted ?? 0 }}</td>
+                  <td class="muted">{{ e.rate_hits ?? 0 }}</td>
+                  <td class="muted">{{ e.cool_remaining_secs ? (e.cool_remaining_secs + 's') : '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div v-if="liveRun && liveRun.last_run" style="margin-top:10px;font-size:12.5px" class="muted">
+            Previous run: {{ liveRun.last_run.status }} @ {{ fmt(liveRun.last_run.finished_at) }}
+            {{ liveRun.last_run.summary.links_created != null ? ('— ' + liveRun.last_run.summary.links_created + ' link(s) created') : '' }}.
           </div>
         </div>
 

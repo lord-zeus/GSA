@@ -42,6 +42,8 @@ pub mod livebus;
 pub mod notifier;
 /// T6 — live run feed (job_events rows + SSE run bus + runner sink).
 pub mod runfeed;
+/// T10 — background multi-project run tracking (active runs + last summary).
+pub mod runtrack;
 
 use axum::routing::{delete, get, patch, post, put};
 
@@ -74,7 +76,8 @@ pub struct AppState {
 
     /// T6 — live run-event bus (the project console streams from here).
     pub run_bus: crate::runfeed::RunBus,
-
+    /// T10 — background run registry (one active per project + last summary).
+    pub runs: crate::runtrack::RunTracker,
 }
 
 
@@ -87,6 +90,13 @@ pub async fn app_state(dsn: Option<&str>) -> anyhow::Result<Arc<AppState>> {
         pool,
         bus: crate::livebus::LiveBus::new(),
         run_bus: crate::runfeed::RunBus::new(),
+        runs: {
+            let cap: usize = std::env::var("SEER_MAX_ACTIVE_RUNS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8);
+            crate::runtrack::RunTracker::new(cap)
+        },
     }))
 
 }
@@ -1956,13 +1966,185 @@ pub async fn run_project_pool(
 
 
 
-/// HTTP handler — thin wrapper over `run_project_pool` returning JSON.
+/// T10 — background multi-project run dispatcher.
+///
+/// Spawns the pool as a detached tokio task (survives the HTTP request
+/// finishing and the browser navigating away), registers it in the run
+/// tracker (which enforces *one active run per project* and a *global cap*),
+/// and immediately returns the run id so the client gets 202 and polls
+/// `/run-status` + the SSE feed for progress.  Multiple projects dispatch in
+/// parallel; the process-wide cap is the only cross-project throttle.
+async fn dispatch_background(
+    state: &Arc<AppState>,
+    project_id: Uuid,
+    links_target: usize,
+    engines_count: usize,
+    auto: bool,
+    pause_override: Option<usize>,
+    fair: Option<Arc<std::sync::Mutex<runner::FairState>>>,
+    enqueued_jobs: usize,
+    order_names: Vec<String>,
+) -> Result<Uuid, crate::runtrack::BeginErr> {
+    let run_id = Uuid::new_v4();
+    let st = Arc::clone(state);
+    let fair_task = fair.clone();
+    let names = order_names;
+    let enq = enqueued_jobs;
 
+    let task = tokio::spawn(async move {
+        let outcome =
+            run_project_pool(project_id, &st, pause_override, fair_task.clone()).await;
+        let (status, payload) = match outcome {
+            Ok(mut s) => {
+                if fair_task.is_some() {
+                    let r = fair_task.as_ref().unwrap().lock().unwrap();
+                    let engines_json: Vec<serde_json::Value> = r
+                        .snapshot(std::time::Instant::now())
+                        .into_iter()
+                        .map(|ss| {
+                            serde_json::json!({
+                                "engine": ss.engine,
+                                "links": ss.links,
+                                "admitted": ss.admitted,
+                                "rate_hits": ss.rate_hits,
+                                "cool_remaining_secs": ss.cool_remaining.map(|d| d.as_secs()),
+                            })
+                        })
+                        .collect();
+                    let (rj_target, rj_cool, rj_inflight, rj_quota) = r.rejections();
+                    let created = r.total_links();
+                    let target = r.policy().target;
+                    if let Some(obj) = s.as_object_mut() {
+                        obj.insert("auto_run".to_string(), serde_json::json!(true));
+                        obj.insert("fair_share".to_string(), serde_json::json!(true));
+                        obj.insert("engines_tried_order".to_string(), serde_json::json!(names));
+                        obj.insert("links_target".to_string(), serde_json::json!(target));
+                        obj.insert("enqueued_jobs".to_string(), serde_json::json!(enq));
+                        obj.insert(
+                            "links_created".to_string(),
+                            serde_json::json!(created),
+                        );
+                        if created < 1 {
+                            obj.insert(
+                                "links_created_note".to_string(),
+                                serde_json::json!("created counts finished engine jobs; slow engines add more as they complete"),
+                            );
+                        }
+                        obj.insert(
+                            "fair".to_string(),
+                            serde_json::json!({
+                                "target": target,
+                                "links_created": created,
+                                "reached_target": created >= target,
+                                "cancelled": r.force_stop(),
+                                "engines": engines_json,
+                                "rejections": {
+                                    "target": rj_target,
+                                    "cooling": rj_cool,
+                                    "in_flight_cap": rj_inflight,
+                                    "quota": rj_quota
+                                }
+                            }),
+                        );
+                    }
+                }
+                ("ok".to_string(), s)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                use runner::EventSink as _;
+                let sink = crate::runfeed::RunEventSink::new(
+                    project_id,
+                    st.pool.clone(),
+                    st.run_bus.sender(),
+                );
+                sink.record(runner::RunEvent {
+                    job_id: None,
+                    engine: None,
+                    level: "error".into(),
+                    message: format!("run started in background but failed to initialise: {msg}"),
+                });
+                ("error".to_string(), serde_json::json!({ "error": msg }))
+            }
+        };
+        st.runs.finalize(
+            project_id,
+            run_id,
+            crate::runtrack::RunSummary {
+                run_id,
+                finished_at: chrono::DateTime::from(chrono::Utc::now()),
+                status,
+                payload,
+            },
+        );
+    });
+
+    let ar = crate::runtrack::ActiveRun {
+        run_id,
+        project_id,
+        started_at: chrono::DateTime::from(chrono::Utc::now()),
+        links_target,
+        engines: engines_count,
+        auto,
+        fair,
+        task,
+    };
+    state
+        .runs
+        .begin(ar)
+        .map(|()| run_id)
+}
+
+/// T10 — map a [`crate::runtrack::BeginErr`] to an HTTP response
+/// (409 same-project already running; 429 global cap reached).
+fn begin_err_response(
+    beg: crate::runtrack::BeginErr,
+    state: &Arc<AppState>,
+    project_id: Uuid,
+) -> Response {
+    match beg {
+        crate::runtrack::BeginErr::AlreadyRunning => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "a run is already in progress for this project",
+                "project_id": project_id.to_string(),
+                "active": state.runs.active_status(project_id),
+                "hint": "poll GET /api/projects/{id}/run-status, or POST …/run-cancel to stop it",
+            })),
+        )
+            .into_response(),
+        crate::runtrack::BeginErr::CapReached => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": format!("process-wide cap of {} active runs reached; wait for one to finish", state.runs.capacity()),
+                "capacity": state.runs.capacity(),
+                "active_runs": state.runs.all_active(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+
+/// T10 — run a project's pending job queue in the BACKGROUND (202 + run id).
+/// Progress: `GET …/run-status`; logs: `GET …/events/live` (SSE).  A second
+/// start of the same project is rejected while one is active (409).
 async fn run_project(State(state): State<Arc<AppState>>, Path(project_id): Path<Uuid>) -> Response {
-
-    match run_project_pool(project_id, &state, None, None).await {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => error_response(e),
+    match dispatch_background(&state, project_id, 0, 0, false, None, None, 0, Vec::new()).await {
+        Ok(run_id) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "run_id": run_id,
+                "status": "running",
+                "background": true,
+                "project_id": project_id.to_string(),
+                "links_target": 0,
+                "active_runs": state.runs.active_count(),
+                "capacity": state.runs.capacity(),
+            })),
+        )
+            .into_response(),
+        Err(beg) => begin_err_response(beg, &state, project_id),
     }
 }
 
@@ -2218,22 +2400,153 @@ struct RunAutoBody {
     links: Option<usize>,
 }
 
+/// T10 — fair-share auto-run in the BACKGROUND (202 + run id).
 async fn run_auto(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<Uuid>,
     Json(body): Json<RunAutoBody>,
 ) -> Response {
-    match run_auto_pool(project_id, &state, body).await {
-        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => error_response(e),
+    let pre = match run_auto_prepare(project_id, &state, body).await {
+        Ok(p) => p,
+        Err(e) => return error_response(e),
+    };
+    match dispatch_background(
+        &state,
+        project_id,
+        pre.links_target,
+        pre.engines,
+        true,
+        Some(0),
+        Some(pre.fair),
+        pre.enqueued,
+        pre.order_names,
+    )
+    .await
+    {
+        Ok(run_id) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "run_id": run_id,
+                "status": "running",
+                "background": true,
+                "project_id": project_id.to_string(),
+                "links_target": pre.links_target,
+                "engines": pre.engines,
+                "enqueued_jobs": pre.enqueued,
+                "active_runs": state.runs.active_count(),
+                "capacity": state.runs.capacity(),
+            })),
+        )
+            .into_response(),
+        Err(beg) => begin_err_response(beg, &state, project_id),
     }
 }
 
-async fn run_auto_pool(
+/// T10 — live run status for a project (the dashboard's source of truth).
+/// `active`  = the in-flight run (live fair progress + started_at), if any.
+/// `jobs`    = per-status job counts straight from the DB (always current).
+/// `last_run` = the most recent finished run summary (persisted alongside).
+async fn project_run_status(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+) -> Response {
+    let repo = Repo::new(state.pool.clone());
+    if repo.project_by_id(project_id).await.ok().flatten().is_none() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "not found" })))
+            .into_response();
+    }
+    let counts = repo
+        .job_status_counts_for_project(project_id)
+        .await
+        .unwrap_or_default();
+    let mut jobs = serde_json::Map::new();
+    for (st, n) in counts {
+        jobs.insert(st, serde_json::json!(n));
+    }
+    let active = state.runs.active_status(project_id);
+    let last = state
+        .runs
+        .latest(project_id)
+        .map(|s| {
+            serde_json::json!({
+                "run_id": s.run_id,
+                "finished_at": s.finished_at.to_rfc3339(),
+                "status": s.status,
+                "summary": s.payload,
+            })
+        });
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "project_id": project_id.to_string(),
+            "active": active,
+            "jobs": jobs,
+            "last_run": last,
+            "active_runs_global": state.runs.active_count(),
+            "capacity": state.runs.capacity(),
+        })),
+    )
+        .into_response()
+}
+
+/// T10 — cancel a project's active background run (soft).
+/// Stops admitting new jobs (fair `force_stop`) and flips the still-queued
+/// `pending` jobs to `cancelled`; already-claimed jobs finish their attempt.
+async fn project_run_cancel(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<Uuid>,
+) -> Response {
+    let repo = Repo::new(state.pool.clone());
+    let had_fair = if let Some(fair) = state.runs.fair_of(project_id) {
+        fair.lock().unwrap().set_force_stop(true);
+        true
+    } else {
+        false
+    };
+    let cancelled = repo.cancel_pending_jobs(project_id).await.unwrap_or(0);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "project_id": project_id.to_string(),
+            "force_stop_requested": had_fair,
+            "pending_cancelled": cancelled,
+            "active": state.runs.active_status(project_id),
+        })),
+    )
+        .into_response()
+}
+
+/// T10 — the global "what's running now" view across ALL projects (the
+/// operator's cross-project dashboard). Lists every in-flight run live.
+async fn global_runs(State(state): State<Arc<AppState>>) -> Response {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "active_runs": state.runs.active_count(),
+            "capacity": state.runs.capacity(),
+            "runs": state.runs.all_active(),
+        })),
+    )
+        .into_response()
+}
+
+struct RunAutoReady {
+    links_target: usize,
+    engines: usize,
+    enqueued: usize,
+    order_names: Vec<String>,
+    fair: std::sync::Arc<std::sync::Mutex<runner::FairState>>,
+}
+
+/// T10 — validate, rank engines, banner, provision the job queue, and build
+/// the fair-share controller — but do NOT execute.  The handler then hands
+/// this to `dispatch_background`, which runs it detached.  The execution +
+/// fair summary now happen inside that background task.
+async fn run_auto_prepare(
     project_id: Uuid,
     state: &Arc<AppState>,
     body: RunAutoBody,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<RunAutoReady> {
     let repo = Repo::new(state.pool.clone());
 
     // 1) Sanity: there must be engines + keywords to drive.
@@ -2319,46 +2632,13 @@ async fn run_auto_pool(
     let fair = std::sync::Arc::new(std::sync::Mutex::new(
         runner::FairState::new(policy, picked.iter().map(|e| e.id)),
     ));
-    let fair_read = std::sync::Arc::clone(&fair);
-    let mut result = run_project_pool(project_id, state, Some(0), Some(fair)).await?;
-    if let Some(obj) = result.as_object_mut() {
-        obj.insert("auto_run".to_string(), serde_json::json!(true));
-        obj.insert("fair_share".to_string(), serde_json::json!(true));
-        obj.insert("engines_tried_order".to_string(), serde_json::json!(order_names));
-        obj.insert("links_target".to_string(), serde_json::json!(links_target));
-        obj.insert("enqueued_jobs".to_string(), serde_json::json!(enqueued));
-        let st = fair_read.lock().unwrap();
-        let (rj_target, rj_cool, rj_inflight, rj_quota) = st.rejections();
-        let engines_json: Vec<serde_json::Value> = st
-            .snapshot(std::time::Instant::now())
-            .into_iter()
-            .map(|s| {
-                serde_json::json!({
-                    "engine": s.engine,
-                    "links": s.links,
-                    "admitted": s.admitted,
-                    "rate_hits": s.rate_hits,
-                    "cool_remaining_secs": s.cool_remaining.map(|d| d.as_secs()),
-                })
-            })
-            .collect();
-        obj.insert(
-            "fair".to_string(),
-            serde_json::json!({
-                "target": links_target,
-                "links_created": st.total_links(),
-                "reached_target": st.total_links() >= links_target,
-                "engines": engines_json,
-                "rejections": {
-                    "target": rj_target,
-                    "cooling": rj_cool,
-                    "in_flight_cap": rj_inflight,
-                    "quota": rj_quota
-                },
-            }),
-        );
-    }
-    Ok(result)
+    Ok(RunAutoReady {
+        links_target,
+        engines: picked.len(),
+        enqueued,
+        order_names,
+        fair,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -3914,6 +4194,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         // solver health.
         .route("/api/projects/{id}/run-auto", post(run_auto))
         .route("/api/projects/{id}/auto-pick", post(auto_pick))
+        .route("/api/projects/{id}/run-status", get(project_run_status))
+        .route("/api/projects/{id}/run-cancel", post(project_run_cancel))
         .route("/api/projects/{id}/events", get(project_events))
         .route("/api/projects/{id}/events/live", get(project_events_live))
         .route("/api/projects/{id}/test-all", post(test_all_engines))
@@ -3952,6 +4234,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/notifications/{id}/read", put(mark_notification_read_api).post(mark_notification_read_api))
         .route("/api/notifications/read-all", put(mark_all_read_api).post(mark_all_read_api))
         .route("/api/notifications/live", get(notifications_sse))
+        .route("/api/runs", get(global_runs))
 
         .route("/api/settings/export", get(export_settings_bundle))
 

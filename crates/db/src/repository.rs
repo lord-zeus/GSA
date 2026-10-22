@@ -732,6 +732,43 @@ impl Repo {
             .collect::<Result<_, _>>()?)
     }
 
+    // ── T10 — background run control ────────────────────────────────────
+    /// Cancel every `pending` job on this project in one round-trip. The
+    /// pool leader sees an empty pending queue on its next pass and drains;
+    /// already-claimed (running) jobs finish. Returns the number flipped.
+    pub async fn cancel_pending_jobs(&self, project_id: Uuid) -> anyhow::Result<u32> {
+        let rows = sqlx::query(
+            "UPDATE jobs SET status = 'cancelled', finished_at = now()
+             WHERE project_id = $1 AND status = 'pending'",
+        )
+        .bind(project_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(rows.rows_affected() as u32)
+    }
+
+    /// Per-status job counts for one project (the run dashboard tail).
+    pub async fn job_status_counts_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT status, COUNT(*)::bigint FROM jobs WHERE project_id = $1 GROUP BY status",
+        )
+        .bind(project_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                Some((
+                    r.try_get::<String, _>(0).ok()?,
+                    r.try_get::<i64, _>(1).ok()?,
+                ))
+            })
+            .collect())
+    }
+
     // ── T6 — live run feed (job_events) + engine health ──────────────────
     /// Append one row to the project's live log. `level` is one of
     /// info|engine|step|captcha|success|error|auto. `job_id` may be None

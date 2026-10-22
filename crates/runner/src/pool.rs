@@ -216,11 +216,13 @@ impl WorkerPool {
                 // no new work is admitted — the run has reached the requested
                 // link count, so the leader drains the in-flight and exits.
                 if let Some(fair) = self.fair.as_ref() {
-                    if fair.lock().unwrap().target_met() {
-                        let links = fair.lock().unwrap().total_links();
+                    let st = fair.lock().unwrap();
+                    if st.should_stop() {
+                        let links = st.total_links();
+                        let why = if st.force_stop() { "cancelled by operator" } else { "fair target met" };
                         if dispatched > 0 {
                             eprintln!(
-                                "runner: fair target met ({links} links); {dispatched} dispatched this run; remaining jobs stay queued"
+                                "runner: {why} ({links} links); {dispatched} dispatched this run; remaining jobs stay queued"
                             );
                         }
                         break;
