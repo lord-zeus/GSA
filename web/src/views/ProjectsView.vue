@@ -667,8 +667,8 @@ async function cancelRun() {
 const pickBusy = ref(false)
 const pickErr = ref('')
 const pickTest = ref(true) // live dry-run verification ON by default
-const pickPerFamily = ref(4)
-const pickMaxTotal = ref(12)
+const pickPerFamily = ref(12)
+const pickMaxTotal = ref(60)
 const pickResult = ref<AutoPickResult | null>(null)
 
 async function autoPick() {
@@ -1108,6 +1108,7 @@ function cls(status: string) {
                   <option :value="2">2</option>
                   <option :value="4">4</option>
                   <option :value="8">8</option>
+                  <option :value="12">12</option>
                 </select>
               </label>
               <label class="muted" style="display:flex;gap:6px;align-items:center" title="cap on total engines sampled">
@@ -1116,6 +1117,8 @@ function cls(status: string) {
                   <option :value="6">6</option>
                   <option :value="12">12</option>
                   <option :value="24">24</option>
+                  <option :value="48">48</option>
+                  <option :value="60">60</option>
                 </select>
               </label>
               <button
