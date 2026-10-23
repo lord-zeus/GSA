@@ -338,14 +338,25 @@ fn lookup_builtin(
     //    (e.g. `%random-0.1-0.9%`) by producing a scaled integer string; GSA
     //    keeps the same number of decimals as in the range bounds on emit.
     if let Some(rest) = n.strip_prefix("random-") {
-        let (lo, hi, dec) = parse_range(rest)?;
+        let (mut lo, mut hi, dec) = parse_range(rest)?;
         // Generate an integer in [lo, hi]; then format with `dec` decimals if
         // the original bound had a decimal point.
-        let span = hi.wrapping_sub(lo);
+        // GSA INIs contain reversed ranges (e.g. `%random-1000000-999999%`
+        // in `Wordpress Article.ini`, `Discuz.ini`, `WeBid.ini`): normalize to
+        // [min, max] — the old wrap-around math overflowed on those (panic in
+        // debug, silent garbage in release).
+        if hi < lo {
+            std::mem::swap(&mut lo, &mut hi);
+        }
+        let span = hi - lo;
         let v: u64 = if span == 0 {
             lo
         } else {
-            lo + rng.range((span + 1) as usize) as u64
+            let range = span
+                .saturating_add(1)
+                .min(usize::MAX as u64)
+                .max(1) as usize;
+            lo.wrapping_add(rng.range(range) as u64)
         };
         if dec == 0 {
             return Some(v.to_string());
@@ -714,6 +725,36 @@ mod tests {
             })
             .collect();
         assert!(seen.len() >= 5, "too few distinct values: {seen:?}");
+    }
+
+    #[test]
+    fn reversed_random_range_is_normalized_not_panicking() {
+        // Regression: GSA INIs ship reversed ranges (e.g. `Wordpress Article.ini`
+        // `%random-1000000-999999%`, `Discuz.ini` `%random-100000000-99999999%`).
+        // Old code: `hi.wrapping_sub(lo)` → span = u64::MAX → `(span + 1)`
+        // overflowed — panic in debug (dropped the whole in-flight request),
+        // silent garbage in release.  Now normalized to [min, max].
+        let lo = 999_999u64;
+        let hi = 1_000_000u64;
+        for s in 0..40u64 {
+            let v: u64 = SpintaxResolver::new(s)
+                .resolve("%random-1000000-999999%", &ctx())
+                .parse()
+                .unwrap();
+            assert!((lo..=hi).contains(&v), "out of [lo,hi]: {v}");
+        }
+        for s in 0..40u64 {
+            let v: u64 = SpintaxResolver::new(s)
+                .resolve("%random-100000000-99999999%", &ctx())
+                .parse()
+                .unwrap();
+            assert!((99_999_999..=100_000_000u64).contains(&v), "out of range: {v}");
+        }
+        // single-value and zero-span sanity
+        assert_eq!(
+            SpintaxResolver::new(7).resolve("%random-42-42%", &ctx()),
+            "42"
+        );
     }
 
     #[test]
