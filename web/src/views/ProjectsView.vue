@@ -489,7 +489,7 @@ const autoBusy = ref(false)
 const autoMsg = ref('')
 const autoFail = ref(false)
 const autoLinks = ref(100)
-const autoEngines = ref(5)
+const autoEngines = ref(0)
 const testAllBusy = ref(false)
 const testAllMsg = ref<{ kind: 'ok' | 'err'; text: string } | null>(null)
 const captchaBusy = ref(false)
@@ -561,7 +561,7 @@ async function runAuto() {
   try {
     const a = await api.projectRunAuto(selected.value, {
       links: autoLinks.value,
-      engines: autoEngines.value,
+      engines: autoEngines.value || undefined, // 0 = "all" → let the API fan out across every enabled engine
     })
     autoMsg.value =
       `✓ Launched background run ${a.run_id.slice(0, 8)}… — building ${a.links_target ?? autoLinks.value} link(s) across ${a.engines ?? autoEngines.value} engine(s), ${a.enqueued_jobs ?? 0} job(s) queued.` +
@@ -1222,12 +1222,12 @@ function cls(status: string) {
                 </select>
               </label>
               <label class="muted" style="display:flex;gap:6px;align-items:center">
-                try up to
-                <select v-model.number="autoEngines" style="width:76px">
-                  <option :value="3">3</option>
-                  <option :value="5">5</option>
-                  <option :value="8">8</option>
+                use engines:
+                <select v-model.number="autoEngines" style="width:96px">
+                  <option :value="0">all (every working one)</option>
                   <option :value="12">12</option>
+                  <option :value="24">24</option>
+                  <option :value="50">50</option>
                 </select>
               </label>
               <button

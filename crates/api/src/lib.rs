@@ -2470,7 +2470,8 @@ async fn run_mixed(
 
 #[derive(Deserialize)]
 struct RunAutoBody {
-    /// How many top-ranked engines to fan out with (default 5).
+    /// How many top-ranked engines to fan out.  Omit = **all enabled engines**
+    /// (default).  An explicit value is clamped to `1..=500`.
     #[serde(default)]
     engines: Option<usize>,
     /// Successful links to create before soft-stopping the rest of the
@@ -2714,7 +2715,13 @@ async fn run_auto_prepare(
             .then(a.attempts.cmp(&b.attempts))
             .then_with(|| a.created_at.cmp(&b.created_at))
     });
-    let top_n = body.engines.unwrap_or(5).clamp(1, 20);
+    // Fan out **all enabled engines** by default — every working engine
+    // gets dispatched per run.  Only an explicit `engines:` request narrows
+    // the pool (clamped to a sane 500 ceiling).
+    let top_n = match body.engines {
+        Some(n) => n.clamp(1, 500),
+        None => engines.len().max(1),
+    };
     // Head of the sorted list = best health first.
     let picked: Vec<ser_db::Engine> = engines.into_iter().take(top_n).collect();
     let _ = &project;
