@@ -2935,28 +2935,39 @@ async fn project_events_live(
 // engines on its own.  The user's job ends at URL + keyword +
 // link count.
 //
-// Over-automation guardrail (agreed plan):
+// Over-automation guardrail:
 //   * static scoring over the whole catalog is FREE (no network —
 //     no liveness probing: dofollow + friction only);
-//   * live dry-runs happen on a bounded SAMPLE — `per_family`
-//     (<= 12) engines per family, capped at `max_total` (<= 60);
-//   * failed engines are DISABLED, not deleted — the decision
-//     stays visible and auditable, and manually re-enablable.
+//   * live dry-runs run in parallel over the SAMPLE — `per_family`
+//     (default all-in-family, ceil 1000) and `max_total` (default
+//     5000, ceil 5000).  The old 12 / 60 ceilings are gone: a pick
+//     can span the whole posting catalog, because the run pool must
+//     be as wide as possible ("run as many as possible");
+//   * failed dry runs are AUDITED, not removed — by default they stay
+//     in the pool (`keep_unverified: true`); set keep_unverified:false
+//     for the stricter "verified only" mode (they are disabled, visible).
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct AutoPickBody {
     /// How many engines to sample per family for live verification
-    /// (default 4, clamped 1..12).
+    /// (default 64, clamped 1..=1000 — high enough to take every posting
+    /// engine in a family).
     #[serde(default)]
     per_family: Option<usize>,
-    /// Hard cap on the total number of engines sampled (default 24).
+    /// Hard cap on the total number of engines sampled (default 1000,
+    /// clamped 1..=5000 — high enough that the whole catalog fits).
     #[serde(default)]
     max_total: Option<usize>,
-    /// Live-test each sampled engine and keep only verified ones enabled
-    /// (default true; false = add without testing).
+    /// Live-test each sampled engine (default true; false = add without
+    /// testing).
     #[serde(default)]
     test: bool,
+    /// Keep engines that FAIL the live test in the run pool (default true —
+    /// "run as many as possible"). Set false to disable failed engines and
+    /// keep only the verified ones (previous behaviour).
+    #[serde(default = "default_true")]
+    keep_unverified: bool,
 }
 
 /// Phase 1 — "Auto-pick" endpoint: sample the whole engine catalog,
@@ -3036,9 +3047,12 @@ async fn auto_pick_pool(
         );
     }
 
-    // 2) Bounded sample: top-N per family, then an absolute cap.
-    let per = body.per_family.unwrap_or(4).clamp(1, 12);
-    let max_total = body.max_total.unwrap_or(24).clamp(1, 60);
+    // 2) Bounded sample: top-N per family, then an absolute cap.  Both
+    //    ceilings and DEFAULTS are high on purpose (per-family up to 1000,
+    //    total up to 5000) so a pick can span the whole posting catalog —
+    //    omitting both picks essentially every posting engine.
+    let per = body.per_family.unwrap_or(1000).clamp(1, 1000);
+    let max_total = body.max_total.unwrap_or(5000).clamp(1, 5000);
     let sel = engine::best_per_family(&cands, per);
     let mut picked: Vec<usize> = Vec::new();
     for (_fam, idxs) in sel {
@@ -3095,69 +3109,116 @@ async fn auto_pick_pool(
         });
     }
 
-    // 5) Live dry-run (if asked): success → verified, stays enabled;
-    //    failure → disabled (still visible for manual re-enable).
+    // 5) Live dry runs (if requested): success → verified.  Failure →
+    //    *stays in the pool* when `keep_unverified` (the default — the
+    //    intent is "run as many as possible"); it is only disabled when the
+    //    caller explicitly asks for the stricter verified-only mode.  Runs
+    //    in parallel (12 in flight) so hundreds finish in reasonable time.
     let mut verified: Vec<serde_json::Value> = Vec::new();
     let mut failed: Vec<serde_json::Value> = Vec::new();
-    for row in &added {
-        let fam = engine::Family::for_type(
-            &std::str::FromStr::from_str(&row.engine_type).unwrap_or(engine::EngineType::Unknown),
-        )
-        .map(|f| f.as_str().to_string())
-        .unwrap_or_else(|| row.engine_type.clone());
-        if !body.test {
+
+    if !body.test {
+        for row in &added {
+            let fam = engine::Family::for_type(
+                &std::str::FromStr::from_str(&row.engine_type)
+                    .unwrap_or(engine::EngineType::Unknown),
+            )
+            .map(|f| f.as_str().to_string())
+            .unwrap_or_else(|| row.engine_type.clone());
             verified.push(serde_json::json!({
                 "engine": row.engine_name,
                 "family": fam,
                 "url": row.url,
                 "verified": null
             }));
-            continue;
         }
-        match test_engine_pool(
-            project_id,
-            TestEngineBody { engine_id: row.id, keyword_id: kw },
-            state,
-        )
-        .await
-        {
-            Ok(v) => {
-                let successful = v
-                    .pointer("/report/successful")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0);
-                if successful > 0 {
-                    verified.push(serde_json::json!({
-                        "engine": row.engine_name, "family": fam, "url": row.url,
-                        "verified": true
-                    }));
-                } else {
-                    let reason = v
-                        .get("report")
-                        .and_then(|r| r.get("errors"))
-                        .and_then(|e| e.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|x| x.as_str())
-                                .take(2)
-                                .collect::<Vec<_>>()
-                                .join("; ")
-                        })
-                        .or_else(|| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
-                        .unwrap_or_else(|| "dry run created no link".into());
-                    let _ = repo.set_engine_enabled(row.id, false).await;
-                    failed.push(serde_json::json!({
-                        "engine": row.engine_name, "family": fam, "url": row.url,
-                        "verified": false, "reason": reason
-                    }));
+    } else {
+        use futures_util::StreamExt as _;
+        let keep_unverified = body.keep_unverified;
+        let repo_ref = &repo; // capture the reference (Copy) into each task
+        let mut stream = futures_util::stream::iter(added.clone())
+            .map(|row| async move {
+                let repo_t = repo_ref.clone();
+                let fam = engine::Family::for_type(
+                    &std::str::FromStr::from_str(&row.engine_type)
+                        .unwrap_or(engine::EngineType::Unknown),
+                )
+                .map(|f| f.as_str().to_string())
+                .unwrap_or_else(|| row.engine_type.clone());
+                let outcome = test_engine_pool(
+                    project_id,
+                    TestEngineBody { engine_id: row.id, keyword_id: kw },
+                    state,
+                )
+                .await;
+                match outcome {
+                    Ok(v) => {
+                        let successful = v
+                            .pointer("/report/successful")
+                            .and_then(|x| x.as_u64())
+                            .unwrap_or(0);
+                        if successful > 0 {
+                            (
+                                true,
+                                serde_json::json!({
+                                    "engine": row.engine_name, "family": fam, "url": row.url,
+                                    "verified": true
+                                }),
+                                None,
+                            )
+                        } else {
+                            let reason = v
+                                .get("report")
+                                .and_then(|r| r.get("errors"))
+                                .and_then(|e| e.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|x| x.as_str())
+                                        .take(2)
+                                        .collect::<Vec<_>>()
+                                        .join("; ")
+                                })
+                                .or_else(|| {
+                                    v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string())
+                                })
+                                .unwrap_or_else(|| "dry run created no link".into());
+                            if !keep_unverified {
+                                let _ = repo_t.set_engine_enabled(row.id, false).await;
+                            }
+                            (
+                                false,
+                                serde_json::json!({
+                                    "engine": row.engine_name, "family": fam, "url": row.url,
+                                    "verified": false
+                                }),
+                                Some(reason),
+                            )
+                        }
+                    }
+                    Err(e) => {
+                        if !keep_unverified {
+                            let _ = repo_t.set_engine_enabled(row.id, false).await;
+                        }
+                        (
+                            false,
+                            serde_json::json!({
+                                "engine": row.engine_name, "family": fam, "url": row.url,
+                                "verified": false
+                            }),
+                            Some(e.to_string()),
+                        )
+                    }
                 }
+            })
+            .buffer_unordered(12);
+        while let Some((ok, mut value, reason)) = stream.next().await {
+            if let Some(r) = reason {
+                value["reason"] = serde_json::json!(r);
             }
-            Err(e) => {
-                let _ = repo.set_engine_enabled(row.id, false).await;
-                failed.push(serde_json::json!({
-                    "engine": row.engine_name, "family": fam, "url": row.url,
-                    "verified": false, "reason": e.to_string()
-                }));
+            if ok {
+                verified.push(value);
+            } else {
+                failed.push(value);
             }
         }
     }
@@ -3168,10 +3229,14 @@ async fn auto_pick_pool(
         "tested": if body.test { added.len() } else { 0 },
         "verified": verified,
         "failed": failed,
-        "note": if verified.is_empty() && !failed.is_empty() {
-            "no engines verified this pass — bump per_family and re-run, or re-enable a failed one manually"
+        "note": if body.test {
+            if body.keep_unverified {
+                "every picked engine STAYS in the pool — verified ones above, rejected ones audited (re-enable/disabled only if asked) — hit run-auto to create links"
+            } else {
+                "only engines that passed the dry run stay enabled — hit run-auto to create links"
+            }
         } else {
-            "verified engines stay enabled — hit run-auto to create links"
+            "live verification off — every picked engine stays in the pool — hit run-auto to create links"
         },
     }))
 }

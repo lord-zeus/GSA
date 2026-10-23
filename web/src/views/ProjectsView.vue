@@ -667,8 +667,9 @@ async function cancelRun() {
 const pickBusy = ref(false)
 const pickErr = ref('')
 const pickTest = ref(true) // live dry-run verification ON by default
-const pickPerFamily = ref(12)
-const pickMaxTotal = ref(60)
+const pickKeepUnverified = ref(true) // failed engines STAY in the pool (default)
+const pickPerFamily = ref(1000) // 1000 = every posting engine in a family
+const pickMaxTotal = ref(5000) // 5000 = the whole catalog
 const pickResult = ref<AutoPickResult | null>(null)
 
 async function autoPick() {
@@ -679,6 +680,7 @@ async function autoPick() {
   try {
     pickResult.value = await api.projectAutoPick(selected.value, {
       test: pickTest.value,
+      keep_unverified: pickKeepUnverified.value,
       per_family: pickPerFamily.value,
       max_total: pickMaxTotal.value,
     })
@@ -1098,27 +1100,33 @@ function cls(status: string) {
             </div>
             <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
               <label class="muted" style="display:flex;gap:6px;align-items:center;cursor:pointer"
-                     title="live dry-run each sampled engine; keeps only proven ones (a bit slower)">
+                     title="live dry-run each sampled engine in parallel (12 at a time); verifies without removing — rejected engines stay in the pool">
                 <input type="checkbox" v-model="pickTest" />
                 live-verify (recommended)
               </label>
+              <label class="muted" style="display:flex;gap:6px;align-items:center;cursor:pointer"
+                     title="engines that FAIL the live test stay in the run pool (default — run as many as possible). Uncheck to keep only proven engines.">
+                <input type="checkbox" v-model="pickKeepUnverified" />
+                keep unverified in pool
+              </label>
               <label class="muted" style="display:flex;gap:6px;align-items:center">
                 per family
-                <select v-model.number="pickPerFamily" style="width:64px">
-                  <option :value="2">2</option>
+                <select v-model.number="pickPerFamily" style="width:88px">
                   <option :value="4">4</option>
-                  <option :value="8">8</option>
-                  <option :value="12">12</option>
+                  <option :value="16">16</option>
+                  <option :value="64">64</option>
+                  <option :value="256">256</option>
+                  <option :value="1000">all</option>
                 </select>
               </label>
               <label class="muted" style="display:flex;gap:6px;align-items:center" title="cap on total engines sampled">
                 max total
-                <select v-model.number="pickMaxTotal" style="width:64px">
-                  <option :value="6">6</option>
-                  <option :value="12">12</option>
+                <select v-model.number="pickMaxTotal" style="width:88px">
                   <option :value="24">24</option>
-                  <option :value="48">48</option>
-                  <option :value="60">60</option>
+                  <option :value="128">128</option>
+                  <option :value="512">512</option>
+                  <option :value="2000">2000</option>
+                  <option :value="5000">all</option>
                 </select>
               </label>
               <button

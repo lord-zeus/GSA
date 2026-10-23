@@ -613,7 +613,12 @@ export const api = {
    *  step 1 of the flow (build the engine list); run-auto is step 2. */
   projectAutoPick: (
     id: string,
-    o: { test?: boolean; per_family?: number; max_total?: number } = {},
+    o: {
+      test?: boolean
+      per_family?: number
+      max_total?: number
+      keep_unverified?: boolean
+    } = {},
   ) =>
     req<AutoPickResult>(`/api/projects/${id}/auto-pick`, {
       method: 'POST',
