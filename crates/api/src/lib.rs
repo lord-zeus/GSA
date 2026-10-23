@@ -1122,34 +1122,32 @@ async fn upsert_engine(
 
 ) -> Response {
 
-    let result = Repo::new(state.pool.clone())
-
+    let repo = Repo::new(state.pool.clone());
+    match repo
         .upsert_engine(
-
             project_id,
-
             &body.engine_name,
-
             body.engine_type.as_deref().unwrap_or("directory"),
-
             body.url.as_deref().unwrap_or(""),
-
             &body.file_path,
-
             body.step_count,
-
         )
-
-        .await;
-
-    match result {
-
-        Ok(e) => Json(e).into_response(),
-
+        .await
+    {
+        Ok(mut e) => {
+            // Honor a GSA ";down" engine (INI `enabled=0`) on manual add too.
+            if !body.file_path.trim().is_empty()
+                && !engine::ini_is_enabled(&resolve_engine_path(&body.file_path))
+            {
+                match repo.set_engine_enabled(e.id, false).await {
+                    Ok(dis) => e = dis,
+                    Err(err) => return error_response(err),
+                }
+            }
+            Json(e).into_response()
+        }
         Err(e) => error_response(e),
-
     }
-
 }
 
 
@@ -3045,7 +3043,7 @@ async fn auto_pick_pool(
     let mut added: Vec<ser_db::Engine> = Vec::new();
     for i in &picked {
         let ce = &rows[*i];
-        let row = repo
+        let mut row = repo
             .upsert_engine(
                 project_id,
                 &ce.engine_name,
@@ -3055,6 +3053,11 @@ async fn auto_pick_pool(
                 ce.step_count,
             )
             .await?;
+        // Honor a GSA ";down" engine (INI `enabled=0`): keep the row in the
+        // project for audit, but flip it out of the dispatch pool.
+        if !ce.file_path.trim().is_empty() && !engine::ini_is_enabled(&resolve_engine_path(&ce.file_path)) {
+            row = repo.set_engine_enabled(row.id, false).await?;
+        }
         added.push(row);
     }
 

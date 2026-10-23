@@ -110,7 +110,7 @@ pub mod smtp;
 pub use keyword::{expand as expand_keyword, normalize as normalize_keyword, resolve_one as resolve_keyword_one};
 
 pub use spin::{Context, SpintaxResolver, default_context, resolve};
-pub use enginespec::{Engine, EngineType, Step, parse_engine_file, parse_engine_str};
+pub use enginespec::{Engine, EngineType, Step, parse_engine_file, parse_engine_str, ini_enabled_from_text, ini_is_enabled};
 pub use extraction::{extract_front_back, extract_front_back_variants};
 pub use extract::{
     EmailExtractPlan, EmailVerifyResult, Extractor, ExtractRule, engine_uses_email_verify,

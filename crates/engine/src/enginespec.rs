@@ -118,6 +118,40 @@ pub struct Engine {
     pub steps: Vec<Step>,
 }
 
+/// GSA marks engines it considers "down" with `enabled=0` in the INI.
+/// Returns `false` when the `enabled` flag is an explicit off value,
+/// `true` otherwise (including "not present — assume enabled").
+#[must_use]
+pub fn ini_enabled_from_text(raw: &str) -> bool {
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with(';') || t.starts_with('#') {
+            continue;
+        }
+        let Some(eq) = t.find('=') else {
+            continue;
+        };
+        let key = t[..eq].trim().to_ascii_lowercase();
+        if key != "enabled" {
+            continue;
+        }
+        let val = t[eq + 1..].trim().to_ascii_lowercase();
+        return !matches!(val.as_str(), "0" | "false" | "no" | "off");
+    }
+    true
+}
+
+/// Convenience wrapper: read the INI at `path` and apply
+/// [`ini_enabled_from_text`].  Returns true (enabled) if the file can't
+/// be read, so a transient I/O error never silently drops an engine.
+#[must_use]
+pub fn ini_is_enabled(path: impl AsRef<std::path::Path>) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path.as_ref()) else {
+        return true;
+    };
+    ini_enabled_from_text(&raw)
+}
+
 impl Engine {
     /// Case-insensitive search over the step names.
     pub fn step(&self, name: &str) -> Option<&Step> {
@@ -461,5 +495,22 @@ link=%url%
         // step order stays in parse order (we don't re-sort steps)
         assert_eq!(e.steps[0].name, "ZZZ step a");
         assert_eq!(e.steps[1].name, "AAA step b");
+    }
+
+    #[test]
+    fn ini_enabled_flag_honors_disabled_markers() {
+        use super::ini_enabled_from_text;
+        // `enabled=0` (the GSA ";down" marker) → disabled
+        assert!(!ini_enabled_from_text("[setup]\n;down\nenabled=0\ndefault checked=0\n"));
+        // other off spellings → disabled
+        assert!(!ini_enabled_from_text("enabled = false\n"));
+        assert!(!ini_enabled_from_text("enabled=no\n"));
+        assert!(!ini_enabled_from_text("  ENABLED = OFF  \n"));
+        // explicit on / present-but-on → enabled
+        assert!(ini_enabled_from_text("[engine]\nenabled=1\nname=x\n"));
+        // absent → default enabled
+        assert!(ini_enabled_from_text("[engine]\nname=x\nengine type=Directory\n"));
+        // first `enabled=` wins (later ones ignored); comment line skipped
+        assert!(!ini_enabled_from_text("# note\n;enabled=1\nenabled=0\nenabled=1\n"));
     }
 }
