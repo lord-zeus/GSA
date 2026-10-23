@@ -121,6 +121,12 @@ pub struct StepNav {
     /// `modify url=...` — raw, usually the URL that must end with the
     /// submitted URL.
     pub modify_url: Option<String>,
+    /// T12 — `verify url=...` (GSA submit verification): the INI author's
+    /// explicit pattern for the URL this step *creates*, e.g. Scribd's
+    /// `find url=http://www.scribd.com/doc/[0-9]*[0-9]/*`.  Highest-priority
+    /// input to [extract_result_url].  A `%name%` reference is resolved to
+    /// the named section's `find url` / `find link` during planning.
+    pub verify_url: Option<String>,
 }
 
 impl StepNav {
@@ -324,6 +330,31 @@ pub fn resolve_plan(engine: &Engine, input: &SubmissionInput) -> SubmissionPlan 
         .filter(|s| is_submission_step(&s.name))
         .map(|s| resolve_step(s, &resolver, &ctx))
         .collect();
+    // T12 — resolve `verify url=%name%` references to the named extract
+    // section's pattern (Scribd: `%verify_url%` → the `[verify_url]`
+    // section's `find url`).  Section names are case-insensitive in GSA.
+    let section_vars: std::collections::HashMap<String, String> = engine
+        .steps
+        .iter()
+        .filter_map(|s| {
+            let pat = s.field("find url").cloned().or_else(|| s.field("find link").cloned())?;
+            Some((s.name.to_ascii_lowercase(), pat))
+        })
+        .collect();
+    for sp in ordered.iter_mut() {
+        if let Some(v) = sp.nav.verify_url.as_ref() {
+            let inner = v
+                .trim()
+                .strip_prefix('%')
+                .and_then(|s| s.strip_suffix('%'))
+                .map(|s| s.to_ascii_lowercase());
+            if let Some(name) = inner {
+                if let Some(pat) = section_vars.get(&name) {
+                    sp.nav.verify_url = Some(pat.clone());
+                }
+            }
+        }
+    }
     // Stable sort: Register < Login < Submit < Extra < Delete, then numeric.
     ordered.sort_by_key(|sp| (sp.phase, sp.order));
 
@@ -377,6 +408,7 @@ fn resolve_step(
         form_name: StepNav::split(f("form name")),
         link_type: f("link type").map(str::to_string),
         modify_url: f("modify url").map(str::to_string),
+        verify_url: f("verify url").map(str::to_string),
     };
 
     let mut fields = HashMap::new();
@@ -506,7 +538,20 @@ pub fn extract_result_url(step: &StepPlan, html: &str, target: Option<&str>) -> 
         }
     }
 
-    // 1. Every navigation hint (`find url`, `alternative url`, `modify url`)
+    // 1. `verify url=...` (T12) is the INI author's explicit pattern for the
+    //    URL THIS step creates (Scribd: `scribd.com/doc/[0-9]*[0-9]/*`).  It
+    //    names the created resource precisely, so it outranks the generic nav
+    //    hints — which can self-reference the form page (upload/login) — and
+    //    every "project URL echo" fallback below.
+    if let Some(v) = step.nav.verify_url.as_deref() {
+        let v = v.trim().trim_start_matches('*').trim_start_matches('.');
+        if !v.is_empty() {
+            if let Some(u) = find_url(html, v).or_else(|| find_bare_url(html, v)) {
+                return Some(u);
+            }
+        }
+    }
+    // 2. Every navigation hint (`find url`, `alternative url`, `modify url`)
     //    is a matcher: pull the first absolute href on the page that contains
     //    it (after stripping glob/star/dot prefixes GSA uses for matches).
     let mut candidates: Vec<&String> =
@@ -791,8 +836,7 @@ pub async fn execute_plan_with_solver(
             if let Some(u) = extract_result_url(step, &res.html, Some(&plan.target_url)) {
                 if let (Some(uh), Some(th)) = (host_of(&u), host_of(&plan.target_url)) {
                     if uh != th {
-                        report.submitted_url = report.submitted_url.clone().or(Some(u.clone()));
-                        report.submitted_url_source = Some(format!("{}: {}", step.name, u));
+                        record_created_url(&mut report, format!("{}: {}", step.name, u), &u);
                         outcome = StepOutcomeRef {
                             outcome: StepOutcome::Success,
                             matched_phrase: Some("short-link-returned".to_string()),
@@ -810,8 +854,7 @@ pub async fn execute_plan_with_solver(
         // was posted" run read as success rather than "unknown outcome".
         if outcome.outcome == super::StepOutcome::Unknown && !step.just_download && res.ok {
             if let Some(u) = final_url_created(&res.final_url, &target) {
-                report.submitted_url = report.submitted_url.clone().or(Some(u.clone()));
-                report.submitted_url_source = Some(format!("{}: {} (created)", step.name, u));
+                record_created_url(&mut report, format!("{}: {} (created)", step.name, u), &u);
                 outcome = StepOutcomeRef {
                     outcome: StepOutcome::Success,
                     matched_phrase: Some("created-resource".to_string()),
@@ -872,19 +915,26 @@ pub async fn execute_plan_with_solver(
             }
         }
         let nav = extract_result_url(step, &res.html, Some(&plan.target_url));
-        // Preference order for the recorded link: a real deep link from a nav
-        // hint (engine-specific, strongest) → the redirect target (the created
-        // resource, e.g. the new paste) → the original extraction even if it is
-        // only the bare base (better than nothing).  Never overrides a link an
-        // earlier step already recorded (`or()` keeps the first winner).
         let chosen = nav
             .clone()
             .filter(|n| !n.trim().is_empty() && n.trim() != target.trim())
             .or_else(|| final_url_created(&res.final_url, &target))
-            .or(nav);
+            .or(nav)
+            // T12 — comment engines POST the comment to the post itself
+            // (same-page submit, no dedicated permalink for the comment).
+            // The target IS the verifiable page — use it as last resort so
+            // the operator can open the post and see the comment there.
+            .or_else(|| {
+                if !step.just_download && !fields.is_empty() {
+                    Some(target.clone())
+                } else {
+                    None
+                }
+            });
         if let Some(u) = chosen {
-            report.submitted_url = report.submitted_url.clone().or(Some(u.clone()));
-            report.submitted_url_source = Some(format!("{}: {}", step.name, u));
+            // T12 — best-wins: a later step's deeper permalink correctly
+            // replaces an earlier step's login/form page.
+            record_created_url(&mut report, format!("{}: {}", step.name, u), &u);
         }
         match outcome.outcome {
             StepOutcome::Success => report.successful += 1,
@@ -899,6 +949,78 @@ pub async fn execute_plan_with_solver(
         report.steps.push(outcome);
     }
     report
+}
+
+/// T12 — rank candidate "created" URLs by specificity: deep permalinks
+/// score highest, auth/form pages (login, account, signup) lowest.  The
+/// winner across all steps is decided by score, NOT by step order — the
+/// first successful step is almost always just *login*, and its page must
+/// not shadow the actual created permalink that a later step reveals.
+fn url_score(u: &str) -> i32 {
+    let p = u.trim();
+    let path = p
+        .strip_prefix("https://")
+        .or_else(|| p.strip_prefix("http://"))
+        .unwrap_or(p)
+        .split('/')
+        .nth(1)
+        .unwrap_or("");
+    let mut s = 0;
+    for seg in path.split('/').filter(|seg| !seg.is_empty()) {
+        s += 1;
+        let ls = seg.to_ascii_lowercase();
+        if matches!(
+            ls.as_str(),
+            "login"
+                | "log-in"
+                | "sign-in"
+                | "signin"
+                | "signup"
+                | "sign-up"
+                | "signout"
+                | "logout"
+                | "register"
+                | "registration"
+                | "account"
+                | "accounts"
+                | "user"
+                | "users"
+                | "home"
+                | "index"
+                | "index.html"
+                | "main"
+                | "start"
+                | "dashboard"
+        ) {
+            s -= 8;
+        }
+        // Long digit runs usually denote a created item's id / permalink
+        // (/doc/123456789/, /p/88/, /u/42/, /entry/918372/).
+        if seg.chars().filter(|c| c.is_ascii_digit()).count() >= 4 {
+            s += 6;
+        }
+    }
+    s
+}
+
+/// T12 — record `u` as the run's created link only when it beats the current
+/// winner (first set always wins when the pool is empty).  The *highest*
+/// specificity wins — a deep permalink recorded by a later step correctly
+/// replaces a login/form page recorded by an earlier one.
+fn record_created_url(report: &mut ExecutionReport, source: String, u: &str) -> bool {
+    let c = u.trim();
+    if c.is_empty() {
+        return false;
+    }
+    let wins = match report.submitted_url.as_deref() {
+        None => true,
+        Some(cur) => url_score(c) > url_score(cur),
+    };
+    if wins {
+        report.submitted_url = Some(c.to_string());
+        report.submitted_url_source = Some(source);
+    }
+    wins
 }
 
 /// GSA parity helper: does this page expose a challenge artifact the local
@@ -1719,6 +1841,7 @@ new_url=%random-1-99999%-delete-me
             form_name: vec![],
             link_type: None,
             modify_url: Some("http://thedatahub.org/user/register".into()),
+            verify_url: None,
         };
         // absolute alternative_url should win over relative form_url
         let t = nav.navigation_target().unwrap();
@@ -1734,6 +1857,7 @@ new_url=%random-1-99999%-delete-me
             form_name: vec![],
             link_type: None,
             modify_url: Some("http://thedatahub.org/user/register".into()),
+            verify_url: None,
         };
         let t2 = nav2.navigation_target().unwrap();
         assert!(t2.starts_with("http://"), "must be absolute: {t2}");
@@ -1748,6 +1872,7 @@ new_url=%random-1-99999%-delete-me
             form_name: vec![],
             link_type: None,
             modify_url: None,
+            verify_url: None,
         };
         let t3 = nav3.navigation_target().unwrap();
         assert_eq!(t3, "/relative/path");
@@ -1921,7 +2046,7 @@ title=T
 
     #[test]
     fn empty_site_url_behaves_like_absent() {
-        let ini = "title=T\r\n\n[STEP1]\r\njust download=1\r\nmodify url=/sign\r\nsubmit success=OK\r\n";
+        let ini = "title=T\r\n\r\n[STEP1]\r\njust download=1\r\nmodify url=/sign\r\nsubmit success=OK\r\n";
         let eng = parse_engine_str(ini, "disco2").unwrap();
         let input = SubmissionInput {
             url: "https://backlink.example/".to_string(),
@@ -1931,6 +2056,156 @@ title=T
         };
         let plan = resolve_plan(&eng, &input);
         assert!(plan.target_url.is_empty(), "blank site_url must not leak in");
+    }
+
+    // ── T12: created-link accuracy ─────────────────────────────────━━━━━━━
+
+    /// A driver that serves one canned page per call — enough to simulate
+    /// "login page first, then the upload-success page reveals the new
+    /// document permalink".
+    struct TwoPageDriver {
+        pages: Vec<String>,
+        calls: std::sync::Mutex<usize>,
+    }
+    impl TwoPageDriver {
+        fn new(pages: Vec<String>) -> Self {
+            Self { pages, calls: std::sync::Mutex::new(0) }
+        }
+        fn next(&self) -> DriverResponse {
+            let mut c = self.calls.lock().unwrap();
+            let html = self.pages.get(*c).cloned().unwrap_or_default();
+            *c += 1;
+            DriverResponse {
+                ok: true,
+                final_url: "mock".into(),
+                html,
+                error: None,
+            }
+        }
+    }
+    #[async_trait::async_trait]
+    impl Driver for TwoPageDriver {
+        async fn navigate(&self, _u: String) -> DriverResponse {
+            self.next()
+        }
+        async fn submit(
+            &self,
+            _u: String,
+            _f: HashMap<String, String>,
+            _t: std::time::Duration,
+        ) -> DriverResponse {
+            self.next()
+        }
+    }
+
+    /// The exact shape of the reported bug: a Scribd-like engine whose
+    /// *first* successful step is the login page (its URL gets captured),
+    /// then the upload step that reveals the created document's permalink
+    /// via the `[verify_url] find url` glob.  The recorded link MUST be the
+    /// document URL — the only one the operator can open to confirm the
+    /// upload exists.
+    #[tokio::test]
+    async fn t12_verify_url_permalink_beats_login_echo() {
+        let raw = r#"
+[engine]
+name=ScribdLike
+engine type=Document Sharing
+fixed url=http://www.scribdlike.com/login
+
+[verify_url]
+find link=*.pdf
+find url=http://www.scribdlike.com/doc/[0-9]*[0-9]/*
+
+[LOGIN_STEP1]
+modify url=http://www.scribdlike.com/login
+submit success=>Log Out<
+form url=http://www.scribdlike.com/login
+login_or_email=me
+login_password=x
+
+[EXTRA_STEP1]
+modify url=http://www.scribdlike.com/upload/supload
+submit success=>My Doc</a>
+verify url=%verify_url%
+form name=*Upload
+form url=*/upload/supload
+file=doc.pdf
+"#;
+        let eng = parse_engine_str(raw, "ScribdLike").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        // Sanity: the %verify_url% reference resolved to the glob pattern.
+        assert_eq!(
+            plan.steps[1].nav.verify_url.as_deref(),
+            Some("http://www.scribdlike.com/doc/[0-9]*[0-9]/*")
+        );
+
+        let login_page = r#"<html><body>Logged in as
+            <a href="http://www.scribdlike.com/login">me</a>
+            <span>>Log Out<</span></body></html>"#.to_string();
+        let upload_page = r#"<html><body>Thank you.
+            <a href="http://www.scribdlike.com/doc/123456789/my-case-study">My Doc</a>
+            </body></html>"#.to_string();
+        let driver = TwoPageDriver::new(vec![login_page, upload_page]);
+
+        let report = execute_plan_with_solver(&plan, &driver, None).await;
+        assert_eq!(report.successful, 2, "both steps should succeed: {report:?}");
+        assert_eq!(
+            report.submitted_url.as_deref(),
+            Some("http://www.scribdlike.com/doc/123456789/my-case-study"),
+            "the created permalink must win over the login page: {report:?}"
+        );
+        assert!(
+            report
+                .submitted_url_source
+                .as_deref()
+                .map(|s| s.contains("EXTRA_STEP1"))
+                .unwrap_or(false)
+        );
+    }
+
+    /// Comment engines POST the comment to the post page itself — the
+    /// created comment has no permalink of its own.  Spec: report the *post*
+    /// URL so the operator can open it and verify the comment is there.
+    #[tokio::test]
+    async fn t12_comment_engine_falls_back_to_post_url() {
+        let raw = r#"
+[engine]
+name=Blog
+engine type=Blog Comments
+fixed url=http://www.blogroot.example/
+
+[step 1]
+comment=%anchor_text%
+submit success=your comment was added
+form url=http://post.example/entry/10086
+"#;
+        let eng = parse_engine_str(raw, "Blog").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        // No permalink on the response page — only the success phrase.
+        let driver = MockDriver::with_html(
+            "<html><body><div>your comment was added</div></body></html>",
+        );
+
+        let report = execute_plan_with_solver(&plan, &driver, None).await;
+        assert_eq!(report.successful, 1, "{report:?}");
+        assert_eq!(
+            report.submitted_url.as_deref(),
+            Some("http://post.example/entry/10086"),
+            "comment engines must report the post URL: {report:?}"
+        );
+    }
+
+    /// Scoring sanity: deep permalinks outrank form/auth pages; short links
+    /// still beat bare domains.
+    #[test]
+    fn t12_url_score_ranks_permalinks_above_forms() {
+        assert!(url_score("http://www.scribd.com/doc/123456789/my-doc")
+            > url_score("http://www.scribd.com/login"));
+        assert!(url_score("http://www.scribd.com/upload/supload")
+            > url_score("http://www.scribd.com/login"));
+        assert!(url_score("http://rlu.ru/5i1b6") > url_score("http://rlu.ru/"));
+        assert!(url_score("https://dir.example/profile/abc123")
+            > url_score("https://dir.example/"));
     }
 }
 

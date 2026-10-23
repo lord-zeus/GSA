@@ -67,8 +67,96 @@ pub fn extract_front_back_variants(
     None
 }
 
+/// GSA glob tokens that a plain `contains` cannot express: `*` (any run) and
+/// `[...]` character classes (`[0-9]`, `[a-z]`, `^-`).  Patterns without
+/// them keep the historical substring behaviour.
+fn has_glob_tokens(p: &str) -> bool {
+    p.contains('*') || (p.contains('[') && p.contains(']'))
+}
+
+/// Full GSA-pattern match of `hay` against `pat`: `*` = any run of chars,
+/// `[abc]`/`[a-z0-9]` = a single class member (ranges + `^` negation),
+/// everything else literal.  Case-insensitive.
+pub fn url_glob_match(hay: &str, pat: &str) -> bool {
+    if pat.is_empty() {
+        return true;
+    }
+    let h: Vec<char> = hay.to_ascii_lowercase().chars().collect();
+    let p: Vec<char> = pat.to_ascii_lowercase().chars().collect();
+    glob_match_at(&h, 0, &p, 0)
+}
+
+fn glob_match_at(h: &[char], i: usize, p: &[char], j: usize) -> bool {
+    if j == p.len() {
+        return i == h.len();
+    }
+    if p[j] == '*' {
+        // Zero chars, or consume one and re-match the star.
+        if glob_match_at(h, i, p, j + 1) {
+            return true;
+        }
+        i < h.len() && glob_match_at(h, i + 1, p, j)
+    } else if p[j] == '[' {
+        if let Some(end) = p[j..].iter().position(|c| *c == ']') {
+            if end > 0 {
+                let c = *h.get(i).unwrap_or(&'\0');
+                (c != '\0') && class_contains(c, &p[j + 1..j + end]) && glob_match_at(h, i + 1, p, j + end + 1)
+            } else {
+                false
+            }
+        } else {
+            // Unclosed `[` — treat as a literal char.
+            i < h.len() && h[i] == '[' && glob_match_at(h, i + 1, p, j + 1)
+        }
+    } else {
+        i < h.len() && h[i] == p[j] && glob_match_at(h, i + 1, p, j + 1)
+    }
+}
+
+fn class_contains(c: char, class: &[char]) -> bool {
+    let (neg, class) = if class.first() == Some(&'^') {
+        (true, &class[1..])
+    } else {
+        (false, class)
+    };
+    let mut matched = false;
+    let mut k = 0usize;
+    while k < class.len() {
+        if k + 2 < class.len() && class[k + 1] == '-' {
+            let (lo, hi) = (class[k].min(class[k + 2]), class[k].max(class[k + 2]));
+            if c >= lo && c <= hi {
+                matched = true;
+                break;
+            }
+            k += 3;
+        } else if class[k] == c {
+            matched = true;
+            break;
+        } else {
+            k += 1;
+        }
+    }
+    matched != neg
+}
+
+/// T12 — does `u` satisfy the GSA pattern `needle`?  Substring semantics
+/// (the pattern may match anywhere in the URL): glob patterns are matched
+/// with `*<pattern>*`, plain patterns with `contains` (previous behaviour).
+pub fn url_matches(u: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let ul = u.to_ascii_lowercase();
+    let nl = needle.to_ascii_lowercase();
+    if has_glob_tokens(&nl) {
+        url_glob_match(&ul, &format!("**{nl}**"))
+    } else {
+        ul.contains(&nl)
+    }
+}
+
 /// GSA's `find url`: locate the first `href=` (or `src=`) value that is an
-/// absolute URL and contains `must_have`.
+/// absolute URL and satisfies `must_have` (substring or GSA glob pattern).
 pub fn find_url(html: &str, must_have: &str) -> Option<String> {
     let haystack = html.to_ascii_lowercase();
     let needle = must_have.to_ascii_lowercase();
@@ -78,7 +166,7 @@ pub fn find_url(html: &str, must_have: &str) -> Option<String> {
         let rest = &html[start..];
         let url = take_url(rest);
         if let Some(u) = url {
-            if needle.is_empty() || u.to_ascii_lowercase().contains(&needle) {
+            if url_matches(&u, &needle) {
                 return Some(u);
             }
         }
@@ -137,7 +225,7 @@ pub fn find_bare_url(html: &str, must_have: &str) -> Option<String> {
                 continue;
             }
             let full = if scheme == "//" { format!("https://{}", url) } else { format!("{}{}", scheme, url) };
-            if needle.is_empty() || full.to_ascii_lowercase().contains(&needle) {
+            if url_matches(&full, &needle) {
                 return Some(full);
             }
             start = i + 1;
@@ -161,8 +249,8 @@ pub fn find_link(html: &str, hint: &str) -> Option<String> {
             .map(|(_, v)| v.split('"').next().unwrap_or("").split('\'').next().unwrap_or("").to_string())
         {
             if n.is_empty()
-                || href.to_ascii_lowercase().contains(&n)
-                || tag.to_ascii_lowercase().contains(&n)
+                || url_matches(&href, &n)
+                || url_matches(tag, &n)
             {
                 let visible = tag.split_once('>')?.1.split('<').next().unwrap_or("").trim().to_string();
                 return Some(if visible.is_empty() { href } else { visible });
@@ -307,5 +395,46 @@ mod tests {
     fn match_spec_regex_flag_still_substring_for_plain_tokens() {
         let m = MatchSpec::regex("site.example");
         assert!(m.matches("https://site.example/verify?ok=1"));
+    }
+
+    // ── T12: GSA glob patterns against real permalinks ────────────────────
+
+    #[test]
+    fn glob_pattern_matches_real_doc_permalink() {
+        // Scribd's `[verify_url]` pattern: literal prefix + digit class + run.
+        assert!(url_matches(
+            "http://www.scribd.com/doc/123456789/my-article-title",
+            "http://www.scribd.com/doc/[0-9]*[0-9]/*"
+        ));
+        assert!(url_matches(
+            "https://example.com/p/88/",
+            "https://example.com/p/[0-9]*[0-9]/*"
+        ));
+    }
+
+    #[test]
+    fn glob_pattern_rejects_non_matching_urls() {
+        assert!(!url_matches(
+            "http://www.scribd.com/login",
+            "http://www.scribd.com/doc/[0-9]*[0-9]/*"
+        ));
+        assert!(!url_matches(
+            "http://www.scribd.com/upload/supload",
+            "http://www.scribd.com/doc/[0-9]*[0-9]/*"
+        ));
+        // single-char class: `/u/42/` has no letter run
+        assert!(!url_matches(
+            "https://example.com/u/abc/",
+            "https://example.com/u/[0-9]*/"
+        ));
+    }
+
+    #[test]
+    fn find_url_honours_glob_pattern() {
+        let html = r#"<html><body><a href="http://www.scribd.com/login">login</a>
+            <a href="http://www.scribd.com/doc/987654321/case-study">my doc</a>
+            </body></html>"#;
+        let u = find_url(html, "http://www.scribd.com/doc/[0-9]*[0-9]/*").unwrap();
+        assert_eq!(u, "http://www.scribd.com/doc/987654321/case-study");
     }
 }
