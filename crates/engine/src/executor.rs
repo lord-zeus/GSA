@@ -127,6 +127,14 @@ pub struct StepNav {
     /// input to [extract_result_url].  A `%name%` reference is resolved to
     /// the named section's `find url` / `find link` during planning.
     pub verify_url: Option<String>,
+    /// T13 — GSA `type=extract` verify section (`front1=` / `front2=` /
+    /// `back=`): capture the URL between the delimiters in the response
+    /// HTML.  E.g. yy7's `[verifyurl] front1=<div class="resultLink">
+    /// front2=href=" back="` yields the freshly-created short link — the
+    /// verifiable permalink a professional backlinker reports.  Populated
+    /// from the referenced section during planning when the section's
+    /// `type` field is `extract`.
+    pub verify_extract: Option<(String, String, String)>,
 }
 
 impl StepNav {
@@ -260,6 +268,11 @@ pub struct SubmissionPlan {
 pub struct ExecutionReport {
     /// Number of steps that matched `submit success`.
     pub successful: usize,
+    /// T13 — number of steps that confirmed **content creation**: a
+    /// `Success` outcome in the Submit or Extra phase.  Login/Register
+    /// successes are infrastructure — the operator cannot verify a link
+    /// through them — so a professional backlinker counts only these.
+    pub content_success: usize,
     /// Number of steps that matched `submit failed` and had no retry.
     pub failed: usize,
     /// Number of steps that returned `submit failed retry`.
@@ -341,6 +354,35 @@ pub fn resolve_plan(engine: &Engine, input: &SubmissionInput) -> SubmissionPlan 
             Some((s.name.to_ascii_lowercase(), pat))
         })
         .collect();
+    // T13 — GSA `type=extract` sections (yy7 `[verifyurl] front1=...
+    // front2=href=" back="`) are URL delimiters, not patterns: when a step
+    // references one via `%name%`, resolve it to the (front1, front2, back)
+    // tuple and let execute-time extraction capture the created link.
+    let section_extractors: std::collections::HashMap<String, (String, String, String)> = engine
+        .steps
+        .iter()
+        .filter(|s| {
+            s.field("type")
+                .map(|t| t.trim().eq_ignore_ascii_case("extract"))
+                .unwrap_or(false)
+        })
+        .filter_map(|s| {
+            // Old GSA syntax uses `front=`; new syntax splits it into
+            // `front1=`/`front2=`.  Both arrive as (front1, front2, back).
+            let front1 = s
+                .field("front1")
+                .cloned()
+                .or_else(|| s.field("front").cloned())
+                .unwrap_or_default();
+            let front2 = s.field("front2").cloned().unwrap_or_default();
+            let back = s.field("back").cloned().unwrap_or_default();
+            if front1.is_empty() && front2.is_empty() {
+                None
+            } else {
+                Some((s.name.to_ascii_lowercase(), (front1, front2, back)))
+            }
+        })
+        .collect();
     for sp in ordered.iter_mut() {
         if let Some(v) = sp.nav.verify_url.as_ref() {
             let inner = v
@@ -349,7 +391,10 @@ pub fn resolve_plan(engine: &Engine, input: &SubmissionInput) -> SubmissionPlan 
                 .and_then(|s| s.strip_suffix('%'))
                 .map(|s| s.to_ascii_lowercase());
             if let Some(name) = inner {
-                if let Some(pat) = section_vars.get(&name) {
+                if let Some(x) = section_extractors.get(&name) {
+                    sp.nav.verify_extract = Some(x.clone());
+                    sp.nav.verify_url = None;
+                } else if let Some(pat) = section_vars.get(&name) {
                     sp.nav.verify_url = Some(pat.clone());
                 }
             }
@@ -409,6 +454,7 @@ fn resolve_step(
         link_type: f("link type").map(str::to_string),
         modify_url: f("modify url").map(str::to_string),
         verify_url: f("verify url").map(str::to_string),
+        verify_extract: None,
     };
 
     let mut fields = HashMap::new();
@@ -551,6 +597,23 @@ pub fn extract_result_url(step: &StepPlan, html: &str, target: Option<&str>) -> 
             }
         }
     }
+    // 1.5 (T13) — `type=extract` verify section (yy7 / yuarel / old-GSA
+    //    `front=` style): the INI author's own delimiters for the created
+    //    link.  This is the most precise evidence the response carries.
+    if let Some((f1, f2, b)) = &step.nav.verify_extract {
+        if let Some(u) = extract_front_back_url(html, f1, f2, b) {
+            return Some(u);
+        }
+    }
+    // 1.6 (T13) — "creation echo": the engine anchored the submitted
+    //    content's title in an `<a href>` in the response (Scribd's upload
+    //    step matches `submit success=>%article_title%</a>` — the title
+    //    string sits directly inside the created page's link).  Walk back
+    //    from the marker text to its href.  Outranks the nav hints below
+    //    because those can self-reference the form/upload page.
+    if let Some(u) = creation_echo_href(step, html) {
+        return Some(u);
+    }
     // 2. Every navigation hint (`find url`, `alternative url`, `modify url`)
     //    is a matcher: pull the first absolute href on the page that contains
     //    it (after stripping glob/star/dot prefixes GSA uses for matches).
@@ -666,6 +729,243 @@ fn resolve_against_base(raw: &str, base: &str) -> String {
     }
 }
 
+/// T13 — GSA `type=extract` delimiters: locate `front1` in the response,
+/// then from there find `front2`, and capture up to `back` (or the next
+/// `<`).  When `front1` is empty, `front2` acts as the front anchor.
+/// Returns the first captured token that is a plausible absolute URL.
+pub fn extract_front_back_url(html: &str, front1: &str, front2: &str, back: &str) -> Option<String> {
+    let f1 = front1.trim();
+    let f2 = front2.trim();
+    let b = back.trim();
+    if f1.is_empty() && f2.is_empty() {
+        return None;
+    }
+    let mut cursor = 0usize;
+    loop {
+        let anchor = if f1.is_empty() { f2 } else { f1 };
+        let Some(p) = html[cursor..].find(anchor) else {
+            return None;
+        };
+        let after1 = cursor + p + anchor.len();
+        let after2 = if f1.is_empty() {
+            after1
+        } else if f2.is_empty() {
+            after1
+        } else {
+            let Some(o) = html[after1..].find(f2) else {
+                cursor = after1 + 1;
+                continue;
+            };
+            after1 + o + f2.len()
+        };
+        let seg = &html[after2..];
+        let end = if b.is_empty() {
+            seg.find('<').unwrap_or(seg.len())
+        } else {
+            let e = seg.find(b).unwrap_or(seg.len());
+            seg.find('<').map(|t| e.min(t)).unwrap_or(e)
+        };
+        let raw = seg[..end].trim();
+        // Old-GSA front/back pairs can leave a leftover quote/bracket in
+        // the capture (`front=input.value=["` → capture ends `..."`).
+        let raw = raw.trim_matches(|c| c == '"' || c == '\'' || c == '[' || c == ']' || c == '`');
+        if (raw.starts_with("http://") || raw.starts_with("https://")) && raw.len() >= 10 {
+            return Some(raw.to_string());
+        }
+        cursor = after2 + 1;
+    }
+}
+
+/// T13 — "creation echo" fallback (Scribd-style): the engine's response
+/// anchors the submitted content in an `<a href>` — the step's
+/// `submit success` marker literally reads `>%article_title%</a>`, so the
+/// echoed text sits directly inside the created page's link.  Find the
+/// marker text in the response and walk back to the nearest `href`.
+/// The first absolute, non-auth/wall href wins.
+fn creation_echo_href(step: &StepPlan, html: &str) -> Option<String> {
+    let mut texts: Vec<String> = Vec::new();
+    for m in &step.success {
+        let m = m.trim();
+        let Some(gt) = m.find('>') else { continue; };
+        let Some(close) = m[gt + 1..].rfind('<') else { continue; };
+        let t = m[gt + 1..gt + 1 + close].trim();
+        if t.chars().count() >= 3 {
+            texts.push(t.to_string());
+        }
+    }
+    for (k, v) in &step.fields {
+        if k.to_ascii_lowercase().contains("title") {
+            let t = v.trim();
+            if t.chars().count() >= 3 && !t.contains('%') {
+                texts.push(t.to_string());
+            }
+        }
+    }
+    let hay = html.to_ascii_lowercase();
+    for t in &texts {
+        let needle = t.to_ascii_lowercase();
+        let mut from = 0usize;
+        while let Some(pos) = hay[from..].find(&needle) {
+            let abs = from + pos;
+            let window_start = abs.saturating_sub(400);
+            let window = &html[window_start..abs];
+            if let Some(hp) = window.rfind("href=") {
+                let after_byte = window_start + hp + 5;
+                let rest = &html[after_byte..abs];
+                let val = if let Some(q) = rest.chars().next() {
+                    if q == '"' || q == '\'' {
+                        match rest[q.len_utf8()..].find(q) {
+                            Some(i) => Some(rest[q.len_utf8()..q.len_utf8() + i].to_string()),
+                            None => None,
+                        }
+                    } else {
+                        rest.split(|c: char| c.is_whitespace() || c == '>' || c == '"' || c == '\'')
+                            .next()
+                            .map(|s| s.to_string())
+                    }
+                } else {
+                    None
+                };
+                if let Some(v) = val {
+                    let v = v.trim().to_string();
+                    if (v.starts_with("http://") || v.starts_with("https://"))
+                        && !is_unverifiable_url(&v)
+                    {
+                        return Some(v);
+                    }
+                }
+            }
+            from = abs + 1;
+        }
+    }
+    None
+}
+
+/// T13 — an auth / anti-bot wall page that an operator cannot open to
+/// verify a post (login, signup, human-check, captcha, challenge…).  A
+/// "success" result row must never carry one of these URLs — if that is all
+/// we captured, the job was login-only and must be reported as a failure.
+pub fn is_unverifiable_url(u: &str) -> bool {
+    let lower = u.trim().to_ascii_lowercase();
+    let path = lower
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(lower.as_str());
+    const WALLS: &[&str] = &[
+        "login",
+        "log-in",
+        "signin",
+        "sign-in",
+        "sign_up",
+        "signup",
+        "sign-up",
+        "register",
+        "registration",
+        "logout",
+        "human-check",
+        "captcha",
+        "recaptcha",
+        "challenge",
+        "confirm-email",
+        "verify-email",
+    ];
+    WALLS.iter().any(|w| path.contains(w))
+}
+
+/// T13b — normalize a URL for "is this the same page" comparisons: strip
+/// scheme, leading `www.`, trailing slash, query and fragment, lowercase.
+/// Query/fragment are stripped so a form page and the same page re-shown with
+/// a `?return=…` variant still compare equal (that is the point of the
+/// form-echo demotion — the *page* is what matters, not the query).
+fn url_same_page(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        let mut t = s.trim().to_ascii_lowercase();
+        loop {
+            if let Some(r) = t.strip_prefix("https://") {
+                t = r.to_string();
+                continue;
+            }
+            if let Some(r) = t.strip_prefix("http://") {
+                t = r.to_string();
+                continue;
+            }
+            if let Some(r) = t.strip_prefix("www.") {
+                t = r.to_string();
+                continue;
+            }
+            break;
+        }
+        // Drop query / fragment — only the path identifies the page.
+        if let Some(i) = t.find(['?', '#']) {
+            t.truncate(i);
+        }
+        while t.ends_with('/') {
+            t.pop();
+        }
+        t
+    };
+    let (na, nb) = (norm(a), norm(b));
+    !na.is_empty() && na == nb
+}
+
+/// T13b — `true` when `u` is a bare site root (`host/` or `host`): no path
+/// beyond the domain.  A short link (`rlu.ru/5i1b6`) or any real page
+/// (`/doc/123`, `/profile/abc`) is not a bare root.
+fn is_bare_root(u: &str) -> bool {
+    let rest = match u.strip_prefix("https://").or_else(|| u.strip_prefix("http://")) {
+        Some(r) if !r.is_empty() => r,
+        _ => return false,
+    };
+    // First '/' (if any) splits host from path.
+    let path = match rest.find('/') {
+        Some(i) => &rest[i + 1..],
+        None => "",
+    };
+    // Strip query/fragment for the "root" test.
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    path.is_empty()
+}
+
+/// T13b — did the INI author declare where a created resource's URL lives
+/// (GSA `find url` / `verify url` / a named extraction)?  When they did,
+/// the engine's own form/nav pages are *known non-creation* locations: a
+/// real created link would have been extracted first (those patterns
+/// outrank the nav hints in [extract_result_url]), so landing back on one
+/// of the engine's own pages means the creation was never confirmed.
+/// Engines with no such contract (a plain blog-comment form) may still
+/// legitimately report the post page they posted to.
+fn plan_has_url_contract(plan: &SubmissionPlan) -> bool {
+    plan.steps.iter().any(|s| {
+        !s.nav.find_url.is_empty()
+            || s.nav.verify_url.is_some()
+            || s.nav.verify_extract.is_some()
+            || !s.nav.alternative_url.is_empty()
+    })
+}
+
+/// T13b — every form/nav target the plan posts to (one per step), resolved
+/// against the base URL exactly like the executor computes each step's
+/// `target`.  The union of these is the set of the engine's *own* pages —
+/// where forms live, not where new resources get their permalinks.
+fn plan_form_targets(plan: &SubmissionPlan) -> Vec<String> {
+    plan
+        .steps
+        .iter()
+        .map(|s| {
+            if s.just_download {
+                resolve_against_base(&step_target_from_modify(s, &plan.target_url), &plan.target_url)
+            } else {
+                resolve_against_base(
+                    &s.nav
+                        .navigation_target()
+                        .unwrap_or_else(|| plan.target_url.clone()),
+                    &plan.target_url,
+                )
+            }
+        })
+        .collect()
+}
+
 /// Pull the first absolute-URL `<input value="...">` (double or single
 /// quoted) out of `html`.  For a URL-shortener that is the created short
 /// link.  Avoids echo of the submitted (target) URL by preferring a value
@@ -768,6 +1068,7 @@ pub async fn execute_plan_with_solver(
 ) -> ExecutionReport {
     let mut report = ExecutionReport {
         successful: 0,
+        content_success: 0,
         failed: 0,
         retried: 0,
         captcha_failed: 0,
@@ -931,13 +1232,79 @@ pub async fn execute_plan_with_solver(
                     None
                 }
             });
-        if let Some(u) = chosen {
+        if let Some(ref u) = chosen {
             // T12 — best-wins: a later step's deeper permalink correctly
             // replaces an earlier step's login/form page.
-            record_created_url(&mut report, format!("{}: {}", step.name, u), &u);
+            record_created_url(&mut report, format!("{}: {}", step.name, u), u);
         }
         match outcome.outcome {
-            StepOutcome::Success => report.successful += 1,
+            StepOutcome::Success => {
+                report.successful += 1;
+                // T13 — only Submit/Extra-phase successes prove a backlink
+                // was created; Login/Register successes are infrastructure.
+                // T13b — and the step's own evidence must be real:
+                //   * a wall page (login / human-check) is not a created link;
+                //   * the form we posted to, echoing back what we sent, is
+                //     not a created link (Scribd-style upload forms);
+                //   * a bare foreign site root is not a created link (yy7-style
+                //     `alt="success"` false positives landing on / ).
+                if step.phase == StepPhase::Submit || step.phase == StepPhase::Extra {
+                    let u = chosen.as_deref().unwrap_or("");
+                    let wall = !u.is_empty() && is_unverifiable_url(u);
+                    // The link we pinned down is one of the engine's OWN
+                    // form/nav pages, i.e. the page(s) the plan POSTs to —
+                    // not a created resource.  Two shapes:
+                    //   (a) this step is an *upload* step (carries a `file=`
+                    //       field) and the link is the very form it posted
+                    //       to — the conservative same-page rule; and
+                    //   (b) the INI author declared where a created URL lives
+                    //       (`find url` / `verify url`, a real permalink), so
+                    //       we know the engine's form pages are NOT created
+                    //       resources — yet the best link we can name is one
+                    //       of those form pages.  Scribd's real case: every
+                    //       step returns the same static shell whose self-link
+                    //       is `upload/supload`; that link is attributed to a
+                    //       step whose own target is `login/upload/update_docs`,
+                    //       so a per-step same-page test misses it, but it IS
+                    //       one of the plan's own form pages and the plan
+                    //       declares a `find url`/`verify url` contract.
+                    // Same-page comment engines (no url contract, no file)
+                    // stay legitimate — the post IS the verifiable page.
+                    let u_is_own_form = !u.is_empty() && url_same_page(u, &target);
+                    let u_is_any_plan_form = {
+                        if u.is_empty() {
+                            false
+                        } else {
+                            plan_form_targets(plan).iter().any(|t| url_same_page(u, t))
+                        }
+                    };
+                    let form_echo =
+                        u_is_own_form
+                            && step.fields.keys().any(|k| k.to_ascii_lowercase() == "file")
+                            || plan_has_url_contract(plan) && u_is_any_plan_form;
+                    // A bare site root (`host/`) can never be a created
+                    // permalink — the yy7 `alt="success"` false positive.
+                    let bare_root = !u.is_empty() && is_bare_root(u);
+                    if wall {
+                        report.errors.push(format!(
+                            "{}: matched success, but the site returned a wall page ({u}) — post not confirmable",
+                            step.name
+                        ));
+                    } else if form_echo {
+                        report.errors.push(format!(
+                            "{}: the page only echoed one of the engine's own form pages ({u}) — the created link was not confirmed",
+                            step.name
+                        ));
+                    } else if bare_root {
+                        report.errors.push(format!(
+                            "{}: matched success, but only a bare site root came back ({u}) — the created link was not pinned down",
+                            step.name
+                        ));
+                    } else {
+                        report.content_success += 1;
+                    }
+                }
+            }
             StepOutcome::Failed => report.failed += 1,
             StepOutcome::FailedRetry => report.retried += 1,
             StepOutcome::CaptchaFailed => report.captcha_failed += 1,
@@ -1842,6 +2209,7 @@ new_url=%random-1-99999%-delete-me
             link_type: None,
             modify_url: Some("http://thedatahub.org/user/register".into()),
             verify_url: None,
+            verify_extract: None,
         };
         // absolute alternative_url should win over relative form_url
         let t = nav.navigation_target().unwrap();
@@ -1858,6 +2226,7 @@ new_url=%random-1-99999%-delete-me
             link_type: None,
             modify_url: Some("http://thedatahub.org/user/register".into()),
             verify_url: None,
+            verify_extract: None,
         };
         let t2 = nav2.navigation_target().unwrap();
         assert!(t2.starts_with("http://"), "must be absolute: {t2}");
@@ -1873,6 +2242,7 @@ new_url=%random-1-99999%-delete-me
             link_type: None,
             modify_url: None,
             verify_url: None,
+            verify_extract: None,
         };
         let t3 = nav3.navigation_target().unwrap();
         assert_eq!(t3, "/relative/path");
@@ -2206,6 +2576,378 @@ form url=http://post.example/entry/10086
         assert!(url_score("http://rlu.ru/5i1b6") > url_score("http://rlu.ru/"));
         assert!(url_score("https://dir.example/profile/abc123")
             > url_score("https://dir.example/"));
+    }
+
+    // ── T13: professional-backlink semantics ─────────────────────────────
+
+    /// Login-only success is infrastructure, not a backlink.  A job whose
+    /// only successful step is the login form must report
+    /// `content_success == 0` so the runner counts it as a failure.
+    #[tokio::test]
+    async fn t13_login_only_success_is_not_content_success() {
+        let raw = r#"
+[engine]
+name=CommentBlog
+engine type=Comment
+fixed url=http://post.example/entry/10086
+
+[LOGIN_STEP1]
+form url=http://post.example/login
+submit success=>Logged in<
+login_or_email=me
+login_password=x
+
+[COMMENT_STEP1]
+form url=http://post.example/entry/10086
+submit success=your comment was added
+comment body=hello
+comment name=A
+comment email=a@b.co
+"#;
+        let eng = parse_engine_str(raw, "CommentBlog").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        // Both pages: login confirms, comment step does NOT match.
+        let driver = TwoPageDriver::new(vec![
+            "<html><span>>Logged in<</span></html>".to_string(),
+            "<html><body>page</body></html>".to_string(),
+        ]);
+        let report = execute_plan_with_solver(&plan, &driver, None).await;
+        assert_eq!(report.successful, 1, "login step matched: {report:?}");
+        assert_eq!(report.content_success, 0, "login success is not content success: {report:?}");
+
+        // And when the comment step DOES confirm, content_success counts.
+        let driver2 = TwoPageDriver::new(vec![
+            "<html><span>>Logged in<</span></html>".to_string(),
+            "<html><div>your comment was added</div></html>".to_string(),
+        ]);
+        let report2 = execute_plan_with_solver(&plan, &driver2, None).await;
+        assert_eq!(report2.successful, 2, "{report2:?}");
+        assert_eq!(report2.content_success, 1, "the created comment counts: {report2:?}");
+    }
+
+    /// GSA `type=extract` verify section (YY7 shape): the created short link
+    /// sits between `front1`/`front2` and `back` — capture it and report it,
+    /// not the bare engine domain.
+    #[tokio::test]
+    async fn t13_verify_extract_section_yields_created_link() {
+        let raw = r#"
+[engine]
+name=Yy7Sh
+engine type=URL Shortener
+fixed url=http://yy7.example/
+
+[verifyurl]
+front1=<div class="resultLink">
+front2=href="
+back="
+type=extract
+
+[ARTICLE_STEP1]
+form url=http://yy7.example/
+verify url=%verifyurl%
+submit success=your shortened url
+submit failed=invalid url
+url=%url%
+"#;
+        let eng = parse_engine_str(raw, "Yy7Sh").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        assert!(plan.steps[0].nav.verify_extract.is_some(),
+            "%verifyurl% must resolve to the extract tuple: {:?}", plan.steps[0].nav.verify_extract);
+        let driver = MockDriver::with_html(
+            "<html><div class=\"resultLink\"><a href=\"https://yy7.example/Ab3xY9\" target=\"_blank\">https://yy7.example/Ab3xY9</a></div><div>your shortened url</div></html>",
+        );
+        let report = execute_plan_with_solver(&plan, &driver, None).await;
+        assert_eq!(report.successful, 1, "{report:?}");
+        assert_eq!(
+            report.submitted_url.as_deref(),
+            Some("https://yy7.example/Ab3xY9"),
+            "the created short link must be reported: {report:?}"
+        );
+    }
+
+    /// Old-GSA `front=` alias (Scribd `[hset]` shape) also works.
+    #[test]
+    fn t13_extract_front_back_old_syntax() {
+        let html = r#"<input name="x" input.value=["http://x.example/created/42"] type="text">"#;
+        assert_eq!(
+            extract_front_back_url(html, "input.value=[\"", "", "]").as_deref(),
+            Some("http://x.example/created/42")
+        );
+    }
+
+    /// Creation-echo (Scribd upload shape): the response anchors the
+    /// submitted title in an `<a href>`; with NO `find url`/`verify url`
+    /// anywhere in the INI, that href is the created permalink.
+    #[tokio::test]
+    async fn t13_creation_echo_title_href_is_reported() {
+        let raw = r#"
+[engine]
+name=ScribdEcho
+engine type=Document Sharing
+fixed url=http://www.scribdlike.com/login
+
+[EXTRA_STEP1]
+form url=*/upload/supload
+submit success=>My Case Study</a>
+file=doc.pdf
+"#;
+        let eng = parse_engine_str(raw, "ScribdEcho").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        let driver = MockDriver::with_html(
+            "<html><body>Thank you for uploading.\n<a href=\"https://www.scribdlike.com/doc/987654321/my-case-study\">My Case Study</a></body></html>",
+        );
+        let report = execute_plan_with_solver(&plan, &driver, None).await;
+        assert_eq!(report.successful, 1, "{report:?}");
+        assert_eq!(
+            report.submitted_url.as_deref(),
+            Some("https://www.scribdlike.com/doc/987654321/my-case-study"),
+            "the created document page must be reported: {report:?}"
+        );
+    }
+
+    #[test]
+    fn t13_unverifiable_url_detects_walls() {
+        assert!(is_unverifiable_url("https://rentry.co/login"));
+        assert!(is_unverifiable_url("https://www.plurk.com/Users/showLogin"));
+        assert!(is_unverifiable_url("http://www.yuarel.com/human-check.php"));
+        assert!(is_unverifiable_url("https://x.co/signup?next=/a"));
+        assert!(!is_unverifiable_url("http://www.scribd.com/doc/1234/abc"));
+        assert!(!is_unverifiable_url("https://yy7.com/"));
+        assert!(!is_unverifiable_url("https://rentry.co/article/slug42"));
+    }
+
+    // ── T13b: the reported link must be the *created* link, not a wall ─
+
+    /// `is_bare_root` / `url_same_page` helpers.
+    #[test]
+    fn t13b_helpers_bare_root_and_same_page() {
+        assert!(is_bare_root("https://yy7.game/"));
+        assert!(is_bare_root("http://yy7.game"));
+        assert!(is_bare_root("https://yy7.game/?x=1"));
+        assert!(!is_bare_root("https://yy7.game/Ab3xY9"));
+        assert!(!is_bare_root("https://rentry.co/article/slug42"));
+        assert!(url_same_page("http://a.com/x/", "https://www.a.com/x?p=1"));
+        assert!(!url_same_page("https://a.com/x", "https://b.com/x"));
+        assert!(!url_same_page("", "https://a.com/x"));
+    }
+
+    /// A Submit-step success whose only evidence is a **wall page** (login /
+    /// human-check) must NOT count as content — the operator can't verify a
+    /// backlink that lands on a login wall.  This is the yuarel/plurk shape:
+    /// the `submit success` marker matched, but the recorded URL is a wall.
+    #[tokio::test]
+    async fn t13b_wall_success_is_not_content_success() {
+        let raw = r#"
+[engine]
+name=WallEngine
+engine type=Article
+fixed url=http://wall.example/
+
+[ARTICLE_STEP1]
+form url=http://wall.example/submit
+submit success=your url has been created
+url=%url%
+"#;
+        let eng = parse_engine_str(raw, "WallEngine").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        // The response confirms success but the created URL we can pin down
+        // is a login wall (the site redirected to one).
+        let driver = MockDriver::with_html(
+            "<html><body>your url has been created \
+             <a href=\"https://wall.example/login\">sign in</a></body></html>",
+        );
+        let report = execute_plan_with_solver(&plan, &driver, None).await;
+        assert_eq!(report.successful, 1, "the marker matched: {report:?}");
+        let u = report.submitted_url.as_deref().unwrap_or("");
+        assert!(
+            is_unverifiable_url(u),
+            "recorded URL should be the wall: {u:?} — {report:?}"
+        );
+        assert_eq!(
+            report.content_success, 0,
+            "a wall-page success is not a verifiable backlink: {report:?}"
+        );
+    }
+
+    /// A Submit-step success that merely **echoed the form we posted to**
+    /// (marker carries a spintax token, recorded URL == the form) is not a
+    /// created link — the scribd `/upload/supload` shape.
+    #[tokio::test]
+    async fn t13b_form_echo_success_is_not_content_success() {
+        let raw = r#"
+[engine]
+name=EchoEngine
+engine type=Document Sharing
+fixed url=http://echo.example/
+
+[EXTRA_STEP1]
+form url=*/upload/supload
+submit success=>My Case Study</a>
+file=doc.pdf
+"#;
+        let eng = parse_engine_str(raw, "EchoEngine").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        // The page echoes our title but links back to the SAME form, not a
+        // created permalink — the marker text resolves to a %article_title%.
+        let driver = MockDriver::with_html(
+            "<html><body>Uploading… <a href=\"https://echo.example/upload/supload\">My Case Study</a></body></html>",
+        );
+        let report = execute_plan_with_solver(&plan, &driver, None).await;
+        assert_eq!(report.successful, 1, "marker matched: {report:?}");
+        assert_eq!(
+            report.submitted_url.as_deref(),
+            Some("https://echo.example/upload/supload"),
+            "recorded the echo URL: {report:?}"
+        );
+        assert_eq!(
+            report.content_success, 0,
+            "a form-echo is not a created link: {report:?}"
+        );
+    }
+
+    /// The live-Scribd shape (job of 2026-10-23): the engine serves the SAME
+    /// static shell for every step, and that shell's self-link (`/upload/
+    /// supload`) is what gets recorded — but it is attributed to a LATER step
+    /// whose own target is a different form (`/login/upload/update_docs`), so
+    /// a per-step same-page test misses it.  The plan declares a `verify url`
+    /// contract, so any of the engine's own form pages is a known
+    /// non-creation location → not a content success.
+    #[tokio::test]
+    async fn t13b_cross_step_form_echo_is_not_content_success() {
+        let raw = r#"\
+[engine]
+name=ScribdCross
+engine type=Document Sharing
+fixed url=http://www.scribd.example/login
+
+[EXTRA_STEP1]
+form url=http://www.scribd.example/upload/supload
+submit success=Your file is ready
+file=doc.pdf
+verify url=http://www.scribd.example/doc/[0-9]*[0-9]/*
+
+[EXTRA_STEP2]
+form url=http://www.scribd.example/login/upload/update_docs
+submit success=docs updated
+"#;
+        let eng = parse_engine_str(raw, "ScribdCross").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        // One static shell for every step: success markers match, but the
+        // only link on the page is the shell's self-link — step1's form.
+        let driver = MockDriver::with_html(
+            "<html><body>done <a href=\"https://www.scribd.example/upload/supload\">upload</a> <span>Your file is ready</span> <span>docs updated</span></body></html>",
+        );
+        let report = execute_plan_with_solver(&plan, &driver, None).await;
+        assert_eq!(report.successful, 2, "both markers matched: {report:?}");
+        let u = report.submitted_url.as_deref().unwrap_or("");
+        assert!(
+            u.contains("scribd.example"),
+            "recorded the shell self-link, got: {u:?} — {report:?}"
+        );
+        assert_eq!(
+            report.content_success, 0,
+            "a shell self-link is one of the engine's own form pages, not a created link: {u:?} — {report:?}"
+        );
+    }
+
+    /// …and the same two-step shape WITHOUT a url contract is a plain
+    /// "report the page we posted to" engine (comment-style) — legitimate.
+    #[tokio::test]
+    async fn t13b_cross_step_echo_without_contract_counts() {
+        let raw = r#"\
+[engine]
+name=EchoNoContract
+engine type=Comment
+fixed url=http://forum.example/entry/10086
+
+[STEP1]
+form url=http://forum.example/entry/10086
+submit success=comment added
+
+[STEP2]
+form url=http://forum.example/entry/10086/notify
+submit success=notified
+"#;
+        let eng = parse_engine_str(raw, "EchoNoContract").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        let driver = MockDriver::with_html(
+            "<html><body><a href=\"http://forum.example/entry/10086\">permalink</a> <span>comment added</span> <span>notified</span></body></html>",
+        );
+        let report = execute_plan_with_solver(&plan, &driver, None).await;
+        assert_eq!(report.successful, 2, "both markers matched: {report:?}");
+        assert!(
+            report.content_success >= 1,
+            "no url contract → the post page is the verifiable link: {report:?}"
+        );
+    }
+
+    /// A Submit-step success where only a **bare foreign root** came back is
+    /// not a created link — the yy7 `alt="success"` false-positive shape.
+    #[tokio::test]
+    async fn t13b_bare_foreign_root_success_is_not_content_success() {
+        let raw = r#"
+[engine]
+name=Yy7Like
+engine type=URL Shortener
+fixed url=http://yy7.example/
+
+[ARTICLE_STEP1]
+form url=http://yy7.example/
+submit success=<div class="resultLink">|alt="success"
+url=%url%
+"#;
+        let eng = parse_engine_str(raw, "Yy7Like").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        // alt="success" matched, but there is NO real resultLink div in the
+        // response — the settled page is the bare site root.
+        let driver = MockDriver::with_html(
+            "<html><body><img alt=\"success\" src=\"/ok.gif\"></body></html>",
+        );
+        let report = execute_plan_with_solver(&plan, &driver, None).await;
+        assert_eq!(report.successful, 1, "alt=success matched: {report:?}");
+        let u = report.submitted_url.as_deref().unwrap_or("");
+        assert!(
+            is_bare_root(u),
+            "recorded URL should be the bare root: {u:?} — {report:?}"
+        );
+        assert_eq!(
+            report.content_success, 0,
+            "a bare site root is not a created link: {report:?}"
+        );
+    }
+
+    /// Counter-proof: a genuine created permalink (deep, non-wall, ≠ form)
+    /// still counts as content success — T13b must not over-demote.
+    #[tokio::test]
+    async fn t13b_real_permalink_still_counts() {
+        let raw = r#"
+[engine]
+name=GoodEngine
+engine type=Article
+fixed url=http://good.example/
+
+[ARTICLE_STEP1]
+form url=http://good.example/submit
+submit success=your url has been created
+url=%url%
+"#;
+        let eng = parse_engine_str(raw, "GoodEngine").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        let driver = MockDriver::with_html(
+            "<html><body>your url has been created \
+             <a href=\"https://good.example/article/42-created\">view</a></body></html>",
+        );
+        let report = execute_plan_with_solver(&plan, &driver, None).await;
+        assert_eq!(report.successful, 1, "{report:?}");
+        assert_eq!(
+            report.submitted_url.as_deref(),
+            Some("https://good.example/article/42-created"),
+            "{report:?}"
+        );
+        assert_eq!(
+            report.content_success, 1,
+            "a real permalink counts as content: {report:?}"
+        );
     }
 }
 

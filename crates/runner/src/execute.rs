@@ -116,7 +116,10 @@ pub struct JobOutcome {
 
 impl JobOutcome {
     pub fn successful(&self) -> bool {
-        self.report.successful > 0
+        // T13 — a job counts as successful only when the step that
+        // confirms creation (Submit/Extra) matched; login-only successes
+        // are infrastructure the operator cannot verify a link through.
+        self.report.content_success > 0
     }
     pub fn is_done(&self) -> bool {
         self.status == "done"
@@ -579,9 +582,29 @@ impl JobRunner {
             }
             // F#13: record the proxy used in the result payload.
             let proxy_used: Option<String> = attempt_idx.map(|i| self.ctx.proxies[i].url());
-            let done = join_outcome.report.successful > 0;
+            let content_done = join_outcome.report.content_success > 0;
+            // T13b — same verify-submission gate as the classic path: the
+            // inbox-extracted link must actually resolve to real content.
+            let verify_failure: Option<String> = if content_done {
+                match (
+                    self.drivers.get(DriverKind::Http),
+                    join_outcome.report.submitted_url.as_deref(),
+                ) {
+                    (Some(http), Some(u)) => Self::verify_backlink_url(&http, u).await,
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let done = content_done && verify_failure.is_none();
             let done_err = if done {
                 None
+            } else if let Some(v) = verify_failure {
+                Some(v)
+            } else if join_outcome.report.successful > 0
+                && join_outcome.report.content_success == 0
+            {
+                Some("logged in, but the post step did not confirm creation (login-only success)".into())
             } else if let Some(e) = join_err {
                 if join_outcome.report.errors.is_empty() {
                     Some(e)
@@ -756,9 +779,29 @@ impl JobRunner {
         let proxy_used = attempt_idx.map(|i| self.ctx.proxies[i].url());
 
         // 6) persist.
-        let done = report.successful > 0;
+        // T13 — a job is a "success" only when the step that confirms
+        // creation (Submit/Extra) matched.  A login-only success is
+        // infrastructure — the operator can't verify the link by logging
+        // in — so it is a failure with an auditable reason.
+        // T13b — and only when the reported link itself checks out: a
+        // professional backlinker verifies the submission (GSA parity) —
+        // a dead or wall-hiding link is not a backlink.
+        let content_done = report.content_success > 0;
+        let verify_failure = if content_done {
+            match report.submitted_url.as_deref() {
+                Some(u) => Self::verify_backlink_url(&driver, u).await,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let done = content_done && verify_failure.is_none();
         let err = if done {
             None
+        } else if let Some(v) = verify_failure {
+            Some(v)
+        } else if report.successful > 0 && report.content_success == 0 {
+            Some("logged in, but the post step did not confirm creation (login-only success)".into())
         } else if report.errors.is_empty() {
             Some("no step matched submit success".into())
         } else {
@@ -944,6 +987,33 @@ impl JobRunner {
     /// (`spec.url()`) the successful attempt egressed through, so the
     /// results table can attribute the row to its proxy (GSA's
     /// `proxy stats` vocabulary).
+/// T13b — GSA "verify submission": before calling a job a success, open the
+/// reported link.  A backlink that is dead (4xx/5xx) or that resolves to an
+/// auth / human-check wall is not a verifiable backlink — demote the job and
+/// record the honest reason instead of handing the operator an uncheckable
+/// URL.  Returns `None` when the link checks out (or cannot be shaped for a
+/// check), `Some(reason)` when it does not.
+async fn verify_backlink_url(driver: &std::sync::Arc<dyn Driver>, url: &str) -> Option<String> {
+    let u = url.trim();
+    if !u.starts_with("http://") && !u.starts_with("https://") {
+        return None;
+    }
+    let r = driver.navigate(u.to_string()).await;
+    if !r.ok {
+        return Some(format!(
+            "the reported link is not reachable ({}) — demoted to failure",
+            r.error.unwrap_or_else(|| "network error".into())
+        ));
+    }
+    if engine::executor::is_unverifiable_url(&r.final_url) {
+        return Some(format!(
+            "the reported link lands on a wall page ({}) — demoted to failure",
+            r.final_url
+        ));
+    }
+    None
+}
+
     async fn finish(
         &self,
         repo: &ser_db::Repo,
@@ -1016,16 +1086,31 @@ impl JobRunner {
         }
         payload["steps"] = serde_json::json!({
             "successful": report.successful,
+            "content_success": report.content_success,
+            "login_only": report.successful > 0 && report.content_success == 0,
             "failed": report.failed,
             "retried": report.retried,
             "captcha_failed": report.captcha_failed,
         });
+        // T13b — successful rows carry proof: the runner re-opened the
+        // reported link and it resolved to real (non-wall) content.
+        if done {
+            payload["link_verified"] = serde_json::json!(true);
+        }
+        // T13 — flag success rows whose recorded URL is an auth/wall page
+        // (login, human-check…): the site confirmed the post, but we could
+        // not pin down the created page — the operator must check by hand.
+        if let Some(u) = report.submitted_url.as_deref() {
+            if engine::executor::is_unverifiable_url(u) {
+                payload["unverified_url"] = serde_json::json!(true);
+            }
+        }
 
         // F#16 — record the OUTCOME row whether the job succeeded or not.
         // GSA's stats page wants success/failure/**captcha** ratios, and a job
         // blocked by a captcha wall used to leave NO results row at all.
         // Success still takes precedence for the `kind` (matching result_kind).
-        let success = report.successful > 0;
+        let success = done;
         let kind = if success {
             ser_db::ResultKind::Success
         } else if report.captcha_failed > 0 {
@@ -1292,6 +1377,7 @@ fn build_article_text(
 fn empty_report() -> ExecutionReport {
     ExecutionReport {
         successful: 0,
+        content_success: 0,
         failed: 0,
         retried: 0,
         captcha_failed: 0,

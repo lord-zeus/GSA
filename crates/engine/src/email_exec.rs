@@ -494,6 +494,7 @@ pub fn execute_email_engine(
     let start = Instant::now();
     let mut report = ExecutionReport {
         successful: 0,
+        content_success: 0,
         failed: 0,
         retried: 0,
         captcha_failed: 0,
