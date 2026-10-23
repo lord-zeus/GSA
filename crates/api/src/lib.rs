@@ -2932,7 +2932,7 @@ async fn project_events_live(
 //   * static scoring over the whole catalog is FREE (no network —
 //     no liveness probing: dofollow + friction only);
 //   * live dry-runs happen on a bounded SAMPLE — `per_family`
-//     (<= 8) engines per family, capped at `max_total` (<= 60);
+//     (<= 12) engines per family, capped at `max_total` (<= 60);
 //   * failed engines are DISABLED, not deleted — the decision
 //     stays visible and auditable, and manually re-enablable.
 // ─────────────────────────────────────────────────────────────
@@ -2940,7 +2940,7 @@ async fn project_events_live(
 #[derive(Deserialize)]
 struct AutoPickBody {
     /// How many engines to sample per family for live verification
-    /// (default 4, clamped 1..8).
+    /// (default 4, clamped 1..12).
     #[serde(default)]
     per_family: Option<usize>,
     /// Hard cap on the total number of engines sampled (default 24).
@@ -3030,7 +3030,7 @@ async fn auto_pick_pool(
     }
 
     // 2) Bounded sample: top-N per family, then an absolute cap.
-    let per = body.per_family.unwrap_or(4).clamp(1, 8);
+    let per = body.per_family.unwrap_or(4).clamp(1, 12);
     let max_total = body.max_total.unwrap_or(24).clamp(1, 60);
     let sel = engine::best_per_family(&cands, per);
     let mut picked: Vec<usize> = Vec::new();
