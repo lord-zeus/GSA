@@ -9,6 +9,22 @@ description = "Job queue + worker pool for the GSA Search Engine Ranker replica.
 name = "runner"
 path = "src/lib.rs"
 
+# Dev-only captcha probes: they depend on engine::captcha_cdp, which is
+# feature-gated behind `browser`. required-features keeps a no-feature
+# `cargo test -p ser-runner` from attempting (and failing) to build them.
+[[bin]]
+name = "captcha_dbg"
+required-features = ["browser"]
+[[bin]]
+name = "captcha_live"
+required-features = ["browser"]
+[[bin]]
+name = "captcha_shoot"
+required-features = ["browser"]
+[[bin]]
+name = "captcha_tok"
+required-features = ["browser"]
+
 [features]
 default = ["http"]
 http = ["engine/http"]
