@@ -107,6 +107,11 @@ struct EngineFair {
     rate_hits: u32,
     /// Total admits granted (for the per-engine rollup).
     admitted: u32,
+    /// T19 — success/failure tallies for the run dashboard ("how many
+    /// succeeded, how many failed" — the numbers that prove a stopped run
+    /// still banked N real links).
+    successes: u32,
+    fails: u32,
     /// T10c — consecutive non-success outcomes (any class). `Success`
     /// resets it to 0; `>= BLACKLIST_AFTER` flips `disabled`.
     fail_streak: u32,
@@ -156,6 +161,11 @@ pub struct FairState {
     // the top of its loop (in-flight/buffered work still drains). Separate from
     // `target_met()` so "stopped by hand" stays distinguishable in the summary.
     force_stop: bool,
+    /// T19 — operator pause: while set, no new jobs are admitted (the leader
+    /// parks) AND in-flight jobs wait at the executor's step gates. Unlike
+    /// force_stop, pause does NOT end the run — resuming continues exactly
+    /// where it left off, with every queued job still pending.
+    paused: bool,
     /// T10c — admits rejected because the engine was blacklisted.
     rejected_disabled: u32,
     /// T10c — why the leader stopped (set by the pool at the stop moment and
@@ -181,6 +191,7 @@ impl FairState {
             rejected_inflight: 0,
             rejected_quota: 0,
             force_stop: false,
+            paused: false,
             rejected_disabled: 0,
             stop_reason: None,
         }
@@ -193,6 +204,12 @@ impl FairState {
     /// back). Returns `false` when the engine is cooling, over its in-flight or
     /// per-run link cap, or the global target is already met.
     pub fn admit(&mut self, engine: Uuid, now: Instant) -> bool {
+        // T19 — pause gate: while the run is paused, nothing new is admitted
+        // (in-flight jobs wait at the executor's step gates, queued jobs stay
+        // pending). The leader also parks on `paused()` in its own loop.
+        if self.paused {
+            return false;
+        }
         if self.policy.target > 0 && self.total_links >= self.policy.target {
             self.rejected_target += 1;
             return false;
@@ -238,10 +255,12 @@ impl FairState {
             OutcomeClass::Success => {
                 e.links += 1;
                 self.total_links += 1;
+                e.successes = e.successes.saturating_add(1); // T19 — dashboard counter
                 e.rate_streak = 0; // recovered — reset the backoff streak
                 e.fail_streak = 0; // healthy again — clear the blacklist streak
             }
             OutcomeClass::RateLimited => {
+                e.fails = e.fails.saturating_add(1); // T19 — dashboard counter
                 e.rate_streak = e.rate_streak.saturating_add(1);
                 e.rate_hits += 1;
                 let backoff = backoff_delay(base, max, e.rate_streak);
@@ -254,6 +273,7 @@ impl FairState {
                 }
             }
             OutcomeClass::Other => {
+                e.fails = e.fails.saturating_add(1); // T19 — dashboard counter
                 // No rate penalty — a clean non-rate error is not evidence the
                 // engine is rate-limiting, so the backoff state stays as-is.
                 // But it still counts the blacklist streak (T10c): three
@@ -291,8 +311,19 @@ impl FairState {
     pub fn force_stop(&self) -> bool {
         self.force_stop
     }
+    /// T19 — operator pause. `set_paused(true)` stops new admissions AND wakes
+    /// in-flight jobs at the executor's step gates; `set_paused(false)`
+    /// resumes both. `paused()` reports current state (leader loop + status
+    /// endpoint + SSE).
+    pub fn set_paused(&mut self, v: bool) {
+        self.paused = v;
+    }
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
     /// Leader stop condition: cancel requested OR the fair target is met.
     /// Either one ends the current dispatch pass (in-flight work still drains).
+    /// (Pause is NOT a stop — the leader parks instead, so queued work survives.)
     pub fn should_stop(&self) -> bool {
         self.force_stop || self.target_met()
     }
@@ -348,6 +379,21 @@ impl FairState {
     pub fn admitted_for(&self, id: Uuid) -> u32 {
         self.engines.get(&id).map(|e| e.admitted).unwrap_or(0)
     }
+    /// T19 — per-engine success count (dashboard: "how many succeeded").
+    pub fn successes_for(&self, id: Uuid) -> u32 {
+        self.engines.get(&id).map(|e| e.successes).unwrap_or(0)
+    }
+    /// T19 — per-engine failure count (dashboard: "how many failed").
+    pub fn failures_for(&self, id: Uuid) -> u32 {
+        self.engines.get(&id).map(|e| e.fails).unwrap_or(0)
+    }
+    /// T19 — run-wide totals (status/SSE: done = successes + failures + in-flight + queued).
+    pub fn total_successes(&self) -> u32 {
+        self.engines.values().map(|e| e.successes).sum()
+    }
+    pub fn total_failures(&self) -> u32 {
+        self.engines.values().map(|e| e.fails).sum()
+    }
     pub fn rejections(&self) -> (u32, u32, u32, u32, u32) {
         (
             self.rejected_target,
@@ -369,6 +415,8 @@ impl FairState {
                 in_flight: e.inflight,
                 rate_hits: e.rate_hits,
                 admitted: e.admitted,
+                successes: e.successes,
+                fails: e.fails,
                 cool_remaining: self.cool_remaining(*id, now),
                 disabled: e.disabled,
             })
@@ -386,6 +434,10 @@ pub struct EngineSnapshot {
     pub in_flight: u32,
     pub rate_hits: u32,
     pub admitted: u32,
+    /// T19 — succeeded jobs for this engine (created at least one link).
+    pub successes: u32,
+    /// T19 — failed jobs for this engine (rate-limited or other failure).
+    pub fails: u32,
     pub cool_remaining: Option<Duration>,
     /// T10c — blacklisted for this run (3 straight non-successes).
     pub disabled: bool,

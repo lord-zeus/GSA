@@ -1882,13 +1882,16 @@ pub async fn run_project_pool(
     // endpoint isn't up.  `SER_EDGE_CDP=0` disables the pool → the previous
     // clean "driver not registered for kind Browser" behaviour.
     //
-    // A bound WebDriver owns ONE live page target, so with the browser
-    // driver registered the run serializes (`concurrent_workers = 1`):
-    // interleaving two multi-step engine runs on one page cross-talks.
+    // T14 — TWO LANES: the bound WebDriver still owns ONE live page, so
+    // browser-routed jobs serialize against `DriverRegistry::browser_gate`
+    // (held per job, full job duration).  What changed: we no longer collapse
+    // the WHOLE run to `concurrent_workers = 1` when the queue contains a
+    // browser engine — the Http/Email fleet (the overwhelming majority) keeps
+    // its full worker width while browser jobs flow behind the gate.
     //
-    // T10c — but ONLY when this run's pending queue actually contains
-    // browser-routed engines. HTTP/email fleets (the common case) keep
-    // their full worker width even while Edge is up.
+    // T10c/queue check — only connect CDP lazily when this run's pending
+    // queue actually contains browser-routed engines (an all-HTTP queue pays
+    // zero browser cost even while Edge is up).
     {
         let base = std::env::var("SER_EDGE_CDP")
             .unwrap_or_else(|_| "http://127.0.0.1:9222".to_string());
@@ -1898,9 +1901,8 @@ pub async fn run_project_pool(
                 Some(ws) => match engine::WebDriver::connect(ws).await {
                     Ok(wd) => {
                         drivers = drivers.with_browser(wd);
-                        cfg.concurrent_workers = 1;
                         eprintln!(
-                            "[browser] queue contains browser-routed engines — run on single CDP page (concurrent_workers=1)"
+                            "[browser] CDP driver attached — browser jobs serialize on the single-flight gate; Http/Email keep full worker width"
                         );
                     }
                     Err(e) => eprintln!("[browser] CDP ws connect failed: {e}"),
@@ -3376,8 +3378,8 @@ async fn captcha_probe(
     serde_json::json!({ "target": name, "ok": ok, "detail": detail })
 }
 
-/// T6 — "captcha solver link to them": verify the configured solver
-/// (local / 2captcha / anticaptcha / capmonster / auto-chain) before
+/// F#21 `POST /api/captcha/test` — probe the paid captcha key(s) the global
+/// settings would use and report exactly which solvers are armed, without
 /// spending a run slot on an engine that will hit a captcha wall.
 /// `provider=auto` walks the F#29 free-first chain and reports the
 /// first account that accepts the key.
@@ -3672,11 +3674,14 @@ async fn test_engine_pool(
         Ok(o) => (
             serde_json::json!({
                 "successful": o.report.successful,
+                "content_success": o.report.content_success,
                 "failed": o.report.failed,
                 "retried": o.report.retried,
                 "captcha_failed": o.report.captcha_failed,
                 "errors": o.report.errors,
-                "submitted_url": o.report.submitted_url.clone(),
+                "steps": o.report.steps,
+                "submitted_url": o.report.submitted_url,
+                "submitted_url_source": o.report.submitted_url_source,
             }),
             serde_json::Value::Null,
         ),

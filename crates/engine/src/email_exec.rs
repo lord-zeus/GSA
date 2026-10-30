@@ -554,6 +554,11 @@ pub fn execute_email_engine(
         return done(&mut report, &messages, &candidates);
     }
     report.successful = 1;
+    // T13b gate (runner counts content_success>0 as a confirmed creation):
+    // for mail engines, the inbox link that extracted + verified IS the
+    // creation confirmation, so it counts as content success (GSA parity —
+    // a verified mail engine is a success, not a login-only wall).
+    report.content_success = 1;
     report.submitted_url = Some(candidates[0].url.clone());
     report.submitted_url_source = Some(resp.final_url);
     report.steps.push(StepOutcomeRef { outcome: StepOutcome::Success, matched_phrase: None });

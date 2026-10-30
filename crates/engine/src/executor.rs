@@ -229,6 +229,42 @@ pub struct StepPlan {
     /// (which already embeds the target) and reads the result page; no
     /// form data is POSTed.
     pub just_download: bool,
+    // ── T20 — GSA directive suite (reverse-engineered from the 991-engine INI corpus) ──
+    /// `anchor text=…` — step-level anchor override (replaces %anchor_text%).
+    pub anchor_text: Option<String>,
+    /// `upcase=1` — uppercase the step's anchor text.
+    pub upcase: bool,
+    /// `capitalize words=1` — title-case the step's anchor text.
+    pub capitalize_words: bool,
+    /// `min length` / `max length` — anchor length clamps (max truncates at a word boundary).
+    pub max_len: Option<usize>,
+    /// `page must have[N]` — post-submission page content the site must echo.
+    pub page_must_haves: Vec<String>,
+    /// `url must have[N]` — the created link must contain the phrase.
+    pub url_must_haves: Vec<String>,
+    /// `seconds to wait before submission[=N]` (+ optional `… condition=TEXT`).
+    pub wait_before_secs: Option<u64>,
+    pub wait_before_cond: Option<String>,
+    /// GSA blog-search flow: drive a search first, then act on the first usable result.
+    pub search: Option<StepSearch>,
+}
+
+/// GSA `use blog search=<url>` (+`search term`, `allow return`,
+/// `skip content on`, `add keyword to search`, `extract keywords`,
+/// `skip ext links on`) — one step's search flow, resolved.
+#[derive(Debug, Clone, Serialize)]
+pub struct StepSearch {
+    pub url: String,
+    pub term: String,
+    pub add_keyword: bool,
+    /// `allow return=1` permits results linking back to the submitted site.
+    pub allow_return: bool,
+    /// `skip content on=…` phrases disqualify a candidate (URL or label).
+    pub skip_content: Vec<String>,
+    /// `skip ext links on=1`: only same-host results.
+    pub skip_ext: bool,
+    /// `extract keywords=1`: search the project keyword, not the custom term.
+    pub extract_keywords: bool,
 }
 
 /// The phase a [StepPlan] belongs to — drives ordering + UI labels.
@@ -261,6 +297,11 @@ pub struct SubmissionPlan {
     /// Fields the plan had no value for (typically because the project did
     /// not set one) — useful for the UI to surface "fill me" prompts.
     pub unresolved_fields: Vec<String>,
+    /// Operator pause gate shared with the run leader: while `true`,
+    /// in-flight jobs wait between steps instead of advancing.
+    /// The leader stops dispatching new engines meanwhile.
+    #[serde(skip)]
+    pub pause: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// The result of driving a [SubmissionPlan] with a [driver::Driver].
@@ -434,6 +475,9 @@ pub fn resolve_plan(engine: &Engine, input: &SubmissionInput) -> SubmissionPlan 
         steps: ordered,
         required_driver: crate::routing::required_driver_kind(engine),
         unresolved_fields: unresolved,
+        // T19 — filled by the runner when a run leader provides the shared
+        // pause gate; `None` = never paused.
+        pause: None,
     }
 }
 
@@ -457,9 +501,53 @@ fn resolve_step(
         verify_extract: None,
     };
 
+    // T20 — anchor directives: `anchor text` (+`upcase`/`capitalize words`/
+    // `max length`) apply to THIS step's %anchor_text% token only.  The
+    // final anchor is spintax-resolved first (so `{a|b}` picks a branch),
+    // then transformed, then substituted before the rest of the value is
+    // resolved.
+    let upcase = flag_truthy(step.field("upcase"));
+    let cap_words = flag_truthy(step.field("capitalize words"));
+    let max_len = step.field("max length").and_then(|s| s.trim().parse().ok());
+    let anchor_override = step
+        .field("anchor text")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let anchor_final: Option<String> = if let Some(base) = anchor_override
+        .clone()
+        .or_else(|| ctx.get("anchor_text").map(|s| s.to_string()))
+    {
+        if base.is_empty() {
+            None
+        } else {
+            let mut a = resolver.resolve(&base, ctx);
+            if upcase {
+                a = a.to_uppercase();
+            }
+            if cap_words {
+                a = titlecase_words(&a);
+            }
+            if let Some(mx) = max_len {
+                a = truncate_at_word(&a, mx);
+            }
+            Some(a)
+        }
+    } else {
+        None
+    };
     let mut fields = HashMap::new();
     for (_k, f) in step.fields.iter() {
-        let resolved = resolver.resolve(&f.value, ctx);
+        let raw = f.value.as_str();
+        let resolved = if let Some(final_anchor) = &anchor_final {
+            if raw.contains("%anchor_text%") {
+                let substituted = raw.replace("%anchor_text%", final_anchor);
+                resolver.resolve(&substituted, ctx)
+            } else {
+                resolver.resolve(raw, ctx)
+            }
+        } else {
+            resolver.resolve(raw, ctx)
+        };
         let key_norm = f.key.to_string();
         fields.insert(key_norm, resolved);
     }
@@ -475,7 +563,108 @@ fn resolve_step(
         failed_retry: StepNav::split(f("submit failed retry")),
         captcha_failed: StepNav::split(f("captcha failed")),
         just_download: flag_truthy(step.field("just download")),
+        anchor_text: step
+            .field("anchor text")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        upcase: flag_truthy(step.field("upcase")),
+        capitalize_words: flag_truthy(step.field("capitalize words")),
+        max_len: step.field("max length").and_then(|s| s.trim().parse().ok()),
+        page_must_haves: collect_numbered(step, "page must have"),
+        url_must_haves: collect_numbered(step, "url must have"),
+        wait_before_secs: step
+            .field("seconds to wait before submission")
+            .and_then(|s| s.trim().parse::<u64>().ok()),
+        wait_before_cond: step
+            .field("seconds to wait before submission condition")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        search: step
+            .field("use blog search")
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .map(|url| {
+                let term = step
+                    .field("search term")
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                StepSearch {
+                    url,
+                    term,
+                    add_keyword: flag_truthy(step.field("add keyword to search")),
+                    allow_return: flag_truthy(step.field("allow return")),
+                    skip_content: StepNav::split(step
+                        .field("skip content on")
+                        .map(|s| s.as_str()))
+                        .into_iter()
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                    skip_ext: flag_truthy(step.field("skip ext links on")),
+                    extract_keywords: flag_truthy(step.field("extract keywords")),
+                }
+            }),
     }
+}
+
+/// `page must have` / `url must have` + their numbered forms (`…1`, `…2` …).
+fn collect_numbered(step: &Step, base: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(v) = step.field(base) {
+        out.push(v.trim().to_string());
+    }
+    for i in 1..=10 {
+        let k = format!("{}{}", base, i);
+        if let Some(v) = step.field(&k) {
+            out.push(v.trim().to_string());
+        }
+    }
+    out.into_iter().filter(|s| !s.is_empty()).collect()
+}
+
+/// `capitalize words` — title-case each spintax branch independently (braces/
+/// separators stay intact).
+fn titlecase_words(s: &str) -> String {
+    s.split('|')
+        .map(|seg| {
+            seg.split(' ')
+                .map(|w| {
+                    let mut seen_alpha = false;
+                    w.chars()
+                        .map(|ch| {
+                            if ch.is_alphabetic() {
+                                let r = if seen_alpha {
+                                    ch.to_lowercase().to_string()
+                                } else {
+                                    seen_alpha = true;
+                                    ch.to_uppercase().to_string()
+                                };
+                                r
+                            } else {
+                                ch.to_string()
+                            }
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// `max length=N` — truncate the anchor to whole words that fit within N chars.
+fn truncate_at_word(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for w in s.split_inclusive(' ') {
+        if (out.chars().count() + w.chars().count()) > max && !out.is_empty() {
+            break;
+        }
+        out.push_str(w);
+    }
+    out.trim_end().to_string()
 }
 
 /// GSA boolean flag (`just download=1`, `dofollow=1`, …): truthy on
@@ -908,6 +1097,64 @@ fn url_same_page(a: &str, b: &str) -> bool {
     !na.is_empty() && na == nb
 }
 
+/// T13c — is `u` one of this plan's *declared created-link patterns*
+/// (`find url` / `verify url`)?  When it is, a match is exactly the evidence
+/// of creation the INI author promised — not a form echo — even though, for
+/// relative `form url`s, [`StepNav::navigation_target`] promotes the
+/// absolute `find url` to the POST target and the T13b form-echo set would
+/// otherwise swallow the very link it declares.  (GSA parity: an author who
+/// declared `find url=X` is saying "the created link lives like X" — a
+/// response naming X confirms the post.)
+fn url_matches_created_pattern(u: &str, plan: &SubmissionPlan) -> bool {
+    let nu: String = {
+        let mut t = u.trim().to_ascii_lowercase();
+        loop {
+            if let Some(r) = t.strip_prefix("https://") { t = r.to_string(); continue; }
+            if let Some(r) = t.strip_prefix("http://") { t = r.to_string(); continue; }
+            if let Some(r) = t.strip_prefix("www.") { t = r.to_string(); continue; }
+            break;
+        }
+        if let Some(i) = t.find(['?', '#']) { t.truncate(i); }
+        while t.ends_with('/') { t.pop(); }
+        t
+    };
+    if nu.is_empty() {
+        return false;
+    }
+    plan.steps.iter().any(|s| {
+        let mut any = false;
+        let patterns: Vec<&str> = std::iter::once(s.nav.verify_url.as_deref().unwrap_or(""))
+            .chain(s.nav.find_url.iter().map(|x| x.as_str()))
+            .collect();
+        for p in patterns {
+            let mut cc = p.trim().trim_start_matches('*').trim_start_matches('.').trim().to_ascii_lowercase();
+            loop {
+                if let Some(r) = cc.strip_prefix("https://") { cc = r.to_string(); continue; }
+                if let Some(r) = cc.strip_prefix("http://") { cc = r.to_string(); continue; }
+                if let Some(r) = cc.strip_prefix("www.") { cc = r.to_string(); continue; }
+                break;
+            }
+            if let Some(i) = cc.find(['?', '#']) { cc.truncate(i); }
+            while cc.ends_with('/') { cc.pop(); }
+            if cc.is_empty() {
+                continue;
+            }
+            if cc.contains('*') || cc.contains('[') {
+                // Scribd-style glob: the static leading segment is the match
+                // anchor (`scribd.example/doc/…`).
+                let static_prefix = cc
+                    .split(|ch: char| ch == '*' || ch == '[')
+                    .next()
+                    .unwrap_or("");
+                any |= !static_prefix.is_empty() && nu.starts_with(static_prefix);
+            } else {
+                any |= nu == cc || nu.starts_with(&format!("{cc}/")) || cc.starts_with(&format!("{nu}/"));
+            }
+        }
+        any
+    })
+}
+
 /// T13b — `true` when `u` is a bare site root (`host/` or `host`): no path
 /// beyond the domain.  A short link (`rlu.ru/5i1b6`) or any real page
 /// (`/doc/123`, `/profile/abc`) is not a bare root.
@@ -1002,6 +1249,93 @@ fn extract_input_value_url(html: &str, target: Option<&str>) -> Option<String> {
     first_any
 }
 
+/// T20 — first usable `<a href>` in a blog-search result page: resolves
+/// relative links, skips `skip content on` phrases (in URL or label),
+/// other hosts (`skip ext links on`), and self-returns unless
+/// `allow return=1`.
+fn search_candidates(html: &str, base: &str, sr: &StepSearch, target_site: &str) -> Option<String> {
+    let base_host = host_of(base);
+    let site_host = host_of(target_site);
+    let mut from = 0usize;
+    while true {
+        let pos = match html[from..].find("href=") {
+            Some(p) => p,
+            None => break,
+        };
+        let p = from + pos;
+        let after = &html[p + 5..];
+        // capture the quoted (or bare) URL
+        let (v, next) = if let Some(c) = after.chars().next() {
+            if c == '"' || c == '\'' {
+                match after[1..].find(c) {
+                    Some(e) => (after[1..1 + e].trim().to_string(), p + 6 + e + 1),
+                    None => break,
+                }
+            } else {
+                match after.find(|ch: char| ch.is_whitespace() || ch == '>') {
+                    Some(e) => (after[..e].trim().to_string(), p + 6 + e),
+                    None => break,
+                }
+            }
+        } else {
+            break;
+        };
+        from = next;
+        if v.is_empty() || v.starts_with("mailto:") || v.starts_with("javascript:") {
+            continue;
+        }
+        let abs = if v.starts_with("http://") || v.starts_with("https://") {
+            v.clone()
+        } else if v.starts_with("//") {
+            format!("https:{}", v)
+        } else {
+            resolve_against_base(&v, base)
+        };
+        // anchor label: text between the closing '>' of this tag and the next '<'.
+        let gt = html[p + 6..].find('>').map(|g| p + 6 + g).unwrap_or(html.len());
+        let le = html[gt + 1..].find('<').map(|e| gt + 1 + e).unwrap_or(html.len());
+        let label = html[gt + 1..le].to_ascii_lowercase();
+        // `skip content on` — disqualify by URL or label.
+        if sr
+            .skip_content
+            .iter()
+            .any(|ph| abs.to_ascii_lowercase().contains(&ph.to_ascii_lowercase())
+                || label.contains(&ph.to_ascii_lowercase()))
+        {
+            continue;
+        }
+        // self-return: results pointing at the submitted site's home are the
+        // classic "bounced back" wall — allowed only with `allow return=1`.
+        if !sr.allow_return {
+            if let (Some(lh), Some(sh)) = (host_of(&abs), site_host.clone()) {
+                if lh == sh {
+                    let path = abs
+                        .split_once("//")
+                        .map(|(_, r)| r)
+                        .unwrap_or("")
+                        .split('/')
+                        .nth(1)
+                        .unwrap_or("")
+                        .trim_end_matches('/');
+                    if path.is_empty() {
+                        continue;
+                    }
+                }
+            }
+        }
+        // external hosts
+        if sr.skip_ext {
+            if let (Some(lh), Some(bh)) = (host_of(&abs), base_host.clone()) {
+                if lh != bh {
+                    continue;
+                }
+            }
+        }
+        return Some(abs);
+    }
+    None // no candidate left
+}
+
 /// Bare host (`host[:port]`) of an absolute URL, lowercased.
 fn host_of(u: &str) -> Option<String> {
     let rest = u.split_once("://")?.1;
@@ -1077,7 +1411,13 @@ pub async fn execute_plan_with_solver(
         errors: Vec::new(),
         steps: Vec::new(),
     };
+    let mut continue_after_wait: Option<DriverResponse> = None;
     for step in plan.steps.iter() {
+        // T19 — operator pause gate: while the run is paused, in-flight
+        // plans wait here between steps; the leader meanwhile stops
+        // dispatching new engines, so the run goes fully quiet without
+        // losing any already-created link.
+        pause_gate(plan).await;
         // GSA `verify submission` steps are named `DELETE_*` and run *after*
         // the real submission to prove ownership.  On pastbin-style article
         // engines (Rentry) that verification is *destructive*: DELETE_STEP2
@@ -1102,7 +1442,7 @@ pub async fn execute_plan_with_solver(
         // expects a plain GET ("download") of it, and the returned page
         // carries the created (short) link.  Navigate — never POST.
         let mut fields = step.fields.clone();
-        let target = if step.just_download {
+        let mut target = if step.just_download {
             resolve_against_base(&step_target_from_modify(step, &plan.target_url), &plan.target_url)
         } else {
             resolve_against_base(
@@ -1113,10 +1453,90 @@ pub async fn execute_plan_with_solver(
                 &plan.target_url,
             )
         };
-        let mut res: DriverResponse = if step.just_download || fields.is_empty() {
-            driver.navigate(target.clone()).await
-        } else {
-            driver.submit(target.clone(), fields.clone(), std::time::Duration::from_secs(30)).await
+        // T20 — GSA blog-search flow: `use blog search=<url>` drives a
+        // search first; this step then acts on the first usable result
+        // (skipping `skip content on`/external/self-returns unless
+        // `allow return=1`).
+        if step.phase == StepPhase::Submit {
+            if let Some(sr) = &step.search {
+                let base = plan.target_url.trim().to_string();
+                let search_url = resolve_against_base(&sr.url, &base);
+                let keyword = plan
+                    .anchor
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_default();
+                let term = if sr.extract_keywords && !keyword.is_empty() {
+                    keyword
+                } else if sr.term.is_empty() {
+                    keyword.clone()
+                } else if sr.add_keyword && !keyword.is_empty() {
+                    format!("{} {}", sr.term, keyword)
+                } else {
+                    sr.term.clone()
+                };
+                if !term.is_empty() {
+                    let mut found: Option<String> = None;
+                    for fname in ["q", "search", "s", "keyword", "query", "txtsearch"] {
+                        let mut sf = std::collections::HashMap::new();
+                        sf.insert(fname.to_string(), term.clone());
+                        let r = driver
+                            .submit(search_url.clone(), sf, std::time::Duration::from_secs(30))
+                            .await;
+                        if !r.ok {
+                            break;
+                        }
+                        found = search_candidates(&r.html, &base, sr, &plan.target_url);
+                        break;
+                    }
+                    match found {
+                        Some(link) => {
+                            target = resolve_against_base(&link, &base);
+                        }
+                        None => {
+                            report.errors.push(format!("{}: no usable result from blog search {}", step.name, search_url));
+                            report.failed += 1;
+                            report.steps.push(StepOutcomeRef { outcome: StepOutcome::Failed, matched_phrase: None });
+                            continue;
+                        }
+                    }
+                }
+            }
+            // T20 — `seconds to wait before submission[ condition=TEXT]`:
+            // load the step page, wait only when the condition (if any) is
+            // present, then proceed.
+            if let Some(secs) = step.wait_before_secs.filter(|s| *s > 0) {
+                let pre = driver.navigate(target.clone()).await;
+                let cond_ok = match &step.wait_before_cond {
+                    Some(c) if !c.is_empty() => {
+                        pre.ok && pre.html.to_ascii_lowercase().contains(&c.to_ascii_lowercase())
+                    }
+                    _ => pre.ok,
+                };
+                if cond_ok && secs > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                }
+                // A no-fields step consumes the pre-loaded page; submit
+                // steps re-POST after the wait (GSA order: GET → wait → POST).
+                if fields.is_empty() {
+                    let mut res: DriverResponse = pre;
+                    if !res.ok {
+                        report.errors.push(format!("{}: {}", step.name, res.error.unwrap_or_default()));
+                        report.failed += 1;
+                        report.steps.push(StepOutcomeRef { outcome: StepOutcome::Failed, matched_phrase: None });
+                        continue;
+                    }
+                    continue_after_wait = Some(res);
+                }
+            }
+        }
+        let mut res: DriverResponse = match continue_after_wait.take() {
+            Some(r) => r,
+            None => if step.just_download || fields.is_empty() {
+                driver.navigate(target.clone()).await
+            } else {
+                driver.submit(target.clone(), fields.clone(), std::time::Duration::from_secs(30)).await
+            },
         };
         if !res.ok {
             report.errors.push(format!("{}: {}", step.name, res.error.unwrap_or_default()));
@@ -1216,6 +1636,17 @@ pub async fn execute_plan_with_solver(
             }
         }
         let nav = extract_result_url(step, &res.html, Some(&plan.target_url));
+        // T14' — was a *real* link found on the page (vs the post-target
+        // fallback below)?  The form-echo demotion must only fire on real
+        // evidence: when the page merely said "success" and no link exists,
+        // the post target is the last-resort permalink GSA itself records —
+        // demoting it would kill every engine that returns a bare
+        // confirmation (the `PHRASE OK` shape).
+        let found_link = nav
+            .as_deref()
+            .map(|n| !n.trim().is_empty() && n.trim() != target.trim())
+            .unwrap_or(false)
+            || final_url_created(&res.final_url, &target).is_some();
         let chosen = nav
             .clone()
             .filter(|n| !n.trim().is_empty() && n.trim() != target.trim())
@@ -1278,13 +1709,42 @@ pub async fn execute_plan_with_solver(
                             plan_form_targets(plan).iter().any(|t| url_same_page(u, t))
                         }
                     };
-                    let form_echo =
-                        u_is_own_form
-                            && step.fields.keys().any(|k| k.to_ascii_lowercase() == "file")
-                            || plan_has_url_contract(plan) && u_is_any_plan_form;
+                    // T13c — an echo of an author-declared created-link pattern
+                    // (`find url` / `verify url`) is the confirmation itself,
+                    // never a form echo (the T13b false positive where a
+                    // relative `form url` + absolute `find url=X` put X both
+                    // in the POST target and the "own form pages" set).
+                    // Two shapes, one rule each:
+                    //  (a) an *upload* step (carries `file=`) that landed back
+                    //      on its own form — demote even when no link resolved
+                    //      (a bare "success" on the upload form proves nothing);
+                    //  (b) a REAL link was found and it is one of the engine's
+                    //      own form pages — unless it matches the author's
+                    //      declared created-link pattern (`find url` /
+                    //      `verify url`): then it IS the confirmation.
+                    let form_echo = u_is_own_form
+                        && step.fields.keys().any(|k| k.to_ascii_lowercase() == "file")
+                        || found_link
+                            && plan_has_url_contract(plan)
+                            && u_is_any_plan_form
+                            && !url_matches_created_pattern(u, plan);
                     // A bare site root (`host/`) can never be a created
                     // permalink — the yy7 `alt="success"` false positive.
                     let bare_root = !u.is_empty() && is_bare_root(u);
+                    // T20 — `page must have` (post-submission content the site
+                    // must echo) + `url must have` (created-link phrase).  An
+                    // engine that declares them but gets neither back did not
+                    // really post — demote like the other evidence gaps.
+                    let html_lc = res.html.to_ascii_lowercase();
+                    let page_must_fail = step
+                        .page_must_haves
+                        .iter()
+                        .any(|ph| !html_lc.contains(&ph.to_ascii_lowercase()));
+                    let u_lc = u.to_ascii_lowercase();
+                    let url_must_fail = step
+                        .url_must_haves
+                        .iter()
+                        .any(|ph| !u_lc.contains(&ph.to_ascii_lowercase()));
                     if wall {
                         report.errors.push(format!(
                             "{}: matched success, but the site returned a wall page ({u}) — post not confirmable",
@@ -1293,6 +1753,30 @@ pub async fn execute_plan_with_solver(
                     } else if form_echo {
                         report.errors.push(format!(
                             "{}: the page only echoed one of the engine's own form pages ({u}) — the created link was not confirmed",
+                            step.name
+                        ));
+                    } else if page_must_fail {
+                        let missing = step
+                            .page_must_haves
+                            .iter()
+                            .filter(|ph| !html_lc.contains(&ph.to_ascii_lowercase()))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        report.errors.push(format!(
+                            "{}: matched success, but the page was missing required content ({missing})",
+                            step.name
+                        ));
+                    } else if url_must_fail {
+                        let missing = step
+                            .url_must_haves
+                            .iter()
+                            .filter(|ph| !u_lc.contains(&ph.to_ascii_lowercase()))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        report.errors.push(format!(
+                            "{}: matched success, but the created link did not contain the required phrase ({missing}) at {u}",
                             step.name
                         ));
                     } else if bare_root {
@@ -1388,6 +1872,19 @@ fn record_created_url(report: &mut ExecutionReport, source: String, u: &str) -> 
         report.submitted_url_source = Some(source);
     }
     wins
+}
+
+/// T19 — operator pause gate. While the shared pause flag is set, an
+/// in-flight plan waits here (between steps) until the operator resumes —
+/// or the run is cancelled, in which case the job's own timeout/cancel
+/// accounting ends it. Polling keeps the gate deadlock-free with the
+/// leader (no async runtime dependency on the flag setter).
+async fn pause_gate(plan: &SubmissionPlan) {
+    if let Some(p) = plan.pause.as_deref() {
+        while p.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+    }
 }
 
 /// GSA parity helper: does this page expose a challenge artifact the local
@@ -1679,8 +2176,18 @@ custom=%totally_undefined_variable%
             failed_retry: Vec::new(),
             captcha_failed: StepNav::split(Some(captcha)),
             just_download: false,
+            anchor_text: None,
+            upcase: false,
+            capitalize_words: false,
+            max_len: None,
+            page_must_haves: Vec::new(),
+            url_must_haves: Vec::new(),
+            wait_before_secs: None,
+            wait_before_cond: None,
+            search: None,
         }
     }
+
 
     #[test]
     fn classify_precedence_captcha_beats_failed_beats_success() {
@@ -2949,5 +3456,148 @@ url=%url%
             "a real permalink counts as content: {report:?}"
         );
     }
-}
 
+    // ── T20 — GSA directive suite (reverse-engineered from the 991-engine corpus) ──
+
+    #[test]
+    fn t20_anchor_override_upcase_capitalize_maxlen() {
+        let raw = "\
+[engine]
+name=DirEngine
+engine type=Article
+fixed url=http://d.example/
+
+[STEP1]
+form url=http://d.example/submit
+title=Buy %anchor_text% now
+submit success=posted
+anchor text={green door|blue door}
+upcase=1
+
+[STEP2]
+form url=http://d.example/submit2
+title=%anchor_text%
+submit success=posted
+capitalize words=1
+max length=11
+";
+        let eng = parse_engine_str(raw, "DirEngine").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        let a1 = plan.steps.iter().find(|s| s.name.to_ascii_lowercase() == "step1").unwrap();
+        let a2 = plan.steps.iter().find(|s| s.name.to_ascii_lowercase() == "step2").unwrap();
+        let t1 = a1.fields.get("title").unwrap();
+        // upcase=1 on a1: spintax branch uppercased, embedded in the value
+        assert!(
+            t1 == "Buy GREEN DOOR now" || t1 == "Buy BLUE DOOR now",
+            "upcase: got {t1}"
+        );
+        let t2 = a2.fields.get("title").unwrap();
+        // capitalize words + max length=11 on "buy shoes online"
+        assert_eq!(t2, "Buy Shoes", "cap+maxlen: got {t2}");    }
+
+    #[tokio::test]
+    async fn t20_page_must_have_gate_counts_and_demotes() {
+        let raw = "\
+[engine]
+name=PMH
+engine type=Article
+fixed url=http://m.example/
+
+[STEP1]
+form url=http://m.example/submit
+submit success=posted
+url=%url%
+page must have=your article is live
+";
+        let eng = parse_engine_str(raw, "PMH").unwrap();
+        // Present → counts as content.
+        let plan = resolve_plan(&eng, &test_input());
+        let ok = MockDriver::with_html(
+            "<html><body>posted <a href=\"https://m.example/article/42\">x</a> your article is live</body></html>",
+        );
+        let rep = execute_plan_with_solver(&plan, &ok, None).await;
+        assert_eq!(rep.successful, 1, "{rep:?}");
+        assert_eq!(rep.content_success, 1, "phrase present must count: {rep:?}");
+        // Absent → demoted (success marker alone is not enough).
+        let plan = resolve_plan(&eng, &test_input());
+        let bad = MockDriver::with_html(
+            "<html><body>posted <a href=\"https://m.example/article/42\">x</a></body></html>",
+        );
+        let rep = execute_plan_with_solver(&plan, &bad, None).await;
+        assert_eq!(rep.successful, 1, "{rep:?}");
+        assert_eq!(rep.content_success, 0, "missing phrase must demote: {rep:?}");
+        assert!(
+            rep.errors.iter().any(|e| e.contains("required content")),
+            "{:?}",
+            rep.errors
+        );
+    }
+
+    #[tokio::test]
+    async fn t20_url_must_have_gate_counts_and_demotes() {
+        let raw = "\
+[engine]
+name=UMH
+engine type=Article
+fixed url=http://m.example/
+
+[STEP1]
+form url=http://m.example/submit
+submit success=posted
+url=%url%
+url must have=article/
+";
+        let eng = parse_engine_str(raw, "UMH").unwrap();
+        let plan = resolve_plan(&eng, &test_input());
+        let ok = MockDriver::with_html(
+            "<html><body>posted <a href=\"https://m.example/article/42\">x</a></body></html>",
+        );
+        let rep = execute_plan_with_solver(&plan, &ok, None).await;
+        assert_eq!(rep.content_success, 1, "link phrase present must count: {rep:?}");
+        let plan = resolve_plan(&eng, &test_input());
+        let bad = MockDriver::with_html(
+            "<html><body>posted <a href=\"https://m.example/other/9\">x</a></body></html>",
+        );
+        let rep = execute_plan_with_solver(&plan, &bad, None).await;
+        assert_eq!(rep.successful, 1, "{rep:?}");
+        assert_eq!(rep.content_success, 0, "link phrase missing must demote: {rep:?}");
+    }
+
+    #[test]
+    fn t20_search_candidates_skips_ads_ext_and_self_return() {
+        let sr = StepSearch {
+            url: "https://s.example/search".into(),
+            term: "cool cats".into(),
+            add_keyword: false,
+            allow_return: false,
+            skip_content: vec!["sponsored".into(), "ads".into()],
+            skip_ext: true,
+            extract_keywords: false,
+        };
+        let html = "\
+<a href=\"https://partner.example/go\">partner</a>
+<a href=\"https://s.example/\">home</a>
+<a href=\"https://s.example/sponsored-ads-7\">deal</a>
+<a href=\"https://s.example/article/77\">cool cats post</a>";
+        let got = search_candidates(html, "https://s.example/", &sr, "https://s.example/").unwrap();
+        assert_eq!(got, "https://s.example/article/77");
+        // allow return=1 lets the self-home link through
+        let sr2 = StepSearch { allow_return: true, ..sr.clone() };
+        let html2 = "<a href=\"https://s.example/\">home</a>";
+        assert_eq!(
+            search_candidates(html2, "https://s.example/", &sr2, "https://s.example/").unwrap(),
+            "https://s.example/"
+        );
+    }
+
+    #[test]
+    fn t20_titlecase_and_truncate_helpers() {
+        assert_eq!(
+            titlecase_words("{green door|Blue Sky}"),
+            "{Green Door|Blue Sky}"
+        );
+        assert_eq!(titlecase_words("buy shoes online"), "Buy Shoes Online");
+        assert_eq!(truncate_at_word("Buy Shoes Online", 11), "Buy Shoes");
+        assert_eq!(truncate_at_word("buy", 11), "buy");
+    }
+}

@@ -2,8 +2,8 @@ use sqlx::{FromRow, PgPool, Row};
 use uuid::Uuid;
 
 use crate::model::{
-    Engine, Job, JobStatus, Keyword, NotificationRow, Project, ProjectResult, Proxy, ResultKind,
-    ResultStats, Schedule, SubmissionResult,
+    Engine, Job, JobStatus, Keyword, NotificationRow, Project, ProjectResult,
+    Proxy, ResultKind, ResultStats, Schedule, SubmissionResult,
 };
 
 /// CRUD + pipeline helpers over the core tables.

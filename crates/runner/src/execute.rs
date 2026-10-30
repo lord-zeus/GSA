@@ -102,6 +102,12 @@ pub struct SubmissionContext {
     /// table + the SSE broadcast so the UI console updates live. `None` =
     /// previous behavior (events not logged) — unit tests stay quiet.
     pub events: Option<std::sync::Arc<dyn crate::events::EventSink>>,
+    /// T19 — operator pause gate for the whole run. The API creates ONE
+    /// `Arc<AtomicBool>` per run (shared by every worker + the pool
+    /// leader); `POST /api/projects/:id/run/pause` stores `true` and every
+    /// in-flight executor parks at its next step boundary until
+    /// `resume`. `None` (unit tests, dry pools) = never paused.
+    pub pause_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// The terminal state of one job's execution.
@@ -138,6 +144,13 @@ impl JobOutcome {
 #[derive(Clone, Default)]
 pub struct DriverRegistry {
     by_kind: HashMap<DriverKind, std::sync::Arc<dyn Driver>>,
+    /// T14 — two-lane execution. A CDP `WebDriver` owns ONE live page, so only
+    /// one browser-routed job may drive it at a time (multi-step interleaving
+    /// cross-talks). But that must NOT serialize the whole fleet: this gate
+    /// is held per-JOB by browser-routed jobs only (`JobRunner::run_one`),
+    /// while Http/Email jobs ignore it and keep the full worker width.
+    /// `with_browser` installs it; `Option<Arc<_>>` stays Clone+Default.
+    browser_gate: Option<std::sync::Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl std::fmt::Debug for DriverRegistry {
@@ -151,7 +164,10 @@ impl std::fmt::Debug for DriverRegistry {
 
 impl DriverRegistry {
     pub fn new() -> Self {
-        Self { by_kind: HashMap::new() }
+        Self {
+            by_kind: HashMap::new(),
+            browser_gate: None,
+        }
     }
     /// Register a driver for `Http`-routed engines.
     pub fn with_http(mut self, d: impl Driver + 'static) -> Self {
@@ -161,7 +177,19 @@ impl DriverRegistry {
     /// Register a driver for `Browser`-routed engines.
     pub fn with_browser(mut self, d: impl Driver + 'static) -> Self {
         self.by_kind.insert(DriverKind::Browser, std::sync::Arc::new(d));
+        // T14 — install the single-flight browser gate (all clones of this
+        // registry share the same Arc<tokio::Mutex<()>>, so every worker in
+        // the pool serializes browser jobs against ONE lock).
+        if self.browser_gate.is_none() {
+            self.browser_gate = Some(std::sync::Arc::new(tokio::sync::Mutex::new(())));
+        }
         self
+    }
+    /// T14 — the shared single-flight browser gate, if a browser driver is
+    /// registered. `run_one` holds it for the entire job of Browser-routed
+    /// engines; Http/Email jobs never touch it.
+    pub fn browser_gate(&self) -> Option<std::sync::Arc<tokio::sync::Mutex<()>>> {
+        self.browser_gate.clone()
     }
     /// Register a driver for `Email`-routed (F#12) engines. Used for the
     /// WEB-family `pop3 server=WEB` inbox fetch and for the final
@@ -321,6 +349,28 @@ impl JobRunner {
         };
         let input_anchor = anchor_draw.as_ref().map(|d| d.text.clone());
 
+        // T14 — two-lane execution: a CDP WebDriver owns ONE live page, so
+        // Browser-routed jobs hold the shared single-flight gate for the
+        // whole job (plan build + every step + captcha retries).  Http/Email
+        // jobs never touch the gate and keep the full worker width — this
+        // replaces the old "any browser engine ⇒ run serializes to 1 worker"
+        // rule that crawled a 500-link run to a single in-flight job.
+        let browser_gate = if engine::routing::required_driver_kind(&engine) == DriverKind::Browser {
+            self.drivers.browser_gate()
+        } else {
+            None
+        };
+        // Owned-guard form: `lock_owned(self: Arc<Self>)` → `OwnedMutexGuard`
+        // OWNS the Arc (no lifetime parameter), so holding the guard for the
+        // whole job can't dangle.  The guard — held to function end, released
+        // when this job finishes — is what serializes browser jobs fleet-wide
+        // while Http/Email jobs never touch it.
+        let _browser_gate_guard = if let Some(g) = browser_gate {
+            Some(g.lock_owned().await)
+        } else {
+            None
+        };
+
         // F#20 — URL options applied to the target URL before it reaches the
         // engine spec (which resolves it into `%url%` form fields)
         //
@@ -471,7 +521,7 @@ impl JobRunner {
             random_options: vec![],
             site_url,
         };
-        let plan = resolve_plan(&engine, &input);
+        let mut plan = resolve_plan(&engine, &input);
         self.emit(RunEvent {
             job_id: Some(job.id),
             engine: Some(engine.name.clone()),
@@ -628,6 +678,11 @@ impl JobRunner {
             }
         };
 
+        // T19 — shared pause gate (one per run; set by the API on pause).
+        // While the run is paused, in-flight steps park at their step
+        // boundary and the leader stops dispatching new engines.
+        plan.pause = self.ctx.pause_flag.clone();
+
         // 5) execute with a per-job timeout.
         //
         // F#13 (GSA "use proxies" / `proxy list` / "proxy seems down"):
@@ -737,6 +792,8 @@ impl JobRunner {
                     .filter(|s| s.phase != StepPhase::Register)
                     .cloned()
                     .collect();
+                // T19 — carry the shared pause gate into the login plan.
+                p.pause = plan.pause.clone();
                 p
             };
             let login_report = self
@@ -1467,4 +1524,85 @@ fn looks_transport_failure<T: TransportFailureSource>(r: &T) -> bool {
         }
     }
     false
+}
+
+/// T14 — two-lane execution: browser jobs serialize on ONE shared gate while
+/// the Http/Email fleet keeps full worker width. These tests pin the registry
+/// half of that contract — the gate exists only once a browser driver is
+/// registered, and every clone of the registry shares the SAME lock (so the
+/// whole pool serializes browser jobs against one mutex, per job).
+#[cfg(test)]
+mod browser_gate_tests {
+    use super::*;
+
+    struct GateDriver;
+    #[async_trait::async_trait]
+    impl Driver for GateDriver {
+        async fn navigate(&self, _url: String) -> engine::driver::DriverResponse {
+            engine::driver::DriverResponse {
+                ok: true,
+                final_url: "mock".into(),
+                html: String::new(),
+                error: None,
+            }
+        }
+        async fn submit(
+            &self,
+            _url: String,
+            _fields: std::collections::HashMap<String, String>,
+            _timeout: std::time::Duration,
+        ) -> engine::driver::DriverResponse {
+            engine::driver::DriverResponse {
+                ok: true,
+                final_url: "mock".into(),
+                html: String::new(),
+                error: None,
+            }
+        }
+    }
+
+    /// A bare registry (Http/Email only) carries no gate: there is nothing to
+    /// serialize, and `run_one`'s gate branch is a no-op for those engines.
+    #[test]
+    fn no_browser_driver_no_gate() {
+        let reg = DriverRegistry::new().with_http(engine::HttpDriver::new());
+        assert!(reg.browser_gate().is_none());
+    }
+
+    /// `with_browser` must install the single-flight gate.
+    #[test]
+    fn with_browser_installs_gate() {
+        let reg = DriverRegistry::new().with_http(engine::HttpDriver::new()).with_browser(GateDriver);
+        assert!(reg.browser_gate().is_some());
+        assert!(reg.get(DriverKind::Browser).is_some());
+    }
+
+    /// Every clone of the registry holds the SAME lock: while one worker's
+    /// guard is held, a second worker's acquire must block (time out) until
+    /// the first releases. This is the "browser jobs are single-flight
+    /// fleet-wide" half of the two-lane contract.
+    #[tokio::test]
+    async fn clones_share_one_lock() {
+        let reg = DriverRegistry::new().with_browser(GateDriver);
+        let a = reg.clone();
+        let b = reg.clone();
+        // Owned guard: the Arc moves into the guard and lives to end of scope.
+        let g1 = a.browser_gate().expect("gate");
+        let guard = g1.lock_owned().await;
+        // Concurrent acquire on a CLONE must not complete while held…
+        let res = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let g2 = b.browser_gate().expect("gate");
+            g2.lock_owned().await
+        })
+        .await;
+        assert!(res.is_err(), "second acquire should block while the first holds the gate");
+        // …and must complete once the first releases.
+        drop(guard);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let g2 = b.browser_gate().expect("gate");
+            g2.lock_owned().await
+        })
+        .await;
+        assert!(res.is_ok(), "acquire must succeed after release");
+    }
 }

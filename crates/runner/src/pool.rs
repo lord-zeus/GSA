@@ -246,6 +246,20 @@ impl WorkerPool {
                     break;
                 }
 
+                // T19 — OPERATOR PAUSE (distinct from F#26's soft ceiling):
+                // while the fair controller says `paused`, the leader PARKS
+                // here (500 ms tick) instead of dispatching — queued jobs stay
+                // `pending`, in-flight workers park at their executor step
+                // boundary, and the drain handlers below never get the chance
+                // to end the run. A cancel (`should_stop`) above keeps taking
+                // priority, so a cancel during pause still ends the run.
+                if let Some(f) = self.fair.as_ref() {
+                    if f.lock().unwrap().paused() {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
+                }
+
                 // T9 — fair-share: stop dispatching once the global target is
                 // met. Remaining queued jobs stay `pending` (resumable), and
                 // no new work is admitted — the run has reached the requested
